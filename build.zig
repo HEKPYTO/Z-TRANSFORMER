@@ -4,11 +4,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Phase 4 switch. Accepted and documented so `-Dcuda=true` is a valid
-    // command line, but it gates no behavior yet: this host has no CUDA and no
-    // .cu file is in the tree.
-    _ = b.option(bool, "cuda", "Build CUDA sources (Phase 4, not implemented)");
-
     const lib = b.addModule("ztransformer", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,

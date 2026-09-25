@@ -227,6 +227,73 @@ test "attention on zero tokens returns an empty output" {
     try std.testing.expectEqual(@as(usize, 0), out.data.len);
 }
 
+test "attention keeps an f64 accumulator over a 512 token context" {
+    // Every other test here is small, and its values are dyadic, so f32 and
+    // f64 arithmetic agree bit for bit on them and nothing above can tell an
+    // f64 accumulator from an f32 one. This is the test that can.
+    //
+    // One head, head_dim 8, T 512, and q, k and v filled with 1/3 and 1/7.
+    // Both are inexact in f32, so every product and every partial sum is
+    // rounded, and a 512 term reduction is long enough for those roundings to
+    // accumulate instead of cancelling. Measured over the 4096 outputs of this
+    // configuration, an f32 accumulator is up to 2.21e-6 absolute and 6.62e-6
+    // relative away from the f64 answer, and the largest gap sits at t = 492.
+    //
+    // The tolerance below is 1e-6 relative: 6.6x under the f32 drift, so
+    // narrowing the accumulator fails, and still 14x over the f32 storage
+    // rounding the output genuinely carries, which is 4.6e-7 relative at 0.33.
+    //
+    // The reference is the same formula computed here in f64 from the same
+    // inputs, written out rather than called, so narrowing attention.zig's
+    // accumulator changes the code under test and not the expected answer.
+    const t_len: usize = 512;
+    const dim: usize = 8;
+    const cfg = attention.Config{ .n_heads = 1, .n_kv_heads = 1, .head_dim = dim };
+
+    var q = try Tensor.init(std.testing.allocator, t_len, dim);
+    defer q.deinit();
+    var k = try Tensor.init(std.testing.allocator, t_len, dim);
+    defer k.deinit();
+    var v = try Tensor.init(std.testing.allocator, t_len, dim);
+    defer v.deinit();
+    // Even indices take 1/3, odd take 1/7, so a dot product sums a mix of
+    // 1/9 and 1/21 terms and no two consecutive positions repeat.
+    for (0..t_len) |t| {
+        for (0..dim) |j| {
+            const val: f32 = if ((t + j) % 2 == 0) 1.0 / 3.0 else 1.0 / 7.0;
+            q.set(t, j, val);
+            k.set(t, j, val);
+            v.set(t, j, val);
+        }
+    }
+
+    var out = try attention.forward(std.testing.allocator, q, k, v, cfg);
+    defer out.deinit();
+
+    const scale = 1.0 / @sqrt(@as(f64, @floatFromInt(dim)));
+    var scores: [t_len]f64 = undefined;
+    for (0..t_len) |t| {
+        var row_max: f64 = -std.math.inf(f64);
+        for (0..t + 1) |s| {
+            var dot: f64 = 0;
+            for (0..dim) |j| dot += @as(f64, q.at(t, j)) * @as(f64, k.at(s, j));
+            scores[s] = dot * scale;
+            row_max = @max(row_max, scores[s]);
+        }
+        var denom: f64 = 0;
+        for (0..t + 1) |s| {
+            scores[s] = @exp(scores[s] - row_max);
+            denom += scores[s];
+        }
+        for (0..t + 1) |s| scores[s] /= denom;
+        for (0..dim) |j| {
+            var acc: f64 = 0;
+            for (0..t + 1) |s| acc += scores[s] * @as(f64, v.at(s, j));
+            try std.testing.expectApproxEqRel(acc, @as(f64, out.at(t, j)), 1e-6);
+        }
+    }
+}
+
 test "attention is bit reproducible run to run" {
     const cfg = attention.Config{ .n_heads = 4, .n_kv_heads = 2, .head_dim = 4 };
     var q = try filled(std.testing.allocator, 3, 16, &.{

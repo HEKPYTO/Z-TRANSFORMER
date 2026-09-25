@@ -82,7 +82,3 @@ pub fn forward(allocator: std.mem.Allocator, q: Tensor, k: Tensor, v: Tensor, cf
     }
     return out;
 }
-
-test {
-    _ = @import("attention_test.zig");
-}

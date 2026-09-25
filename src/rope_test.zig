@@ -11,6 +11,16 @@ fn fromLiterals(a: std.mem.Allocator, rows: usize, cols: usize, vals: []const f3
     return t;
 }
 
+/// The plain L2 norm of `t`, as `@sqrt(sum of squares)`.
+///
+/// This stays a direct sum. It cannot be `norm.forward` with an all ones
+/// weight, because that returns x / rms(x) per element, which is not the norm
+/// of anything: the reciprocal is still in it. Measured on the row this file
+/// checks, x = [1 -2 3 -4 5 -6], the exact norm is 9.5393920142 and
+/// x[0] / rms(x) is 0.2567762109, a factor of 37.15 apart, and the ratio is
+/// not a constant of the row length either because of the eps inside the rms.
+/// The literals asserted below still hold: 9.5393920142 is the hand computed
+/// sqrt(91) and both calls to this helper return it within 1e-5.
 fn l2(t: tensor.Tensor) f64 {
     var acc: f64 = 0;
     for (t.data) |v| {

@@ -91,21 +91,51 @@ test "norm forward on an all zero row returns zeros, not NaN" {
     }
 }
 
-test "norm forward holds 1e-6 over a 4096 element row" {
-    // 4096 copies of 1/3. Mathematically mean = 4096*(1/9)/4096 = 1/9 exactly,
-    // rms = sqrt(1/9 + 1e-5) = 0.33334833, y = (1/3)/rms = 0.99995500.
-    // Summing 4096 f32 squares drifts the mean by 1.3e-5, past this tolerance.
-    var x = try Tensor.init(std.testing.allocator, 1, 4096);
+test "norm forward keeps an f64 accumulator over a 512 element row" {
+    // 512 is ffn_dim of the default model config, so this is the widest row the
+    // model actually builds. 4096, which this used to use, is a shape nothing
+    // here ever produces, and a tolerance picked for it says nothing about the
+    // rows that run.
+    //
+    // 512 copies of 1/3. Measured on this row, in f32 and in f64:
+    //     sum of squares   f32 56.888706        f64 56.88889227973056
+    //     mean             f32 0.111110754      f64 0.11111111773384875
+    //     rms              f32 0.3333478        f64 0.33334833
+    //     y = (1/3)/rms    f32 0.99995667       f64 0.99995506
+    //     exact, f64 throughout, 0.999955003039954
+    // So the f64 accumulator lands 5.7e-8 from the exact value, which is the
+    // f32 storage rounding of the one division, and the f32 accumulator lands
+    // 1.667e-6 from it. The tolerance below is 1e-6: 17x the error norm.zig
+    // actually has, and still 1.6x tighter than the f32 drift, so an
+    // accumulator narrowed to f32 fails here. The last assertion is that same
+    // claim stated as a check, so this test cannot quietly stop discriminating.
+    const d: usize = 512;
+    const third: f32 = 1.0 / 3.0;
+    const exact: f64 = 0.999955003039954;
+
+    var sum32: f32 = 0;
+    for (0..d) |_| sum32 += third * third;
+    const mean32: f64 = @as(f64, sum32) / @as(f64, @floatFromInt(d));
+    const rms32: f32 = @floatCast(@sqrt(mean32 + 1e-5));
+    const y32: f64 = @as(f64, third) / @as(f64, rms32);
+
+    var x = try Tensor.init(std.testing.allocator, 1, d);
     defer x.deinit();
-    var w = try Tensor.init(std.testing.allocator, 1, 4096);
+    var w = try Tensor.init(std.testing.allocator, 1, d);
     defer w.deinit();
-    x.fill(1.0 / 3.0);
+    x.fill(third);
     w.fill(1);
 
     var got = try norm.forward(std.testing.allocator, x, w);
     defer got.deinit();
 
     for (got.data) |v| try std.testing.expectApproxEqAbs(@as(f32, 0.999955), v, tol);
+    // Stated in f64 against the exact value, so the margin is the measured one
+    // and not the f32 rounding of the literal on the line above.
+    try std.testing.expectApproxEqAbs(exact, @as(f64, got.at(0, 0)), @as(f64, tol));
+    // An f32 accumulator misses by more than the tolerance, which is what makes
+    // the loop above a test of the accumulator rather than of the formula.
+    try std.testing.expect(@abs(y32 - exact) > @as(f64, tol));
 }
 
 test "norm forward rejects a weight of the wrong length" {

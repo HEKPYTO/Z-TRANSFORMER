@@ -7,7 +7,12 @@ pub const Tensor = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, rows: usize, cols: usize) !Tensor {
-        const data = try allocator.alloc(f32, rows * cols);
+        // The product is checked because a Tensor's shape is what its bounds
+        // guards read. A wrap here would hand back a buffer shorter than
+        // rows * cols while `rows` and `cols` still report the shapes asked
+        // for, and every later guard would pass.
+        const n = std.math.mul(usize, rows, cols) catch return error.DimensionOverflow;
+        const data = try allocator.alloc(f32, n);
         @memset(data, 0);
         return .{ .data = data, .rows = rows, .cols = cols, .allocator = allocator };
     }
