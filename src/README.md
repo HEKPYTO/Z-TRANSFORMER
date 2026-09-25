@@ -71,6 +71,38 @@ so no gradient reaches any of the 28 projection tensors or the embedding, and on
 move. Both PRNGs name `Xoshiro256` explicitly rather than reaching for `DefaultPrng`, whose stream
 Zig documents as an implementation choice rather than a guarantee.
 
+## Gradients
+
+| Symbol | Signature | Purpose |
+|---|---|---|
+| `autograd.LayerGrads` | 9 tensors | Mirrors `model.Layer`, one gradient each. |
+| `autograd.Grads` | `{ tok_embed, layers, final_norm }` | Mirrors `model.Params`. Accumulates. |
+| `autograd.zeroGrads` | `zeroGrads(allocator, like: Params) !Grads` | Exact zeros, shaped like the parameters. |
+| `autograd.dLossDLogits` | `dLossDLogits(allocator, logits, targets) !Tensor` | `(softmax - onehot) / T`. |
+| `autograd.backward` | `backward(allocator, p, g, cfg, tokens, dlogits) !void` | Accumulates into `g`. Never zeroes it. |
+| `gradcheck.Mismatch` | `{ path, index, analytic, numeric, diff, budget }` | One failing parameter element. |
+| `gradcheck.Report` | `{ rows, mismatch }` | The whole sweep, as data. |
+| `gradcheck.compare` | `compare(allocator, cfg, p, tokens, targets, tol, g) !Report` | Central differences, no printing. |
+| `gradcheck.line` | `line(allocator, m) ![]u8` | One diagnostic line for one mismatch. |
+| `gradcheck.report` | `report(Report) void` | Prints the table. Only on demand. |
+| `gradcheck.checkAll` | `checkAll(allocator, cfg, p, tokens, targets, tol) !void` | `compare`, then print and fail on mismatch. |
+
+Gradients are hand-written per module, not produced by a tape. A tape would need every tensor to
+become a graph node, which rewrites all five numerics modules and changes every signature they
+expose. Hand-written backward leaves those untouched and makes each gradient independently
+checkable. The cost is one backward function per forward function, and that cost is smaller than
+the rewrite.
+
+`checkAll` is silent when every parameter matches, and prints the full table plus a diagnostic line
+naming the parameter, index, analytic value, numeric value, difference and budget when one does not.
+The budget is not a chosen tolerance: it is the most an `f32` central difference of that loss can
+resolve, derived from the loss scale and the step. A real gradient bug lands two orders of magnitude
+above it, so the check discriminates instead of merely passing.
+
+`compare` returns the table as data and takes the gradient tensor as a parameter. That split is what
+lets a test corrupt one element and assert on the returned `Mismatch` rather than scraping stderr.
+`checkAll` is a thin wrapper over it, and every existing call site is unchanged.
+
 ## Tokenizer
 
 | Symbol | Signature | Purpose |
