@@ -1,0 +1,12 @@
+#!/bin/sh
+# Format and lint only. Tests belong to CI, not to a commit hook.
+set -eu
+
+files=$(git diff --cached --name-only --diff-filter=ACM -- '*.zig')
+[ -z "$files" ] && exit 0
+
+# shellcheck disable=SC2086
+if ! zig fmt --check $files; then
+    echo "pre-commit: run 'zig fmt' on the staged .zig files" >&2
+    exit 1
+fi
