@@ -25,3 +25,7 @@ comptime {
     _ = @import("model_test.zig");
     _ = @import("autograd_test.zig");
 }
+
+comptime {
+    _ = @import("train_test.zig");
+}

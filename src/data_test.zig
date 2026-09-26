@@ -209,7 +209,7 @@ test "the shuffle reorders whole batches and never the tokens inside one" {
     try std.testing.expect(!in_stream_order);
 }
 
-test "one seed gives one batch sequence and reset returns to it" {
+test "one seed gives one batch sequence and another seed another" {
     const ctx = 2;
     const stride = ctx + 1;
     const windows = 12;
@@ -222,10 +222,6 @@ test "one seed gives one batch sequence and reset returns to it" {
     defer b.deinit();
     var c = try data.Batcher.init(std.testing.allocator, &stream, ctx, 2);
     defer c.deinit();
-    // Never advanced, so it is the reference the post-reset drain is compared
-    // against once `b` has been used up.
-    var d = try data.Batcher.init(std.testing.allocator, &stream, ctx, 1);
-    defer d.deinit();
 
     var differs_from_other_seed = false;
     for (0..windows) |_| {
@@ -245,22 +241,63 @@ test "one seed gives one batch sequence and reset returns to it" {
     }
     try std.testing.expect((try a.next()) == null);
     try std.testing.expect(differs_from_other_seed);
+}
 
-    // Twelve windows under a different permutation would have to collide
-    // exactly, so the seed is load bearing rather than decorative.
-    a.reset();
-    for (0..windows) |_| {
-        const ga = (try a.next()).?;
-        var ba = ga;
-        defer ba.deinit();
-        const gd = (try d.next()).?;
-        var bd = gd;
-        defer bd.deinit();
-        try std.testing.expectEqualSlices(u32, ba.inputs, bd.inputs);
-        try std.testing.expectEqualSlices(u32, ba.targets, bd.targets);
+test "one seed gives one batch sequence and reset gives a different one" {
+    const ctx = 2;
+    const stride = ctx + 1;
+    const windows = 12;
+    var stream: [windows * stride]u32 = undefined;
+    for (&stream, 0..) |*t, i| t.* = @intCast(i);
+
+    // Drained once to get epoch 1's order, then reset for epoch 2, and compared
+    // on both counts. Reproducible from scratch, and different from its first
+    // epoch: the one property a reshuffle has to have, because an order that
+    // repeats every epoch stops being a shuffle.
+    var a = try data.Batcher.init(std.testing.allocator, &stream, ctx, 5);
+    defer a.deinit();
+    // Never advanced, so it is the epoch 1 reference `a` is measured against.
+    var d = try data.Batcher.init(std.testing.allocator, &stream, ctx, 5);
+    defer d.deinit();
+
+    var epoch1: [windows]u32 = undefined;
+    for (0..windows) |i| {
+        const got = (try a.next()).?;
+        var batch = got;
+        defer batch.deinit();
+        epoch1[i] = batch.inputs[0];
     }
     try std.testing.expect((try a.next()) == null);
-    try std.testing.expect((try d.next()) == null);
+    for (0..windows) |i| {
+        const got = (try d.next()).?;
+        var batch = got;
+        defer batch.deinit();
+        try std.testing.expectEqual(epoch1[i], batch.inputs[0]);
+    }
+
+    // Epoch 2 is a live reshuffle, so it must not be epoch 1 again. Twelve
+    // windows would have to collide exactly to pass a check they cannot.
+    a.reset();
+    var differs = false;
+    for (0..windows) |i| {
+        const got = (try a.next()).?;
+        var batch = got;
+        defer batch.deinit();
+        if (batch.inputs[0] != epoch1[i]) differs = true;
+    }
+    try std.testing.expect((try a.next()) == null);
+    try std.testing.expect(differs);
+
+    // Reproducible from scratch at the same seed, which is what the training
+    // loop's determinism rests on: two runs of one seed still agree.
+    var e = try data.Batcher.init(std.testing.allocator, &stream, ctx, 5);
+    defer e.deinit();
+    for (0..windows) |i| {
+        const got = (try e.next()).?;
+        var batch = got;
+        defer batch.deinit();
+        try std.testing.expectEqual(epoch1[i], batch.inputs[0]);
+    }
 }
 
 test "next returns null at the end and keeps returning null" {

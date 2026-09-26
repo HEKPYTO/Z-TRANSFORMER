@@ -65,7 +65,16 @@ pub const Batcher = struct {
     /// `order[i]` is the window the i-th batch is drawn from.
     order: []usize,
     cursor: usize,
-    seed: u64,
+    /// Seeded once in `init` and then advanced by every `reset`, so the run's
+    /// batch order is a function of the seed and the epoch and of nothing else.
+    ///
+    /// Xoshiro256++ named rather than reached through `std.Random.DefaultPrng`.
+    /// That alias is documented as an implementation choice, so a Zig upgrade
+    /// could reshuffle a training run's batches without a line here changing,
+    /// and the batch order is what the loss curve and every benchmark built on
+    /// it are measured from. Naming the engine makes the stream part of the
+    /// recorded artifact.
+    prng: std.Random.Xoshiro256,
 
     pub fn init(allocator: std.mem.Allocator, tokens: []const u32, ctx: usize, seed: u64) !Batcher {
         if (ctx == 0) return error.BadContext;
@@ -80,7 +89,7 @@ pub const Batcher = struct {
             .ctx = ctx,
             .order = order,
             .cursor = 0,
-            .seed = seed,
+            .prng = std.Random.Xoshiro256.init(seed),
         };
         self.reset();
         return self;
@@ -113,22 +122,17 @@ pub const Batcher = struct {
         return .{ .allocator = self.allocator, .inputs = inputs, .targets = targets };
     }
 
-    /// Restarts the walk in the same order the seed gave it the first time.
+    /// Restarts the walk in a fresh permutation.
+    ///
+    /// The shuffle is drawn from the batcher's live PRNG, so every epoch gets a
+    /// different order and two runs of one seed still agree epoch for epoch. It
+    /// is not re-seeded here: a fresh PRNG per reset would replay the first
+    /// epoch's order for every epoch, which is a shuffle that stops shuffling.
     pub fn reset(self: *Batcher) void {
         for (self.order, 0..) |*slot, i| slot.* = i;
-        // A fresh PRNG per reset, so the permutation is a function of the seed
-        // and of nothing else. The order is an index array walked front to back,
-        // so it never depends on a hash table's iteration order.
-        //
-        // Xoshiro256++ named rather than reached through `std.Random.DefaultPrng`.
-        // That alias is documented as an implementation choice, so a Zig upgrade
-        // could reshuffle a training run's batches without a line here changing,
-        // and the batch order is what the loss curve and every benchmark built
-        // on it are measured from. Naming the engine makes the stream part of
-        // the recorded artifact. It is the alias's current value, so the
-        // permutation is unchanged.
-        var prng = std.Random.Xoshiro256.init(self.seed);
-        prng.random().shuffle(usize, self.order);
+        // The order is an index array walked front to back, so it never depends
+        // on a hash table's iteration order.
+        self.prng.random().shuffle(usize, self.order);
         self.cursor = 0;
     }
 };

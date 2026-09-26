@@ -15,3 +15,9 @@ jobs:
       - run: zig fmt --check .
       - run: zig build test
       - run: zig build run
+      - name: a passing test run is silent
+        run: |
+          set -e
+          log=$(mktemp)
+          zig build test >"$log" 2>&1 || { cat "$log"; exit 1; }
+          test ! -s "$log" || { echo "::error::zig build test wrote $(wc -c <"$log") bytes on a passing run"; cat "$log"; exit 1; }

@@ -3,8 +3,8 @@
 Ten modules. 1,228 lines of implementation, 2,516 of tests.
 
 Every numerics module takes a `std.mem.Allocator` first and returns an error union. No module holds
-global state or spawns a thread. Every reduction runs in a fixed order, so two runs on one host are
-bit-identical across optimization levels.
+global state or spawns a thread. Every reduction runs in a fixed order, so two runs in one build
+configuration are bit-identical.
 
 ## Numerics
 
@@ -129,5 +129,10 @@ non-dyadic attention case that fails if the accumulator drops to `f32`, a 512-el
 that fails if `sum_sq` drops to `f32`, and a `init` overflow case that fails only in the release modes
 where the multiply used to wrap.
 
-Reproducibility is per-host. `@exp`, `@sqrt` and `@cos` resolve to the platform libm, so
-bit-identical output holds on one machine across optimization levels, not across libm versions.
+Reproducibility is per build configuration and per host, and the distinction is measured rather
+than assumed. Two runs at one seed in one build produce byte-identical output. Across optimization
+levels it does not hold: Debug differs from Release by about one f32 ulp per step, because the
+compiler contracts the element-wise accumulation loops into fused multiply-add under optimization
+and not under Debug. One ulp is harmless over a hundred steps and unbounded over ten thousand, so
+the training criterion is stated per build configuration. `@exp`, `@sqrt` and `@cos` additionally
+resolve to the platform libm, so output is not comparable across libm versions either.
