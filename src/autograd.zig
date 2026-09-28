@@ -600,7 +600,11 @@ fn ropeBackward(dout: Tensor, din: *Tensor, pos: usize, theta: f64, head_dim: us
 /// accumulates and `dx` is written whole.
 fn normBackward(x: Tensor, w: Tensor, g: Tensor, dw: *Tensor, dx: *Tensor) void {
     const d = x.cols;
-    const eps: f64 = 1e-5;
+    // The forward pass's own constant, not a second copy of it. A gradient that
+    // differentiates a slightly different function than the one evaluated is
+    // still a plausible-looking gradient, and a finite difference of the forward
+    // pass agrees with it closely enough to pass.
+    const eps = norm.eps;
     const w_row = w.data[0..d];
 
     // dw is the norm's own [1, d] weight gradient, so every row of the batch

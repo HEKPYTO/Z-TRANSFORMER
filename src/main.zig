@@ -1,5 +1,7 @@
 //! The binary. A bare `ztransformer` prints the banner; `ztransformer train`
-//! runs the one path the project ships end to end: corpus in, loss curve out.
+//! runs the one path the project ships end to end: corpus in, loss curve out;
+//! `ztransformer parity` writes the tensors a Llama reference is
+//! compared against.
 //!
 //! The defaults below are a smoke run, not a recipe, and the reason is measured
 //! rather than assumed. A step is a dense f32 forward and backward over a
@@ -16,6 +18,7 @@ const tokenizer = @import("tokenizer.zig");
 const data = @import("data.zig");
 const model = @import("model.zig");
 const train = @import("train.zig");
+const parity = @import("removed.zig");
 
 const corpus_path = "data/tinyshakespeare.txt";
 const csv_path = "outputs/loss.csv";
@@ -48,7 +51,8 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.len > 1) {
         if (std.mem.eql(u8, args[1], "train")) return runTrain(gpa, init.io);
-        std.debug.print("usage: {s} [train]\n", .{args[0]});
+        if (std.mem.eql(u8, args[1], "parity")) return runRemoved(gpa, init.io);
+        std.debug.print("usage: {s} [train|parity]\n", .{args[0]});
         return error.UnknownCommand;
     }
 
@@ -60,7 +64,14 @@ pub fn main(init: std.process.Init) !void {
 
 fn runTrain(gpa: std.mem.Allocator, io: Io) !void {
     const whole = try Io.Dir.cwd().readFileAlloc(io, corpus_path, gpa, .unlimited);
-    const text = whole[0..corpus_bytes];
+    // `@min`, not a bare slice. `corpus_bytes` is a cap, and a cap that is
+    // longer than the file is a cap that reads past the end: the checked build
+    // panics, and `zig build train` links a ReleaseFast binary where the bounds
+    // check is elided, so the slice silently becomes 64 KiB of whatever follows
+    // the allocation and the run trains on it. The vendored corpus is 1.1 MB so
+    // this never fires today, which is exactly why it survived: the only way to
+    // see it is to hand the binary a small file.
+    const text = whole[0..@min(whole.len, corpus_bytes)];
     var tk = try tokenizer.Tokenizer.init(gpa);
     try tk.train(text, n_merges);
     const ids = try tk.encode(gpa, text);
@@ -115,5 +126,40 @@ fn runTrain(gpa: std.mem.Allocator, io: Io) !void {
         res.val_loss,
         csv_path,
     });
+    try w.flush();
+}
+
+fn runRemoved(gpa: std.mem.Allocator, io: Io) !void {
+    // The exporter is the whole of this side of the harness. It runs in Zig
+    // with no Python anywhere in sight, because AGENTS.md requires every
+    // committed artifact to be reproducible from the toolchain the repository
+    // claims to need. `tools/removed/oracle.txt` reads what this writes; it
+    // never produces any of it.
+    const s = parity.sweep();
+    const res = try parity.run(gpa, io, s);
+
+    var buffer: [256]u8 = undefined;
+    var stdout: Io.File.Writer = .init(.stdout(), io, &buffer);
+    const w = &stdout.interface;
+    try w.print(
+        "wrote {s}/{{config.txt,index.txt,inputs.txt,data.bin}}\n" ++
+            "d_model {d}, {d} layers, {d} heads over {d} kv heads of {d}, ffn {d}, vocab {d}, ctx {d}\n" ++
+            "{d} weight blobs, {d} intermediate blobs over {d} cases\n" ++
+            "next: sh tools/removed/check.sh\n",
+        .{
+            parity.dir,
+            model.dModel(s.model),
+            s.model.n_layers,
+            s.model.n_heads,
+            s.model.n_kv_heads,
+            s.model.head_dim,
+            model.ffnDim(s.model),
+            s.model.vocab_size,
+            s.model.n_ctx,
+            res.weight_blobs,
+            res.intermediate_blobs,
+            res.cases,
+        },
+    );
     try w.flush();
 }

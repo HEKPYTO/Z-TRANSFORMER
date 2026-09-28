@@ -1,4 +1,16 @@
 const std = @import("std");
+
+comptime {
+    // The README names 0.16.0 and CI pins it, but neither stops a developer
+    // building on a different one. Nothing in the standard library's build API
+    // reports the version — `Graph` carries only `zig_exe` — so this is the only
+    // place it can be checked, and unchecked it is a confusing std-API error on
+    // the way in rather than a sentence that says what to install.
+    const v = @import("builtin").zig_version_string;
+    if (!std.mem.eql(u8, v, "0.16.0"))
+        @compileError("Z-TRANSFORMER requires Zig 0.16.0; this is " ++ v);
+}
+
 /// The library source, read for the one string `verify` asserts on. Taken from
 /// the same file the binary is built from, so a version bump cannot leave a
 /// stale expectation behind here.
@@ -10,14 +22,17 @@ const corpus_path = "data/tinyshakespeare.txt";
 const corpus_sha256 = "86c4e6aa9db7c042ec79f339dcb96d42b0075e16b8fc2e86bf0ca57e2dc565ed";
 
 pub fn build(b: *std.Build) void {
-    // Before the graph, not as one of its steps, because this is the one place
-    // every entry point passes through. `zig build run -- train` reads the
-    // corpus too, and a check only `verify` ran would leave that path reading a
-    // drifted corpus unguarded.
-    checkCorpusDigest(b);
-
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // A step, not a build-script-time call. Run from `build()` it fired on every
+    // invocation, which meant a missing corpus took `zig build --help` and
+    // `zig build --list-steps` down with it: you could not ask the build system
+    // what steps exist, and the failure arrived as `std.process.exit` noise
+    // rather than as a build failure. `verify` and `train` both depend on it, and
+    // those are the two entry points that read the corpus, so the coverage the
+    // original comment wanted survives the move.
+    const corpus = addCorpusDigest(b);
 
     const lib = b.addModule("ztransformer", .{
         .root_source_file = b.path("src/lib.zig"),
@@ -64,6 +79,7 @@ pub fn build(b: *std.Build) void {
     });
     const train_run = b.addRunArtifact(train_exe);
     train_run.addArg("train");
+    train_run.step.dependOn(&corpus.step);
     const train_step = b.step("train", "Train and write outputs/loss.csv");
     train_step.dependOn(&train_run.step);
 
@@ -97,9 +113,19 @@ pub fn build(b: *std.Build) void {
     fmt.setCwd(b.path("."));
     // The cheapest check goes first and the tests wait for it, so an unformatted
     // tree is reported in a second instead of after a minute of tests.
+    //
+    // Both test binaries gate on fmt, and `verify` depends on both. When the two
+    // modes were serialised, that serialisation was the only edge pulling the
+    // Debug suite into `verify`; removing it to stop two copies of the suite
+    // racing left `verify` running 160 tests while the README promised 320. The
+    // dependency is written out here rather than inherited from an ordering, so
+    // removing an ordering cannot silently halve the gate again.
+    default_tests.step.dependOn(&fmt.step);
     release_tests.step.dependOn(&fmt.step);
     verify_step.dependOn(&fmt.step);
+    verify_step.dependOn(&default_tests.step);
     verify_step.dependOn(&release_tests.step);
+    verify_step.dependOn(&corpus.step);
 
     // The banner, captured rather than inherited: `verify` has to be silent, and
     // an exact stdout match asserts more than the exit code alone, which is the
@@ -135,31 +161,30 @@ fn addTests(
     return b.addRunArtifact(tests);
 }
 
-/// Fails the build unless the corpus still hashes to the digest
+/// A step that fails unless the corpus still hashes to the digest
 /// `data/README.md` documents.
 ///
-/// The message names both digests, because "the check failed" does not say
-/// which side moved, and the failure is a non-zero exit with that message and
-/// nothing else: a stack trace here would bury the two lines that say what to
-/// fix.
-fn checkCorpusDigest(b: *std.Build) void {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(
-        b.graph.io,
-        b.path(corpus_path).getPath2(b, null),
-        b.allocator,
-        .unlimited,
-    ) catch |err| {
-        std.debug.print("\n{s} cannot be read: {s}\n", .{ corpus_path, @errorName(err) });
-        std.process.exit(1);
-    };
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    if (std.mem.eql(u8, &hex, corpus_sha256)) return;
-    std.debug.print(
-        "\n{s} does not hash to the digest data/README.md documents.\n" ++
-            "  expected  {s}\n  actual    {s}\n",
-        .{ corpus_path, corpus_sha256, &hex },
-    );
-    std.process.exit(1);
+/// `shasum -c` rather than a Zig hash here, and the reason is placement: as a
+/// build step this can fail the way a build step is supposed to, with a non-zero
+/// exit and its own message naming the file that did not match. Hashing in the
+/// build script meant `std.process.exit`, which killed the build runner during
+/// configuration and took `zig build --help` down with it.
+///
+/// The redirect is the other half. `verify` is silent on success by contract, and
+/// `shasum -c` prints `<path>: OK` on the way past, so the success path is
+/// swallowed and the failure path is not: a drifted corpus still prints the file
+/// name and the mismatched checksum. `shasum` is present on macOS and on the
+/// GitHub ubuntu runners this repository targets; a machine without it fails the
+/// step loudly rather than skipping the check.
+fn addCorpusDigest(b: *std.Build) *std.Build.Step.Run {
+    const check = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        "want='" ++ corpus_sha256 ++ "  " ++ corpus_path ++ "'; " ++
+            "if echo \"$want\" | shasum -a 256 -c - >/dev/null 2>&1; then exit 0; " ++
+            "else echo 'corpus digest check failed:' >&2; " ++
+            "echo \"$want\" | shasum -a 256 -c - >&2; exit 1; fi",
+    });
+    check.setCwd(b.path("."));
+    return check;
 }

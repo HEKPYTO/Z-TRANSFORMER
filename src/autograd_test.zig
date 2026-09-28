@@ -24,10 +24,18 @@ pub const tiny = model.Config{
 
 /// Two layers, for the paths only a real stack of blocks reaches. A backward
 /// pass that handles the last layer and stops passes with one and fails here.
+///
+/// `n_kv_heads = 1` against two query heads, so `group = 2` and every query head
+/// shares one kv head. With `n_kv_heads == n_heads` the grouping is the
+/// identity: `kv = h / group` becomes `kv = h`, the dk/dv accumulation across
+/// query heads sums one term instead of two, and none of the code that makes
+/// grouped-query attention different from plain attention is ever differenced.
+/// The parity harness is forward-only, so a regression here would have no
+/// oracle at all and would ship green.
 const two_layers = model.Config{
     .n_layers = 2,
     .n_heads = 2,
-    .n_kv_heads = 2,
+    .n_kv_heads = 1,
     .head_dim = 4,
     .n_ctx = 32,
     .vocab_size = 16,
@@ -46,14 +54,18 @@ fn layerTensors(l: *model.Layer) [9]*Tensor {
     };
 }
 
-/// Every parameter drawn the way a trained model looks rather than the way
-/// `initParams` leaves it. `initParams` parks both norm weights of every layer
-/// and the final norm at exactly zero, and a zero norm weight erases the branch
-/// it sits on, so the whole model collapses to a constant logit row and every
-/// gradient in it is exactly zero. Gradchecking that proves nothing, so the
-/// norm weights go to one and every other element is a deterministic draw at
-/// stddev 0.5, which puts the logits and therefore the gradients at O(1) where
-/// the finite difference has a usable signal to noise ratio.
+/// Every parameter drawn the way a trained model looks rather than a random draw
+/// from the shipped initialisation, which is what this once described.
+///
+/// The reason it needed saying at all: an earlier version of `initParams` parked
+/// both norm weights of every layer and the final norm at zero, and a zero norm
+/// weight erases the branch it sits on, so the whole model collapsed to a
+/// constant logit row and every gradient in it was exactly zero. Gradchecking
+/// that proves nothing. `initParams` now sets the norm weights to one precisely
+/// so this trap is not reachable, which `model.zig` explains at length; this
+/// helper stays because a deterministic draw at stddev 0.5 is still not what
+/// `initParams` produces, and it puts the logits at O(1) where the finite
+/// difference has a usable signal to noise ratio.
 pub fn liveParams(allocator: std.mem.Allocator, cfg: model.Config) !model.Params {
     var p = try model.initParams(allocator, cfg, 20260926);
     errdefer p.deinit();

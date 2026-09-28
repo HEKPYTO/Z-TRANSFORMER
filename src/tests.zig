@@ -31,6 +31,10 @@ comptime {
     _ = @import("train_test.zig");
 }
 
+comptime {
+    _ = @import("removed_test.zig");
+}
+
 // Every `src/*_test.zig` is named by one of the blocks above, and a file that
 // is not named there compiles to nothing: no test in it is ever built, and
 // `zig build test` stays green. That is the failure this exists to catch.

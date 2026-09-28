@@ -7,8 +7,53 @@ const mlp = @import("mlp.zig");
 const attention = @import("attention.zig");
 const Tensor = tensor.Tensor;
 
-const rope_theta: f64 = 500000;
+/// Public because the parity exporter writes it into the config the
+/// external side builds its reference model from. A harness that hardcoded
+/// 500000 next to a model that changed it would fail on RoPE and read as a
+/// numerics bug rather than as a stale number.
+pub const rope_theta: f64 = 500000;
 const init_stddev: f64 = 0.02;
+
+/// One intermediate the forward pass hands to a `Sink`, named for what it is
+/// rather than for the local it is bound to.
+///
+/// `attn_probs` and the SwiGLU hidden state are the two the design names and
+/// this enum does not carry, because `attention.forward` and `mlp.forward`
+/// compute them internally and return only the reduced result. Reaching either
+/// means changing those two files, so the parity harness gates the fourteen
+/// this pass can hand over and says so in its own output.
+pub const Name = enum {
+    attn_norm_out,
+    q,
+    k,
+    v,
+    q_rope,
+    k_rope,
+    attn_ctx,
+    attn_proj,
+    residual1,
+    mlp_norm_out,
+    mlp_out,
+    residual2,
+    final_norm,
+    logits,
+};
+
+/// A callback the forward pass hands each intermediate to as it is produced.
+///
+/// A function pointer rather than a bag of tensor pointers, because the
+/// intermediates live in buffers the pass frees before it returns: a pointer
+/// recorded during the pass would dangle by the time a reader got to it. A
+/// callback fires while the tensor is still valid, so the reader copies out
+/// whatever it needs at that moment.
+///
+/// Nothing in the pass reads the sink except to call it, so a null sink runs
+/// the same arithmetic in the same order and returns the same tensor.
+pub const Sink = struct {
+    /// `layer` is the 0-based layer index, and 0 for `final_norm` and
+    /// `logits`, which are not part of any one layer.
+    put: *const fn (sink: *Sink, name: Name, layer: usize, t: Tensor) void,
+};
 
 pub const Config = struct {
     n_layers: usize,
@@ -139,6 +184,22 @@ pub fn initParams(allocator: std.mem.Allocator, cfg: Config, seed: u64) !Params 
 /// A post-norm block would fold each norm into the residual sum instead, which
 /// is the older arrangement and the wrong one.
 pub fn forward(allocator: std.mem.Allocator, p: Params, cfg: Config, tokens: []const u32) !Tensor {
+    return forwardWith(allocator, p, cfg, tokens, null);
+}
+
+/// `forward`, with every intermediate handed to `sink` as it is produced.
+///
+/// The body moved here rather than being copied, so there is one forward pass
+/// in the tree and the two entry points cannot drift apart. `forward` above is
+/// this with no sink, which is the whole of the difference: the callback is
+/// the only thing the pass does that the arithmetic does not already do.
+pub fn forwardWith(
+    allocator: std.mem.Allocator,
+    p: Params,
+    cfg: Config,
+    tokens: []const u32,
+    sink: ?*Sink,
+) !Tensor {
     try validate(cfg);
     if (tokens.len > cfg.n_ctx) return error.SequenceTooLong;
     const d = dModel(cfg);
@@ -186,50 +247,67 @@ pub fn forward(allocator: std.mem.Allocator, p: Params, cfg: Config, tokens: []c
         .head_dim = cfg.head_dim,
     };
 
-    for (p.layers) |l| {
+    for (p.layers, 0..) |l, layer| {
         var attn_in = try norm.forward(allocator, x, l.attn_norm);
         defer attn_in.deinit();
+        if (sink) |s| s.put(s, .attn_norm_out, layer, attn_in);
 
         var q = try tensor.matmul(attn_in, l.wq);
         defer q.deinit();
+        if (sink) |s| s.put(s, .q, layer, q);
         var k = try tensor.matmul(attn_in, l.wk);
         defer k.deinit();
+        if (sink) |s| s.put(s, .k, layer, k);
         var v = try tensor.matmul(attn_in, l.wv);
         defer v.deinit();
+        if (sink) |s| s.put(s, .v, layer, v);
 
         // RoPE sits between the projection and the attention, at absolute
         // position 0, because a training batch always starts there. Sampling
         // with a cache is a later phase and brings its own position.
         var q_pos = try rope.forward(allocator, q, 0, rope_theta, cfg.head_dim);
         defer q_pos.deinit();
+        if (sink) |s| s.put(s, .q_rope, layer, q_pos);
         var k_pos = try rope.forward(allocator, k, 0, rope_theta, cfg.head_dim);
         defer k_pos.deinit();
+        if (sink) |s| s.put(s, .k_rope, layer, k_pos);
         // v is not rotated, so it goes to attention as projected.
 
         var ctx = try attention.forward(allocator, q_pos, k_pos, v, attn_cfg);
         defer ctx.deinit();
+        if (sink) |s| s.put(s, .attn_ctx, layer, ctx);
         var proj = try tensor.matmul(ctx, l.wo);
         defer proj.deinit();
+        if (sink) |s| s.put(s, .attn_proj, layer, proj);
 
         try addInto(&acc, x, proj);
         const after_attn = x;
         x = acc;
         acc = after_attn;
+        // After the swap `x` is the first residual. The next layer's swap
+        // reuses this same buffer, so a sink that kept the pointer instead of
+        // copying here would see layer n+1 overwrite layer n.
+        if (sink) |s| s.put(s, .residual1, layer, x);
 
         var mlp_in = try norm.forward(allocator, x, l.mlp_norm);
         defer mlp_in.deinit();
+        if (sink) |s| s.put(s, .mlp_norm_out, layer, mlp_in);
         var ff = try mlp.forward(allocator, mlp_in, l.w_gate, l.w_up, l.w_down);
         defer ff.deinit();
+        if (sink) |s| s.put(s, .mlp_out, layer, ff);
 
         try addInto(&acc, x, ff);
         const after_mlp = x;
         x = acc;
         acc = after_mlp;
+        if (sink) |s| s.put(s, .residual2, layer, x);
     }
 
     var final_h = try norm.forward(allocator, x, p.final_norm);
     defer final_h.deinit();
+    if (sink) |s| s.put(s, .final_norm, 0, final_h);
     const logits = try tiedHead(allocator, final_h, p.tok_embed);
+    if (sink) |s| s.put(s, .logits, 0, logits);
 
     // The success path frees here, where the two names can be read against the
     // swap above. The errdefers registered at allocation do not fire on this

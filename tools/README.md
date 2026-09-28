@@ -1,7 +1,88 @@
 # tools
 
 Programs that produce build artifacts. Each one runs on its own and writes a file under
-`outputs/`.
+`outputs/`, and the parity harness below writes its one committed record here.
+
+## Parity
+
+`sh tools/removed/check.sh` compares this project's block against a Llama reference and
+exits 0 when they agree, 1 when a tensor disagrees, and 2 when the oracle could not run at all. The
+three are separate on purpose: a machine without torch has not failed a parity check.
+
+| | |
+|---|---|
+| Reference | `reference-library==4.57.3`, `torch` 2.14.0, CPU, float32, attention `eager` |
+| Shape | d_model 64, 2 layers, 4 heads over 2 kv heads of 16, ffn 256, vocab 256, ctx 512, batch 1 |
+| Sweep | sequence lengths 1, 8 and 257, at seeds 7 and 8. Six runs, 156 tensor rows, 532 argmax comparisons |
+| Last verdict | OK. 14 tensor kinds inside their gates, worst 2.1e-06 against a 2.0e-05 gate |
+| Argmax | 532 of 532 rows pick the same token |
+| Record | `report.csv` in this directory, one row per tensor per run |
+
+The pinned versions are not decoration. `reference-library` v5 moved `rope_theta` into
+`rope_parameters`, so an unpinned oracle silently builds the reference with theta 10000 and
+disagrees with this model's 500000 on RoPE while looking like a numerics bug. `_attn_implementation`
+defaults to `sdpa` in 4.57, which is a different kernel and a different reduction order, so `eager`
+is forced and the resolved value is printed in the header. Both traps turn a setup error into a
+plausible-looking numerical one, which is the failure mode this harness exists to remove.
+
+Set up once, into a virtualenv inside the repository:
+
+    python3 -m venv venv-removed
+    venv-removed/bin/pip install -r tools/removed/requirements.txt
+    sh tools/removed/check.sh
+
+`PARITY_PYTHON` overrides the interpreter. The repository-local `venv-removed` wins over the system
+one when both exist, so the pin is what actually runs.
+
+### The three files
+
+`oracle.txt` is the whole oracle: it reads the export, builds the reference, and writes
+`report.csv`. It is never imported by the shipped binary and nothing in `src/` imports it.
+
+`check.sh` is the entry point, and the only place the two halves meet.
+
+`report.csv` is the committed record, and it lives beside the file that writes it so the two cannot
+drift apart. The export it describes is scratch, under `outputs/parity/`, and is not committed.
+
+### What is Zig and what is Python
+
+The export is `ztransformer parity`, which is Zig, and it runs with no Python anywhere in it. It
+writes fixed weights from `model.initParams` at a stated seed, every intermediate the forward pass
+can hand over, the token ids, and the shape. Python only reads those files back.
+
+That split is the point rather than an accident of tooling. AGENTS.md requires that a committed
+artifact never depend on a language the project does not otherwise need, and the weights here are a
+build product: one seed has to reproduce them exactly, on a machine with only Zig. If the oracle
+wrote them, a reader without torch could not regenerate them, and every number below would rest on
+a dependency the repository does not claim.
+
+The formats are raw little-endian f32 with a text index, not safetensors. There is one dtype, no
+mmap on either side, and the oracle never calls `from_pretrained` because it builds a model and
+copies tensors in, so it never wants a checkpoint. A JSON header, an 8-byte alignment rule and
+external's key names would be more code than the rest of the harness, for a reader that does not
+exist.
+
+### What it does not check
+
+Initialisation, because the harness pins the weights on both sides and never compares how they were
+drawn. Batched forward, because this model has no batch axis and the harness runs batch 1. A KV
+cache, quantized weights, or CUDA. The attention probabilities and the SwiGLU hidden state, which
+`attention.forward` and `mlp.forward` reduce internally and never return; reaching either means
+changing those two functions, which changes the numbers everything else is gating.
+
+And sensitivity, which is worth stating precisely rather than in the abstract. The sweep shape was
+chosen for legibility — `d_model` 64 over four heads of 16 keeps every tensor small enough to read.
+Measured at that shape: scaling one element of `wq` by 1e-3 fails 51 gates, and scaling all 4096
+elements of `wq` by 1.001 still fails 16. A tenth of a percent is inside this harness's reach. What
+does slip under the gates is narrower: dropping the f64 accumulator in `norm.zig` to f32 passes,
+because at `d_model` 64 the drift that 512-element tests exist to catch is still below the 2e-6 gate
+here. Sensitivity grows with the row width the gates are set against, not with the tensor count.
+
+Both have to hold: all fourteen gates and the same token on every row. The gates are the sensitive
+one. The smallest reference top1-top2 margin on this sweep is 8.5e-04 and the widest gate on the
+logits is 2e-4, so a run that passes the gates cannot have flipped a token, and the argmax cannot
+fail on its own. Its job is the diagnosis: for any row where the two disagree, the reference's own
+top1-top2 margin is printed, so a near-tie is visibly a near-tie.
 
 ## train_bpe.zig
 

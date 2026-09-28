@@ -3,6 +3,9 @@ zig-out/
 .worktrees/
 outputs/*.bin
 outputs/vocab.json
+outputs/parity/
+venv-removed/
+__pycache__/
 samples/
 *.o
 *.obj

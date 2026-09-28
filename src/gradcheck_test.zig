@@ -70,12 +70,18 @@ test "gradcheck: compare returns the whole sweep as data" {
     }
 
     // The floor is a real number and a discriminating one: above nothing, and
-    // below the largest gradient in the model, or it would be a budget that
-    // cannot fail.
+    // a small fraction of the largest gradient in the model, or it would be a
+    // budget that cannot fail. `floor < gmax` alone is far too loose to do that
+    // job: the measured floor is 1.1e-4 against a gmax of 0.88, so the bound
+    // permits a budget nearly four thousand times looser than the real one, and
+    // the corruption test below perturbs by 1.0, which such a budget would still
+    // catch. A tenth of a percent is the bound `src/README.md` already states in
+    // prose, so this is the assertion that keeps that sentence true.
     try std.testing.expect(r.floor > 0);
     var gmax: f64 = 0;
     for (g.tok_embed.data) |v| gmax = @max(gmax, @abs(@as(f64, @floatCast(v))));
     try std.testing.expect(r.floor < gmax);
+    try std.testing.expect(r.floor < gmax * 0.001);
 
     // A correct gradient is accepted, and the per tensor worst is a real
     // measurement with an index that exists.

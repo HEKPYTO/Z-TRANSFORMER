@@ -1,10 +1,15 @@
 # src
 
-Thirteen modules, plus the `main.zig` binary, `lib.zig` and the `tests.zig` root. 29 `.zig`
-files: 7,123 lines outside the 13 `*_test.zig` files, 4,244 inside them.
+Fourteen modules, plus the `main.zig` binary, `lib.zig` and the `tests.zig` root. 31 `.zig` files:
+8,645 lines outside the 14 `*_test.zig` files, 5,284 inside them.
 
-    wc -l src/*.zig | grep -v _test.zig | tail -1    # 7123 total
-    wc -l src/*_test.zig | tail -1                    # 4244 total
+    wc -l src/*.zig | grep -v _test.zig | tail -1    # 8645 total
+    wc -l src/*_test.zig | tail -1                    # 5284 total
+
+Those two commands are the source of the two numbers, and they are here so the pair cannot be
+edited into disagreement: this block shipped claiming 29 files, 7,123 and 4,244 while the commands
+underneath it printed 7,676 and 4,335, and a reader running them would have found the paragraph
+lying to them.
 
 Every module that allocates takes a `std.mem.Allocator` first and returns an error union. Two take
 no allocator because they build nothing: `tensor.matmul` reads it off `a` and `loss.forward`
@@ -15,6 +20,14 @@ In-tree code reaches the implementation by relative path, `@import("tensor.zig")
 `src/tests.zig` imports the `ztransformer` module, and only for `version` and `name`. `lib.zig`
 deliberately exports no modules, because a file that is both re-exported by the library and
 imported directly puts one file in two Zig modules, which the build refuses.
+
+One directory here is not Zig. `src/cuda/` holds the CUDA source and the container recipe that
+compiles and runs it, because `nvcc` cannot be installed on a GPU host without root, and the CUDA
+the distribution's NVIDIA repository ships is version-skewed against the one this repository targets.
+No `src/*.zig` file imports it and `build.zig` does not reference it yet, so the other 29 `.zig`
+files above are still the whole compiled surface, and their line counts have not moved. `sh
+src/cuda/run-probe.sh` compiles the probe and runs it on the local GPU; `src/cuda/README.md` says
+what that does and does not establish.
 
 ## Numerics
 
@@ -114,6 +127,11 @@ optimizer call.
 | `model.Params` | `{ tok_embed, layers, final_norm }` | Tied embeddings, so there is no `lm_head`. |
 | `model.initParams` | `initParams(allocator, cfg, seed) !Params` | Deterministic from `seed`. |
 | `model.forward` | `forward(allocator, p, cfg, tokens) !Tensor` | Returns logits `[T, vocab]`. |
+| `model.forwardWith` | `forwardWith(allocator, p, cfg, tokens, ?*Sink) !Tensor` | The same pass, handing each intermediate to a `Sink`. `forward` is this with a null sink. |
+| `model.Name` | 14 values | Which intermediate a `Sink.put` call is about. |
+| `model.Sink` | `{ put }` | A callback, not a bag of pointers: the intermediates live in buffers the pass frees before it returns. |
+| `parity.run` | `run(allocator, io, Sweep) !Summary` | Writes the weights, intermediates, token ids and shape to `outputs/parity/`. |
+| `parity.sweep` | `sweep() Sweep` | The shape and the sequence lengths and seeds the harness compares. |
 
 Pre-norm: the norm sits inside the residual branch, not on the sum. Tied embeddings mean `tok_embed`
 takes gradient from both the input lookup and the output projection, and the second path is the one
@@ -121,6 +139,17 @@ that is easy to miss. Norm weights initialise to 1.0, not 0.0: at zero every bra
 so no gradient reaches any of the 28 projection tensors or the embedding, and only the norm weights
 move. Both PRNGs name `Xoshiro256` explicitly rather than reaching for `DefaultPrng`, whose stream
 Zig documents as an implementation choice rather than a guarantee.
+
+`model.Sink` exists for one caller, `parity.run`, and changes no arithmetic: the callback is the
+only thing the pass does that the arithmetic does not already do, so a null sink walks the same
+statements in the same order. It is a function pointer rather than a set of tensor pointers because
+the intermediates live in buffers the pass frees before it returns, and a pointer recorded during the
+pass would dangle by the time a reader got to it. The two tensors the design names and this cannot
+reach are the attention probabilities and the SwiGLU hidden state: `attention.forward` and
+`mlp.forward` reduce them internally and return only the result, so reaching either means changing
+those two files. `parity.run` writes raw little-endian f32 with a text index rather than
+safetensors, because the oracle never calls `from_pretrained` and there is one dtype and no mmap on
+either side. `tools/README.md` says what the harness checks and what it does not.
 
 ## Gradients
 
@@ -223,8 +252,16 @@ where the multiply used to wrap.
 
 Reproducibility is per build configuration and per host, and the distinction is measured rather
 than assumed. Two runs at one seed in one build produce byte-identical output. Across optimization
-levels it does not hold: Debug differs from Release by about one f32 ulp per step, because the
-compiler contracts the element-wise accumulation loops into fused multiply-add under optimization
-and not under Debug. One ulp is harmless over a hundred steps and unbounded over ten thousand, so
-the training criterion is stated per build configuration. `@exp`, `@sqrt` and `@cos` additionally
-resolve to the platform libm, so output is not comparable across libm versions either.
+levels it does not hold: Debug differs from Release by about one f32 ulp per step. One ulp is
+harmless over a hundred steps and unbounded over ten thousand, so the training criterion is stated
+per build configuration.
+
+The mechanism was attributed to fused multiply-add in the element-wise accumulation loops, and that
+attribution was wrong. Each of those loops was extracted and compiled both ways at a size that
+shows the difference: `matmul`, `weightGrad` and `inputGrad` are bit-identical between Debug and
+ReleaseFast. At full model scale the only tensors that move at all are `w_gate` and `w_down` in
+layer 0; the forward pass, `tok_embed`, `wq`, `wk`, `attn_norm` and `final_norm` are all
+bit-identical. The phenomenon is real and reproducible, the explanation for it is not established,
+and it is recorded here as an observation rather than as a mechanism nobody has verified. `@exp`,
+`@sqrt` and `@cos` additionally resolve to the platform libm, so output is not comparable across
+libm versions either.

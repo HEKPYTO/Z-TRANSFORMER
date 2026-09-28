@@ -419,3 +419,78 @@ test "model frees every intermediate of a full forward" {
     // error path too, which testing.allocator is the only thing that can see.
     try std.testing.expectError(error.TokenOutOfRange, model.forward(std.testing.allocator, p, two_layers, &.{ 1, 99, 3 }));
 }
+
+/// Collects what the sink reports, so a test can count and name it.
+///
+/// `@fieldParentPtr` rather than a cast of the pointer itself, matching what
+/// `src/removed.zig` does. Casting the `*model.Sink` straight back to a
+/// `*Recorder` only works while the sink sits at offset zero, which is an
+/// accident of field order rather than a contract; this form holds whatever
+/// order the fields end up in.
+const Recorder = struct {
+    sink: model.Sink = undefined,
+    seen: usize = 0,
+    names: std.EnumArray(model.Name, usize) = .initFill(0),
+    per_layer: usize = 0,
+    layer_zero: usize = 0,
+    non_layer_zero: usize = 0,
+
+    fn put(which: *model.Sink, name: model.Name, layer: usize, _: Tensor) void {
+        const self: *Recorder = @fieldParentPtr("sink", which);
+        self.seen += 1;
+        self.names.set(name, self.names.get(name) + 1);
+        if (name == .final_norm or name == .logits) {
+            self.non_layer_zero += 1;
+        } else {
+            self.per_layer += 1;
+            if (layer == 0) self.layer_zero += 1;
+        }
+    }
+
+    /// The `*model.Sink` to hand the pass, backed by this recorder.
+    fn asSink(self: *Recorder) *model.Sink {
+        self.sink = .{ .put = put };
+        return &self.sink;
+    }
+};
+
+test "a null sink runs the same arithmetic as no sink at all" {
+    var p = try model.initParams(std.testing.allocator, two_layers, 5);
+    defer p.deinit();
+    const tokens = [_]u32{ 1, 2, 3, 4 };
+
+    var plain = try model.forward(std.testing.allocator, p, two_layers, &tokens);
+    defer plain.deinit();
+    var through_sink = try model.forwardWith(std.testing.allocator, p, two_layers, &tokens, null);
+    defer through_sink.deinit();
+
+    // Bit for bit, not within a tolerance. The sink is read on no path in the
+    // arithmetic, so a difference here is not a numerical question at all: it
+    // means the plumbing changed what the pass computes.
+    try std.testing.expectEqualSlices(f32, plain.rowConst(0), through_sink.rowConst(0));
+    for (0..plain.rows) |r| try std.testing.expectEqualSlices(f32, plain.rowConst(r), through_sink.rowConst(r));
+}
+
+test "the sink reports every intermediate, once per layer" {
+    var p = try model.initParams(std.testing.allocator, two_layers, 5);
+    defer p.deinit();
+    const tokens = [_]u32{ 1, 2, 3, 4 };
+
+    var rec: Recorder = .{};
+    var out = try model.forwardWith(std.testing.allocator, p, two_layers, &tokens, rec.asSink());
+    defer out.deinit();
+
+    // 12 per-layer names over 2 layers, plus final_norm and logits once each.
+    try std.testing.expectEqual(@as(usize, 12 * two_layers.n_layers + 2), rec.seen);
+    try std.testing.expectEqual(@as(usize, 12 * two_layers.n_layers), rec.per_layer);
+    try std.testing.expectEqual(@as(usize, 2), rec.non_layer_zero);
+    // Each of the 12 layer-scoped names fires once per layer, so the two layers
+    // contribute evenly and no name is reported for a layer that did not run.
+    for (std.enums.values(model.Name)) |n| {
+        const want: usize = switch (n) {
+            .final_norm, .logits => 1,
+            else => two_layers.n_layers,
+        };
+        try std.testing.expectEqual(want, rec.names.get(n));
+    }
+}
