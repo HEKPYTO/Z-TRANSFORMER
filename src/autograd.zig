@@ -297,12 +297,12 @@ fn buildStep(
         1 => blk: {
             var q = try tensor.matmul(t[0], l.wq);
             defer q.deinit();
-            break :blk try rope.forward(allocator, q, 0, rope_theta);
+            break :blk try rope.forward(allocator, q, 0, rope_theta, cfg.head_dim);
         },
         2 => blk: {
             var k = try tensor.matmul(t[0], l.wk);
             defer k.deinit();
-            break :blk try rope.forward(allocator, k, 0, rope_theta);
+            break :blk try rope.forward(allocator, k, 0, rope_theta, cfg.head_dim);
         },
         3 => tensor.matmul(t[0], l.wv),
         4 => attention.forward(allocator, t[1], t[2], t[3], .{
@@ -416,10 +416,10 @@ fn blockBackward(
     // multiply-adds with the sign of the sine flipped.
     var d_q = try Tensor.init(d_x_in.allocator, t_count, ag.dq.cols);
     defer d_q.deinit();
-    ropeBackward(ag.dq, &d_q, 0, rope_theta);
+    ropeBackward(ag.dq, &d_q, 0, rope_theta, cfg.head_dim);
     var d_k = try Tensor.init(d_x_in.allocator, t_count, ag.dk.cols);
     defer d_k.deinit();
-    ropeBackward(ag.dk, &d_k, 0, rope_theta);
+    ropeBackward(ag.dk, &d_k, 0, rope_theta, cfg.head_dim);
 
     weightGrad(&lg.wq, b.attn_in, d_q);
     weightGrad(&lg.wk, b.attn_in, d_k);
@@ -561,24 +561,28 @@ fn attentionBackward(
 ///     [out_lo, out_hi] = [[c, -s], [s, c]] [lo, hi]
 /// is orthogonal, so the transpose undoes it: the same two multiply-adds with
 /// the sine's sign flipped. The pairing has to be the half-split one
-/// rope.forward uses, element i with element i + d/2, and the angle has to be
-/// the same f64 angle, or a query silently picks up a neighbour's phase.
-fn ropeBackward(dout: Tensor, din: *Tensor, pos: usize, theta: f64) void {
-    const d = dout.cols;
-    const half = d / 2;
+/// rope.forward uses, element `i` with element `i + head_dim/2` of the same
+/// head block, and the angle has to be the same f64 angle, or a query silently
+/// picks up a neighbour's phase.
+fn ropeBackward(dout: Tensor, din: *Tensor, pos: usize, theta: f64, head_dim: usize) void {
+    std.debug.assert(head_dim != 0 and dout.cols % head_dim == 0);
+    const half = head_dim / 2;
     for (0..dout.rows) |r| {
         const src = dout.rowConst(r);
         const dst = din.row(r);
         const t: f64 = @floatFromInt(pos + r);
-        for (0..half) |i| {
-            const exponent = @as(f64, @floatFromInt(2 * i)) / @as(f64, @floatFromInt(d));
-            const angle = t / std.math.pow(f64, theta, exponent);
-            const c = @cos(angle);
-            const s = @sin(angle);
-            const lo = @as(f64, src[i]);
-            const hi = @as(f64, src[i + half]);
-            dst[i] = @floatCast(lo * c + hi * s);
-            dst[i + half] = @floatCast(hi * c - lo * s);
+        for (0..dout.cols / head_dim) |h| {
+            const base = h * head_dim;
+            for (0..half) |i| {
+                const exponent = @as(f64, @floatFromInt(2 * i)) / @as(f64, @floatFromInt(head_dim));
+                const angle = t / std.math.pow(f64, theta, exponent);
+                const c = @cos(angle);
+                const s = @sin(angle);
+                const lo = @as(f64, src[base + i]);
+                const hi = @as(f64, src[base + i + half]);
+                dst[base + i] = @floatCast(lo * c + hi * s);
+                dst[base + i + half] = @floatCast(hi * c - lo * s);
+            }
         }
     }
 }
@@ -607,22 +611,24 @@ fn normBackward(x: Tensor, w: Tensor, g: Tensor, dw: *Tensor, dx: *Tensor) void 
         const g_row = g.rowConst(r);
         const dx_row = dx.row(r);
 
-        // f64 accumulator, narrowed once per row, for the reason norm.forward
-        // gives: the same sum has to land on the same value here as it did
-        // there, or the gradient and the loss disagree about the scale.
+        // f64 accumulator, narrowed once per row to f32, which is what
+        // norm.forward stores. The narrowing is the point, not a rounding
+        // detail: the forward divides by an f32 rms, so keeping the f64 value
+        // here would differentiate a marginally different function than the one
+        // loss.forward measured.
         var sum_sq: f64 = 0;
         for (x_row) |val| sum_sq += @as(f64, val) * @as(f64, val);
-        const rms: f64 = @sqrt(sum_sq / @as(f64, @floatFromInt(d)) + eps);
+        const rms: f32 = @floatCast(@sqrt(sum_sq / @as(f64, @floatFromInt(d)) + eps));
 
         // d n . n, with d n[i] = g[i] * w[i] and n[i] = x[i] / rms.
         var dot: f64 = 0;
         for (0..d) |i| {
-            const n = @as(f64, x_row[i]) / rms;
+            const n = @as(f64, @as(f32, @floatCast(x_row[i])) / rms);
             dot += @as(f64, g_row[i]) * @as(f64, w_row[i]) * n;
         }
         const inv_d = 1.0 / @as(f64, @floatFromInt(d));
         for (0..d) |i| {
-            const n = @as(f64, x_row[i]) / rms;
+            const n = @as(f64, @as(f32, @floatCast(x_row[i])) / rms);
             const dn = @as(f64, g_row[i]) * @as(f64, w_row[i]);
             dw_row[i] += @floatCast(@as(f64, g_row[i]) * n);
             dx_row[i] = @floatCast((dn - n * dot * inv_d) / rms);

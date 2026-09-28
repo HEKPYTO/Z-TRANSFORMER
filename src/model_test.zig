@@ -245,6 +245,106 @@ test "model adds the residual rather than replacing it" {
     try std.testing.expectApproxEqRel(a, without.at(0, 0), 1e-6);
 }
 
+/// head_dim 2, so every rotary frequency is 500000^0 = 1 and a row rotates by
+/// exactly one radian per position. d stays 8 and four heads fit, so q and k
+/// are [T, 8] with four head blocks of 2, which is where a whole row
+/// rotation and a per block rotation disagree.
+const rotary = model.Config{
+    .n_layers = 1,
+    .n_heads = 4,
+    .n_kv_heads = 4,
+    .head_dim = 2,
+    .n_ctx = 8,
+    .vocab_size = 2,
+    .ffn_mult = 1,
+};
+
+test "model rotates each head block of q and k, not the concatenated row" {
+    // The other numeric cases here zero wq and wk, and RoPE of zero is zero, so
+    // none of them can see a wrong rotation. This one does not, and every
+    // projection that matters is the identity or a single 3, so the whole
+    // forward is hand checkable.
+    var p = try blank(std.testing.allocator, rotary);
+    defer p.deinit();
+    const d = model.dModel(rotary); // 8
+
+    // Two tokens whose embeddings differ, so token 1's query is not parallel
+    // to its own key and the softmax is not trivially uniform.
+    //     x0 = [-2 0 0 0 0 -1 0 0]  sum of squares 5, rms 0.7905757396
+    //     x1 = [-1 -1 0 0 1 -2 0 0]  sum of squares 7, rms 0.9354196919
+    //     attn_in0 = [-2.5298018898 0 0 0 0 -1.2649009449 0 0]
+    //     attn_in1 = [-1.0690388589 -1.0690388589 0 0 1.0690388589 -2.1380777177 0 0]
+    // x1 carries mass in head 0 (columns 0, 1) and in head 1 (columns 4, 5), so
+    // both a wrong head pairing and a wrong frequency exponent move the result.
+    // x0 leaves column 1 empty on purpose, which zeroes v row 0 below and keeps
+    // the mixture from being diluted by a term no rotation can reach.
+    p.tok_embed.set(0, 0, -2);
+    p.tok_embed.set(0, 5, -1);
+    p.tok_embed.set(1, 0, -1);
+    p.tok_embed.set(1, 1, -1);
+    p.tok_embed.set(1, 4, 1);
+    p.tok_embed.set(1, 5, -2);
+
+    // wq and wk are the identity, so q and k are the normalised embeddings.
+    for (0..d) |i| {
+        p.layers[0].wq.set(i, i, 1);
+        p.layers[0].wk.set(i, i, 1);
+    }
+
+    // `matmul(x, w)` is x @ w, so wv[1][1] = 3 is one weight: input feature 1
+    // scaled by 3 into output feature 1. That makes
+    //     v[0] = 0                        (attn_in0[1] is 0)
+    //     v[1] = [0 -3.2071165766 0 ...]  (3 * attn_in1[1])
+    // wo is the identity, so the branch reaches the stream unscrambled and is
+    // read where it was written. w_gate, w_up and w_down stay zero, so the mlp
+    // branch adds nothing and the attention branch is the whole story.
+    p.layers[0].wv.set(1, 1, 3);
+    for (0..d) |i| p.layers[0].wo.set(i, i, 1);
+
+    var logits = try model.forward(std.testing.allocator, p, rotary, &.{ 0, 1 });
+    defer logits.deinit();
+
+    // Row 0 has one key, so its softmax is 1 whatever the rotation is and
+    // ctx[0] = v[0] = 0. The stream is x0 unchanged, rms = 0.7905757396, and
+    // the tied head reads
+    //     logit[0][0] = dot(x0, x0 / rms) = 6.3245047245
+    //     logit[0][1] = dot(x1, x0 / rms) = 5.0596037796
+    // This row is the control: it pins the embedding, norm and head path, and
+    // it reads the same under every rotation, right or wrong.
+    try std.testing.expectApproxEqRel(@as(f32, 6.3245047245), logits.at(0, 0), 1e-5);
+    try std.testing.expectApproxEqRel(@as(f32, 5.0596037796), logits.at(0, 1), 1e-5);
+
+    // Row 1 is the one that moves. Every head block turns by 1 radian with
+    // cos = 0.5403023058681398 and sin = 0.8414709848078965, so a block holding
+    // (a, b) becomes (a cos - b sin, b cos + a sin):
+    //     head 0 (a, b) = (-1.0690388589, -1.0690388589)
+    //         -> (a(cos - sin), a(cos + sin)) = (0.3219610209, -1.4771693419)
+    //     head 1 (a, b) = (1.0690388589, -2.1380777177) = (p, -2p)
+    //         -> (p(cos + 2 sin), p(sin - 2 cos)) = (2.3767345233, -0.2556431396)
+    // With k row 0 unrotated at position 0, head 0 at t = 1 scores
+    //     s0 = dot(q1_head0, k0_head0) / sqrt 2 = -0.5759367755
+    //     s1 = dot(q1_head0, k1_head0) / sqrt 2 =  1.6162256001
+    // s1 is a rotation of a vector against itself, so it is a norm and lands on
+    // the same value whatever the rotation. s0 is not, and that is the whole
+    // difference. softmax gives
+    //     w0 = 0.1004565216   w1 = 0.8995434784
+    //     ctx[1][1] = w1 * -3.2071165766 = -2.8849408010
+    //     h[1]      = x1 + ctx = [-1 -3.8849408010 0 0 1 -2 0 0]
+    //     rms(h)    = 1.6237627993
+    //     logit[1][0] = dot(x0, h / rms) = 2.4634139923
+    //     logit[1][1] = dot(x1, h / rms) = 6.0876753706
+    // The 1e-5 tolerance is four orders of magnitude below the gap to either
+    // wrong answer. Rotating the whole 8 wide row pairs column 0 with column 4
+    // and halves every exponent, and reads
+    //     [s0 = 2.6424197109, s1 = 2.2330223215, w1 = 0.3990566247,
+    //      logit[1][0] = 3.3809695757, logit[1][1] = 6.9984558214]
+    // and not rotating at all reads
+    //     [s0 = 1.9123395486, s1 = 1.6162256001, w1 = 0.4265077345,
+    //      logit[1][0] = 3.3208401058, logit[1][1] = 6.9470812930]
+    try std.testing.expectApproxEqRel(@as(f32, 2.4634139923), logits.at(1, 0), 1e-5);
+    try std.testing.expectApproxEqRel(@as(f32, 6.0876753706), logits.at(1, 1), 1e-5);
+}
+
 test "model rejects a config it cannot assemble" {
     var p = try model.initParams(std.testing.allocator, tiny, 5);
     defer p.deinit();
@@ -265,6 +365,13 @@ test "model rejects a config it cannot assemble" {
     // An odd head dim has no rotary pair to rotate.
     const odd = model.Config{ .n_layers = 1, .n_heads = 2, .n_kv_heads = 2, .head_dim = 3, .n_ctx = 32, .vocab_size = 16, .ffn_mult = 1 };
     try std.testing.expectError(error.InvalidConfig, model.forward(std.testing.allocator, p, odd, &.{0}));
+
+    // Two layers of parameters against a config that declares one. The
+    // embedding shape still agrees, because d_model does not depend on depth,
+    // so nothing else in the validation can see it.
+    var deep = try model.initParams(std.testing.allocator, two_layers, 5);
+    defer deep.deinit();
+    try std.testing.expectError(error.DimensionMismatch, model.forward(std.testing.allocator, deep, tiny, &.{0}));
 }
 
 test "model rejects a token id outside the vocabulary instead of wrapping it" {

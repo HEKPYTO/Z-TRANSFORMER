@@ -12,12 +12,13 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - run: zig fmt --check .
-      - run: zig build test
-      - run: zig build run
-      - name: a passing test run is silent
+      - run: zig build verify
+      # The only property the step graph cannot assert about itself. The test
+      # runs inside `verify` are part of its output, so a silent `verify` is a
+      # silent test run.
+      - name: a passing verify run is silent
         run: |
           set -e
           log=$(mktemp)
-          zig build test >"$log" 2>&1 || { cat "$log"; exit 1; }
-          test ! -s "$log" || { echo "::error::zig build test wrote $(wc -c <"$log") bytes on a passing run"; cat "$log"; exit 1; }
+          zig build verify >"$log" 2>&1 || { cat "$log"; exit 1; }
+          test ! -s "$log" || { echo "::error::zig build verify wrote $(wc -c <"$log") bytes on a passing run"; cat "$log"; exit 1; }

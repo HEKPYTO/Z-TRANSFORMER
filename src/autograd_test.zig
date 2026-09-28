@@ -12,7 +12,7 @@ const Tensor = tensor.Tensor;
 /// 1 layer, d_model 8, 2 heads, 2 kv heads, head_dim 4, vocab 16, ctx 32. The
 /// same shape `model_test.zig` uses, for the same reason: the 4 layer default is
 /// slow per test and proves no more.
-const tiny = model.Config{
+pub const tiny = model.Config{
     .n_layers = 1,
     .n_heads = 2,
     .n_kv_heads = 2,
@@ -39,8 +39,6 @@ const two_layers = model.Config{
 const tok: []const u32 = &.{ 3, 1, 4, 0 };
 const tgt: []const u32 = &.{ 1, 4, 0, 2 };
 
-const tol: f32 = 1e-2;
-
 fn layerTensors(l: *model.Layer) [9]*Tensor {
     return .{
         &l.attn_norm, &l.wq,     &l.wk,   &l.wv,     &l.wo,
@@ -56,7 +54,7 @@ fn layerTensors(l: *model.Layer) [9]*Tensor {
 /// norm weights go to one and every other element is a deterministic draw at
 /// stddev 0.5, which puts the logits and therefore the gradients at O(1) where
 /// the finite difference has a usable signal to noise ratio.
-fn liveParams(allocator: std.mem.Allocator, cfg: model.Config) !model.Params {
+pub fn liveParams(allocator: std.mem.Allocator, cfg: model.Config) !model.Params {
     var p = try model.initParams(allocator, cfg, 20260926);
     errdefer p.deinit();
     var prng = std.Random.DefaultPrng.init(0xbeef);
@@ -125,13 +123,13 @@ fn expectDiffers(a: []const f32, b: []const f32) !void {
 test "autograd: gradcheck every parameter element on the tiny config" {
     var p = try liveParams(std.testing.allocator, tiny);
     defer p.deinit();
-    try gradcheck.checkAll(std.testing.allocator, tiny, p, tok, tgt, tol);
+    try gradcheck.checkAll(std.testing.allocator, tiny, p, tok, tgt);
 }
 
 test "autograd: gradcheck passes for two layers" {
     var p = try liveParams(std.testing.allocator, two_layers);
     defer p.deinit();
-    try gradcheck.checkAll(std.testing.allocator, two_layers, p, tok, tgt, tol);
+    try gradcheck.checkAll(std.testing.allocator, two_layers, p, tok, tgt);
 }
 
 test "autograd: gradcheck passes when every norm weight is one" {
@@ -142,7 +140,7 @@ test "autograd: gradcheck passes when every norm weight is one" {
         l.mlp_norm.fill(1);
     }
     p.final_norm.fill(1);
-    try gradcheck.checkAll(std.testing.allocator, two_layers, p, tok, tgt, tol);
+    try gradcheck.checkAll(std.testing.allocator, two_layers, p, tok, tgt);
 }
 
 test "autograd: gradcheck passes when every norm weight is zero" {
@@ -163,7 +161,7 @@ test "autograd: gradcheck passes when every norm weight is zero" {
         l.mlp_norm.fill(0);
     }
     p.final_norm.fill(0);
-    try gradcheck.checkAll(std.testing.allocator, tiny, p, tok, tgt, tol);
+    try gradcheck.checkAll(std.testing.allocator, tiny, p, tok, tgt);
 
     var g = try autograd.zeroGrads(std.testing.allocator, p);
     defer g.deinit();
@@ -180,41 +178,82 @@ test "autograd: gradcheck passes when every norm weight is zero" {
     try std.testing.expect(live > 0);
 }
 
-test "autograd: a wrong gradient is named, with its index" {
-    // The silence on a passing run is only worth anything if a failing run
-    // still says what went wrong, so the failure path needs a gradient that is
-    // actually wrong. One element of one tensor, moved by 1.0, is the smallest
-    // error the finite difference cannot mistake for the floor.
+test "autograd: a failed loss evaluation leaves the parameter it moved untouched" {
+    // `compare` moves one parameter element by the step, evaluates the loss, and
+    // puts it back. An evaluation that fails before the second one has to put it
+    // back anyway, or a caller that catches the error and carries on trains from
+    // a parameter that is one step off, in a direction it never asked for.
     var p = try liveParams(std.testing.allocator, tiny);
     defer p.deinit();
     var g = try autograd.zeroGrads(std.testing.allocator, p);
     defer g.deinit();
     _ = try lossAndGrads(std.testing.allocator, tiny, p, tok, tgt, &g);
 
-    // Row 4 col 5: row 4 is a token, so its gradient carries both paths into
-    // tok_embed and is nowhere near zero.
-    const wrong: usize = 4 * model.dModel(tiny) + 5;
-    const truth = g.tok_embed.data[wrong];
-    g.tok_embed.data[wrong] = truth + 1.0;
+    // The first target is out of range, so the very first loss evaluation fails,
+    // which is the one taken while tok_embed[0] is a step off its true value.
+    const before = p.tok_embed.data[0];
+    try std.testing.expectError(error.TargetOutOfRange, gradcheck.compare(std.testing.allocator, tiny, p, tok, &.{ tiny.vocab_size, 0, 0, 0 }, &g));
+    try std.testing.expectEqual(@as(u32, @bitCast(before)), @as(u32, @bitCast(p.tok_embed.data[0])));
+}
 
-    const r = try gradcheck.compare(std.testing.allocator, tiny, p, tok, tgt, tol, &g);
+test "autograd: a wrong gradient is named, with its index" {
+    // The silence on a passing run is only worth anything if a failing run
+    // still says what went wrong, so the failure path needs a gradient that is
+    // actually wrong. The corruption has to be small enough to prove the budget
+    // discriminates and large enough to be past it, which at one percent of the
+    // element is the case on the largest one: the old budget was nine percent of
+    // the element wide and swallowed a one percent error outright.
+    var p = try liveParams(std.testing.allocator, tiny);
+    defer p.deinit();
+    var g = try autograd.zeroGrads(std.testing.allocator, p);
+    defer g.deinit();
+    _ = try lossAndGrads(std.testing.allocator, tiny, p, tok, tgt, &g);
+
+    // The largest gradient in the tensor, so one percent of it is as far above
+    // the floor as an element gets. An element below the floor cannot be
+    // resolved in f32 at all, and corrupting one of those proves nothing: no
+    // derived budget can see it, and a chosen one that could would be a chosen
+    // one.
+    var wrong: usize = 0;
+    for (g.tok_embed.data, 0..) |v, i| {
+        if (@abs(@as(f64, @floatCast(v))) > @abs(@as(f64, @floatCast(g.tok_embed.data[wrong])))) wrong = i;
+    }
+    const truth = g.tok_embed.data[wrong];
+    const one_percent = 0.01 * @as(f64, @floatCast(truth));
+
+    // The positive half, first: the untouched gradient is accepted. A check that
+    // rejected everything would satisfy the rest of this test just as well.
+    const clean = try gradcheck.compare(std.testing.allocator, tiny, p, tok, tgt, &g);
+    defer clean.deinit();
+    try std.testing.expectEqual(@as(?gradcheck.Mismatch, null), clean.mismatch);
+    // And the floor it was accepted against has to be the derived one, small
+    // enough that one percent of this element is well past it. This is the
+    // assertion that fails if the budget is loosened again.
+    try std.testing.expect(one_percent > 10 * clean.floor);
+
+    g.tok_embed.data[wrong] = truth + @as(f32, @floatCast(one_percent));
+
+    const r = try gradcheck.compare(std.testing.allocator, tiny, p, tok, tgt, &g);
     defer r.deinit();
 
     const m = r.mismatch orelse {
-        std.debug.print("\ntok_embed[{d}] moved by 1.0 was not reported\n", .{wrong});
+        std.debug.print("\ntok_embed[{d}] wrong by 1% was not reported, floor {e}\n", .{ wrong, r.floor });
         return error.TestUnexpectedResult;
     };
     try std.testing.expectEqual(@as(?usize, null), m.layer);
     try std.testing.expectEqualStrings("tok_embed", m.field);
     try std.testing.expectEqual(wrong, m.index);
-    // The gap is the move, and the finite difference still reads the truth,
-    // within the same budget the check itself used.
-    try std.testing.expectApproxEqRel(1.0, m.diff, 1e-3);
-    try std.testing.expect(@abs(m.numeric - @as(f64, truth)) < tol * @abs(@as(f64, truth)) + 1e-3);
+    // The gap is the corruption, and the finite difference still reads the
+    // truth, both to within the same budget the check itself used.
+    try std.testing.expect(m.diff > m.budget);
+    try std.testing.expect(@abs(m.diff - one_percent) < m.budget);
+    try std.testing.expect(@abs(m.numeric - @as(f64, @floatCast(truth))) < m.budget);
 
     const text = try gradcheck.line(std.testing.allocator, m);
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.startsWith(u8, text, "gradient mismatch at tok_embed[37]:"));
+    var want: [64]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&want, "gradient mismatch at tok_embed[{d}]:", .{wrong});
+    try std.testing.expect(std.mem.startsWith(u8, text, prefix));
 }
 
 test "autograd: the tied head's two paths into tok_embed are separable" {
@@ -273,7 +312,7 @@ test "autograd: the tied head's two paths into tok_embed are separable" {
 
     // And the finite difference agrees with the whole thing, which is the part
     // that matters: the split above is a property, the gradcheck is the proof.
-    try gradcheck.checkAll(std.testing.allocator, cfg, p, one, away, tol);
+    try gradcheck.checkAll(std.testing.allocator, cfg, p, one, away);
 }
 
 /// The final hidden state the tied head sees, rebuilt from the stream the same
@@ -300,9 +339,9 @@ fn finalHidden(allocator: std.mem.Allocator, p: model.Params, cfg: model.Config,
         defer k.deinit();
         var v = try tensor.matmul(attn_in, l.wv);
         defer v.deinit();
-        var qp = try rope.forward(allocator, q, 0, 500000);
+        var qp = try rope.forward(allocator, q, 0, 500000, cfg.head_dim);
         defer qp.deinit();
-        var kp = try rope.forward(allocator, k, 0, 500000);
+        var kp = try rope.forward(allocator, k, 0, 500000, cfg.head_dim);
         defer kp.deinit();
         var ctx = try attention.forward(allocator, qp, kp, v, .{
             .n_heads = cfg.n_heads,

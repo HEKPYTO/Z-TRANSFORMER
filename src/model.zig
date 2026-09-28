@@ -147,6 +147,10 @@ pub fn forward(allocator: std.mem.Allocator, p: Params, cfg: Config, tokens: []c
     // that disagrees with the parameters it was built from would panic on a
     // valid token rather than report the mismatch.
     if (p.tok_embed.rows != cfg.vocab_size or p.tok_embed.cols != d) return error.DimensionMismatch;
+    // The layer count is the one shape the embedding cannot imply: a config
+    // built for a shallower or deeper stack would pass the check above and then
+    // run the depth it was handed, ignoring the parameters it was handed.
+    if (p.layers.len != cfg.n_layers) return error.DimensionMismatch;
 
     var x = try Tensor.init(allocator, t_count, d);
     errdefer x.deinit();
@@ -196,9 +200,9 @@ pub fn forward(allocator: std.mem.Allocator, p: Params, cfg: Config, tokens: []c
         // RoPE sits between the projection and the attention, at absolute
         // position 0, because a training batch always starts there. Sampling
         // with a cache is a later phase and brings its own position.
-        var q_pos = try rope.forward(allocator, q, 0, rope_theta);
+        var q_pos = try rope.forward(allocator, q, 0, rope_theta, cfg.head_dim);
         defer q_pos.deinit();
-        var k_pos = try rope.forward(allocator, k, 0, rope_theta);
+        var k_pos = try rope.forward(allocator, k, 0, rope_theta, cfg.head_dim);
         defer k_pos.deinit();
         // v is not rotated, so it goes to attention as projected.
 

@@ -2,6 +2,7 @@ zig-out/
 .zig-cache/
 .worktrees/
 outputs/*.bin
+outputs/vocab.json
 samples/
 *.o
 *.obj

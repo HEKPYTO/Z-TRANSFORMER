@@ -71,11 +71,27 @@ fn readFileAt(path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
 }
 
-/// A path under the scratch directory, created if it is not there. The caller
-/// frees the path and defers `removeFile`.
+/// A path under a per-process scratch directory, created if it is not there.
+/// The caller frees the path and defers `removeFile`.
+///
+/// The pid is in the directory name because these names are fixed strings. Two
+/// copies of this suite in one tree — a Debug and a ReleaseFast binary, or two
+/// shells running `zig test` — both wrote `zig-out/train_test/a.csv` and each
+/// one's deferred `removeFile` took the other's file out from under it. The
+/// failure surfaced as `FileNotFound` on a read that had already succeeded, and
+/// it reproduced 5 times in 5 rounds when the same binary was run twice
+/// concurrently. Serialising the two modes in the build hid it; the collision
+/// was always there for anyone who ran the suite in two shells.
 fn scratchPath(name: []const u8) ![]u8 {
-    _ = try std.Io.Dir.cwd().createDirPathStatus(io, scratch_dir, .default_dir);
-    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ scratch_dir, name });
+    // One allocation, freed by the caller. Formatting the directory and the file
+    // name separately would leak the directory string on the success path, which
+    // the leak-detecting allocator this suite runs under reports as a test
+    // failure rather than as noise.
+    const path = try std.fmt.allocPrint(gpa, "{s}/{d}/{s}", .{ scratch_dir, std.c.getpid(), name });
+    errdefer gpa.free(path);
+    const dir = std.fs.path.dirname(path).?;
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
+    return path;
 }
 
 fn removeFile(path: []const u8) void {
