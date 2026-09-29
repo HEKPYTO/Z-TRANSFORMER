@@ -48,8 +48,71 @@ const two_layers = model.Config{
     .ffn_mult = 1,
 };
 
-/// Four distinct tokens, so every position owns a tok_embed row of its own and
-/// the gradient scatter is position resolvable.
+/// One layer, `d_model` 12 and 1 kv head, so `d_model`, the kv width and
+/// `head_dim` are all 12: none of the three is a multiple of the eight the
+/// backward pass's unrolled loops split by, and 12 is one full group plus a
+/// four wide tail, so each one runs its unrolled prefix and its scalar tail.
+///
+/// Every other fixture in the repository lands on a multiple of eight by
+/// accident — `tiny` has `d_model` 8, `two_layers` has `d_model` 8, the 4 layer
+/// default has 128 — so the unrolled prefix runs everywhere and the scalar
+/// tail that finishes an odd width runs nowhere. A tail that dropped its last
+/// element, or started one element early and overwrote the lane before it,
+/// would pass every other gradient test in this file. This is the shape that
+/// fails instead, and it is the only coverage the tails have.
+///
+/// `head_dim` was 4 here and that covered none of `attentionBackward`: at 4 the
+/// unrolled `d q` and `d k d v` splits run zero groups and the whole of both is
+/// tail. `n_heads` 3 and `head_dim` 4 also summed to a `d_model` of 12, so
+/// dropping the head count to 1 and raising `head_dim` to 12 buys the coverage
+/// at the same `d_model`, the same kv width and the same finite-difference
+/// budget this fixture was already paying.
+const unroll_tail = model.Config{
+    .n_layers = 1,
+    .n_heads = 1,
+    .n_kv_heads = 1,
+    .head_dim = 12,
+    .n_ctx = 32,
+    .vocab_size = 16,
+    .ffn_mult = 1,
+};
+
+/// Nine tokens, so `t + 1` reaches 9 and the `s`-split loops in
+/// `attentionBackward` unroll at least once. `tok` above is four tokens, which
+/// is the only array any `checkAll` in this repository was passed, and four is
+/// below `lanes`, so the eight-way `s` bodies never executed under a finite
+/// difference check. They did execute in `train_test.zig`, but that compares
+/// `train.run` against `clearedWalk` — two calls to the same `backward` — so a
+/// wrong unroll is wrong identically in both arms and the comparison passes.
+const tok8: []const u32 = &.{ 3, 1, 4, 0, 5, 9, 2, 6, 11 };
+const tgt8: []const u32 = &.{ 1, 4, 0, 5, 9, 2, 6, 11, 7 };
+
+/// Four heads over two kv heads at `head_dim` 12, so `d_model` is 48 and both
+/// `h * dim` and `kv * dim` are nonzero for some head. `unroll_tail` above is
+/// `n_heads 1, n_kv_heads 1`, which makes both offsets identically zero in the
+/// only finite-difference check that reached those lines: an unrolled lane that
+/// indexed the wrong head or the wrong kv head would have passed. Two kv heads
+/// is the minimum, because `kv = h / group` and `group = n_heads / n_kv_heads`,
+/// so with one kv head `kv` is zero for every head.
+///
+/// `head_dim` 12 again gives one lane group of eight plus a four-wide tail, so
+/// this fixture covers the `head_dim` splits in both halves.
+const unroll_s = model.Config{
+    .n_layers = 1,
+    .n_heads = 4,
+    .n_kv_heads = 2,
+    .head_dim = 12,
+    .n_ctx = 16,
+    .vocab_size = 16,
+    .ffn_mult = 1,
+};
+
+/// Four distinct tokens, so every position owns a `tok_embed` row of its own and
+/// the gradient scatter is position resolvable. It is also, and that is the
+/// reason it is worth reading, **below `lanes`**: every `checkAll` in this file
+/// was for a long time passed this array or `one`, so the `s`-split loops in
+/// `attentionBackward`, which need eight positions before they unroll at all,
+/// executed in no finite-difference check anywhere in the repository.
 const tok: []const u32 = &.{ 3, 1, 4, 0 };
 const tgt: []const u32 = &.{ 1, 4, 0, 2 };
 
@@ -173,6 +236,18 @@ test "autograd: gradcheck every parameter element on the tiny config" {
     var p = try liveParams(std.testing.allocator, tiny);
     defer p.deinit();
     try gradcheck.checkAll(std.testing.allocator, tiny, p, tok, tgt);
+}
+
+test "autograd: gradcheck every parameter element where the matmul unroll tails run" {
+    var p = try liveParams(std.testing.allocator, unroll_tail);
+    defer p.deinit();
+    try gradcheck.checkAll(std.testing.allocator, unroll_tail, p, tok, tgt);
+}
+
+test "autograd: gradcheck where the attention backward unrolls execute" {
+    var p = try liveParams(std.testing.allocator, unroll_s);
+    defer p.deinit();
+    try gradcheck.checkAll(std.testing.allocator, unroll_s, p, tok8, tgt8);
 }
 
 test "autograd: gradcheck passes for two layers" {

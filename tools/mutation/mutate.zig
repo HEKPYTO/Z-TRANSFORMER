@@ -152,6 +152,20 @@ const mutations = [_]Mutation{
         .to = "    const group: usize = 1;",
     },
     .{
+        .name = "attn-unroll-lane-write",
+        .file = "src/autograd.zig",
+        .what = "one unrolled lane in the gathered-row score dot writes lane zero's " ++
+            "result, so seven of the eight prefixes in a group take the same dot product",
+        .from =
+        \\                        probs[s + u] = dot[u] * scale;
+        \\                        row_max = @max(row_max, probs[s + u]);
+        ,
+        .to =
+        \\                        probs[s + u] = dot[0] * scale;
+        \\                        row_max = @max(row_max, probs[s + u]);
+        ,
+    },
+    .{
         .name = "attn-no-rowmax",
         .file = "src/attention.zig",
         .what = "the softmax row max is dropped: every exp is taken on the raw score",

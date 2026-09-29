@@ -1,6 +1,6 @@
 # src/cuda
 
-Five files. `norm.cu` is the first kernel this project ships: RMSNorm on the GPU, checked against the
+Six files. `norm.cu` is the first kernel this project ships: RMSNorm on the GPU, checked against the
 CPU twin in `src/norm.zig`. `norm_twin.zig` is the CPU half of that check. `run-norm.sh` runs both.
 `probe.cu` is the older toolchain probe and `run-probe.sh` runs it.
 
@@ -9,6 +9,7 @@ CPU twin in `src/norm.zig`. `norm_twin.zig` is the CPU half of that check. `run-
 | `norm.cu` | The kernel, the parity gate, and the benchmark. All of it, no CPU reference. |
 | `norm_twin.zig` | Generates inputs, runs `norm.forward`, writes the reference output and its own timings. |
 | `run-norm.sh` | Compiles and runs both halves and exits non-zero on a failed check. |
+| `run-probe.sh` | Compiles and runs the probe, the same container recipe, no parity. |
 | `cuda.sh` | The container, image pin and nvcc flags, shared by the two runners. |
 | `probe.cu` | Toolchain probe. Nothing here is a transformer operation except `norm.cu`. |
 
@@ -73,8 +74,9 @@ ordinary `f32` storage rounding rather than accumulation.
 ### One `f64` per row, on purpose
 
 After the tree reduction the total is widened to `f64` once per **row**, and the divide, the `eps`
-add, the square root and the narrowing back to `f32` all happen in `f64`, exactly as
-`src/norm.zig:24` does. It is free: 4096 rows ask for 4096 double divisions and square roots
+add, the square root and the narrowing back to `f32` all happen in `f64`, exactly as the
+`@sqrt(sum_sq / d + eps)` in `norm.forward` does. It is free: 4096 rows ask for 4096 double
+divisions and square roots
 against 16.7 million `f32` loads, and the kernel is bandwidth bound long before that.
 
 Doing it this way means the only thing left that can differ between the two implementations is the
@@ -194,15 +196,15 @@ host named above, quoted as it printed. Microseconds per call:
 
 ```
 shape        size          elements        cpu   cpu_core        gpu   gpu_sync    gpu_e2e      win
-micro        32x32             1024       3.44       2.38       3.70       8.09      17.07     0.6x
-small        32x128            4096      14.13       9.96       3.37       7.65      19.40     3.0x
-mid          128x128          16384      83.79      39.56       4.73       9.34      35.91     8.4x
-ship         256x128          32768     162.88      78.95       7.72      12.23      55.87    10.2x
-tall         4096x128        524288    2600.90    1299.00      83.51      83.38     672.00    15.6x
-r1024c512    1024x512        524288    2642.97    1336.26      21.63      25.57     528.03    61.8x
-r256c2048    256x2048        524288    2727.09    1426.18       8.67      12.56     514.61   164.5x
-r1024c2048   1024x2048      2097152   11272.11    5623.92      28.79      32.75    2158.18   195.4x
-big          4096x4096     16777216   91628.05   43564.09     228.07     231.06   21826.60   191.0x
+micro        32x32             1024       2.57       1.48       4.01       8.88      20.47     0.4x
+small        32x128            4096      14.46      10.20       3.67       8.99      24.30     2.8x
+mid          128x128          16384      84.59      39.93       5.22      10.34      41.38     7.7x
+ship         256x128          32768     164.01      79.61       8.37      13.45      65.85     9.5x
+tall         4096x128        524288    2598.10    1294.84      88.71      99.03     640.13    14.6x
+r1024c512    1024x512        524288    2636.21    1338.12      23.70      32.46     577.02    56.5x
+r256c2048    256x2048        524288    2633.58    1336.36       8.58      25.73     552.39   155.7x
+r1024c2048   1024x2048     2097152   10963.06    5479.28      29.49      45.54    2233.12   185.8x
+big          4096x4096     16777216   90694.79   43489.45     257.37     229.35   22949.36   169.0x
 ```
 
 A rerun does not print these bytes again, and the reason is on the next line: run to run the small
@@ -213,39 +215,41 @@ and every figure quoted below is a subtraction or a ratio of two cells in it.
 ### The two numbers that were asked for
 
 **Shipped model shape, `256x128`**, which is `d_model 128` at a full context window of 256. The
-kernel on its own is `7.72 us`; `norm.zig`'s arithmetic is `78.95 us`. On that measure the GPU is
-`10.2x` faster, and that is the two cells in the `ship` row divided.
+kernel on its own is `8.37 us`; `norm.zig`'s arithmetic is `79.61 us`. On that measure the GPU is
+`9.5x` faster, and that is the two cells in the `ship` row divided.
 
-**Large shape, `4096x4096`.** The kernel is `228 us`; `norm.zig`'s arithmetic is `43.6 ms`. The GPU
-is `191x` faster, and here the number means what it looks like: `4096 * 4096 * 4` bytes in and the
-same out is 128 MiB, and 128 MiB of traffic at roughly 900 GB/s is about 220 us, which is what the
-kernel does.
+**Large shape, `4096x4096`.** The kernel is `257 us`; `norm.zig`'s arithmetic is `43.5 ms`. The GPU
+is `169x` faster, and here the number is the bandwidth it can actually reach: `4096 * 4096 * 4`
+bytes in and the same out is 128 MiB, and 128 MiB in 257 us is 521 GB/s, which is 57% of this
+card's 912 GB/s. The earlier run of this table read 228 us and is worth keeping as the reason
+this number is quoted as a fraction of peak rather than as one: a second run on an idle GPU
+moved it 13%, and the honest claim is the ratio, not the microseconds.
 
 ### The crossover, and why the shipped-shape number is not the interesting one
 
-The crossover is between `1024` elements, where the kernel loses (`3.70 us` against `2.38 us`), and
-`4096` elements, where it wins (`3.37 us` against `9.96 us`). So it is a few thousand elements, which
-is far below anything this model builds.
+The crossover is between `1024` elements, where the kernel loses (`4.01 us` against `1.48 us`), and
+`4096` elements, where it wins (`3.67 us` against `10.20 us`). So it is a few thousand elements,
+which is far below anything this model builds.
 
-That floor is the whole story at the shipped size, and it is why the `10.2x` should not be read as
+That floor is the whole story at the shipped size, and it is why the `9.5x` should not be read as
 "this model would be faster on a GPU":
 
-- The kernel takes `3.70 us` at 1024 elements, `3.37 us` at 4096, `4.73 us` at 16384 and `7.72 us` at
+- The kernel takes `4.01 us` at 1024 elements, `3.67 us` at 4096, `5.22 us` at 16384 and `8.37 us` at
   32768. From 1024 to 32768 elements, thirty-two times the work, and the time only doubles. Almost
   all of it is launch and block scheduling. The actual work at `256x128` is 256 KiB of traffic, about
   `0.3 us` at peak bandwidth.
-- The CPU side is slow for a reason that is specific to `norm.zig` rather than to RMSNorm. `78.95
-  us` over `32768` elements is `2.4 ns` per element, and the reason is readable in the source: it is
+- The CPU side is slow for a reason that is specific to `norm.zig` rather than to RMSNorm. `79.61
+  us` over `32768` elements is `2.43 ns` per element, and the reason is readable in the source: it is
   a serial `f64` accumulation, so each row is one dependency chain of 128 `f64` adds with no ILP to
   fill it. That is a correct and deliberate choice for the CPU implementation, and this kernel is
   not evidence that it was the wrong one.
 
-The number that actually governs a decision is `gpu_e2e`, and at the shipped shape it is `55.87 us`
-against a CPU call of `162.88 us`. This repository has no device-resident tensor type yet, so every
-call copies 128 KiB in and 128 KiB out over PCIe, and that transfer is all but the `7.72 us` of
-kernel: `55.87 - 7.72` is six tenths of the `78.95 us` the CPU spends on the same arithmetic. With
-4 layers and 2 norms per layer, one forward pass spends `8 * 55.87`, about 450 us, copying RMSNorm
-inputs before any arithmetic happens.
+The number that actually governs a decision is `gpu_e2e`, and at the shipped shape it is `65.85 us`
+against a CPU call of `164.01 us`. This repository has no device-resident tensor type yet, so every
+call copies 128 KiB in and 128 KiB out over PCIe, and that transfer is all but the `8.37 us` of
+kernel: `65.85 - 8.37` is `57.48 us`, which is 72% of the `79.61 us` the CPU spends on the same
+arithmetic. With 4 layers and 2 norms per layer, one forward pass spends `8 * 65.85`, about 527 us,
+copying RMSNorm inputs before any arithmetic happens.
 
 **So: no end-to-end speedup is claimed at the shipped model size.** The kernel is correct there, it
 is faster than this CPU implementation there when the buffers are already on the device, and neither
@@ -271,13 +275,13 @@ in this directory changes that yet.
 
 ### Known limitation
 
-`tall` at `4096x128` is the same element count as `r256c2048` and takes `83.51 us` against
-`8.67 us`, about 10x worse, with no more memory traffic. The cause is the fixed block size: at
+`tall` at `4096x128` is the same element count as `r256c2048` and takes `88.71 us` against
+`8.58 us`, about 10x worse, with no more memory traffic. The cause is the fixed block size: at
 `cols = 128` only 128 of the 256 threads in a block have an element to read, so half the block idles,
 and 4096 blocks each pay the full per-block cost for one element. Widening the row hides it and
 narrowing it exposes it.
 
-`ship` is `256x128` and costs `7.72 us`, so the shipped model is on the right side of this for its
+`ship` is `256x128` and costs `8.37 us`, so the shipped model is on the right side of this for its
 row count, but a batch large enough to make 4096 rows out of 128-wide rows would land in the slow
 case. The fix is to dispatch on a block size that fits the row, which needs the warp count to be a
 template parameter rather than the `WARPS` constant it is now. Not done: it is an optimisation, not
@@ -321,9 +325,8 @@ then fails to resolve it.
 ### `addCudaFile` does not exist in Zig 0.16.0
 
 `grep -rn addCudaFile` over `std/` returns nothing. The real API is `Module.addObjectFile(object:
-LazyPath)` (`std/Build/Module.zig:460`) and `Module.linkSystemLibrary("cudart", .{})`
-(`std/Build/Module.zig:363`), which takes three arguments.
-`Step.Run.addOutputFileArg(basename) LazyPath` (`std/Build/Step/Run.zig:279`) returns exactly the
+LazyPath)` and `Module.linkSystemLibrary("cudart", .{})`, which takes three arguments.
+`Step.Run.addOutputFileArg(basename) LazyPath` returns exactly the
 `LazyPath` that `addObjectFile` wants, so an nvcc step and a link can be wired together without a
 temporary path or a file read back off disk.
 
@@ -350,10 +353,10 @@ no root and there is nothing to run `ldconfig` with.
 
 ## How the CPU side is invoked, and why
 
-`norm_twin.zig` is not a build target and `build.zig` does not mention it. It runs the way
-`tools/train_bpe.zig` does, as a root module with a `src/` file brought in as a second module,
-because a module root in Zig 0.16 may not import a file outside its own directory and
-`zig run src/cuda/norm_twin.zig` cannot reach `../norm.zig` at all:
+`norm_twin.zig` is not a build target and `build.zig` does not mention it. It runs as a root
+module with a `src/` file brought in as a second module, because a module root in Zig 0.16 may not
+import a file outside its own directory and `zig run src/cuda/norm_twin.zig` cannot reach
+`../norm.zig` at all:
 
 ```sh
 zig build-exe -OReleaseFast -OReleaseFast --dep ztransformer \

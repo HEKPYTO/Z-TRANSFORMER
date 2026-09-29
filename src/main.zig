@@ -30,10 +30,24 @@ const csv_path = "outputs/loss.csv";
 /// lost artifact, so the run reports first and replaces second. Never committed,
 /// and `.gitignore` covers it: see `outputs/README.md`.
 const csv_pending_path = "outputs/loss.pending.csv";
-/// The digest the committed curve is claimed to have, from `build.zig`. Named
-/// here rather than only there so the message below can print the two sides of a
-/// mismatch without the reader leaving the terminal to run `shasum`.
-const csv_sha256 = "f1dd54445064810c28002dcacaf23b4bc82bb1e6ecfa28f5ed91e7fa4518f792";
+/// The digest the committed curve is claimed to have.
+///
+/// The one owner of this constant. `build.zig` reads it from here rather than
+/// keeping a second copy: two copies of a digest that a reader is told to
+/// update is a wedge with the tool's own recovery instructions on it, because
+/// updating the one `verify` checks leaves `train` permanently unable to
+/// promote. So when the claim changes, this is the line that changes, and the
+/// `verify` digest check follows from it rather than needing a second edit.
+pub const csv_sha256 = "f1dd54445064810c28002dcacaf23b4bc82bb1e6ecfa28f5ed91e7fa4518f792";
+/// How a reader says "I have looked at the two curves and I know why they
+/// differ" without promoting anything. A presence check, not a value check: any
+/// value acknowledges, because the act is the reader's and the content of the
+/// variable is not read by anything.
+///
+/// An environment variable rather than a flag because the binary reads no flags
+/// and `zig build train` passes no arguments: adding one would mean a second
+/// parsing path in a program whose whole argument contract is one word.
+const accept_var = "ZTRANSFORMER_ACCEPT_LOSS_DIFFERENCE";
 /// The 95/5 split `data/README.md` fixes, applied here because this is the only
 /// shipped caller of `data.split`.
 const val_fraction = 0.05;
@@ -56,10 +70,17 @@ const epochs = 1;
 const seed = 7;
 
 pub fn main(init: std.process.Init) !void {
-    // The arena owns the corpus, the vocabulary and the run's result for the
-    // length of the process, so nothing here has a per-allocation teardown.
-    const gpa = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(gpa);
+    // `init.arena` is permanent storage for the process and `init.gpa` is the
+    // runtime's general purpose allocator, and the two are not interchangeable.
+    // An arena's `free` is a no-op, so a caller that frees as it runs has to be
+    // handed the gpa or it never gives the memory back. The corpus, the
+    // vocabulary and the merges are read for the whole process and are the
+    // arena's; a training step frees its cache, its logits and its gradient
+    // buffers as it goes, so the run is the gpa's. It was the arena's once, and
+    // the cost was that the peak was the sum of all 123 steps' working sets
+    // rather than one step's.
+    const arena = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(arena);
 
     if (args.len > 1) {
         // Exactly one argument. The binary reads no flags, so a second one is
@@ -69,8 +90,8 @@ pub fn main(init: std.process.Init) !void {
         // callers this ships to, `zig build train` and `zig build run -- parity`,
         // each pass one, so nothing legitimate is refused.
         if (args.len == 2) {
-            if (std.mem.eql(u8, args[1], "train")) return runTrain(gpa, init.io);
-            if (std.mem.eql(u8, args[1], "parity")) return runRemoved(gpa, init.io);
+            if (std.mem.eql(u8, args[1], "train")) return runTrain(arena, init.gpa, init.io, init.environ_map);
+            if (std.mem.eql(u8, args[1], "parity")) return runRemoved(arena, init.io);
             if (std.mem.eql(u8, args[1], "scale-profile")) return runScaleProfile(init.io);
         }
         std.debug.print("usage: {s} [train|parity|scale-profile]\n", .{args[0]});
@@ -83,8 +104,17 @@ pub fn main(init: std.process.Init) !void {
     try stdout.interface.flush();
 }
 
-fn runTrain(gpa: std.mem.Allocator, io: Io) !void {
-    const whole = try Io.Dir.cwd().readFileAlloc(io, corpus_path, gpa, .unlimited);
+/// `arena` is `init.arena` and `gpa` is `init.gpa`, split for the reason
+/// `main` gives. The run's `Result` is freed back into `gpa` by its own
+/// `deinit` below, so the trained weights do not outlive the allocator that
+/// produced them.
+fn runTrain(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+) !void {
+    const whole = try Io.Dir.cwd().readFileAlloc(io, corpus_path, arena, .unlimited);
     // `@min`, not a bare slice. `corpus_bytes` is a cap, and a cap that is
     // longer than the file is a cap that reads past the end: the checked build
     // panics, and `zig build train` links a ReleaseFast binary where the bounds
@@ -93,9 +123,9 @@ fn runTrain(gpa: std.mem.Allocator, io: Io) !void {
     // this never fires today, which is exactly why it survived: the only way to
     // see it is to hand the binary a small file.
     const text = whole[0..@min(whole.len, corpus_bytes)];
-    var tk = try tokenizer.Tokenizer.init(gpa);
+    var tk = try tokenizer.Tokenizer.init(arena);
     try tk.train(text, n_merges);
-    const ids = try tk.encode(gpa, text);
+    const ids = try tk.encode(arena, text);
     const corpus = try data.split(ids, val_fraction);
 
     var cfg: train.Config = .{
@@ -156,7 +186,7 @@ fn runTrain(gpa: std.mem.Allocator, io: Io) !void {
         res.val_loss,
     });
     try w.flush();
-    try settleCsv(io);
+    try settleCsv(io, environ);
 }
 
 /// Compares the curve just written against the digest the repository claims for
@@ -166,19 +196,45 @@ fn runTrain(gpa: std.mem.Allocator, io: Io) !void {
 /// pending file gone, which is what makes a reproducing run leave the tree as
 /// clean as it found it.
 ///
-/// On a mismatch it does not replace anything and it does not fail. The run
-/// itself is what it is either way; only the question of which bytes are the
-/// committed ones is open, and a different answer there is not a broken build.
-/// `@exp`, `@sqrt` and `@cos` resolve to the platform libm, and Debug differs
-/// from release by about one f32 ulp per step, so a host or a build
-/// configuration that disagrees here has produced a legitimate run of its own.
-/// The pending file is kept so the reader can diff the two curves, and the
-/// message says which is which instead of printing a bare mismatch: the exit
-/// status stays 0, because failing it would report a host difference as a
-/// defect, and a gate that cries wolf is worse than no gate.
-fn settleCsv(io: Io) !void {
+/// A digest mismatch exits non-zero, always, and promotion still requires the
+/// bytes to be equal. The exit status no longer depends on a magnitude
+/// threshold, and the reason is measured rather than preferred.
+///
+/// The threshold was built and then refuted by this repository's own two cases.
+/// A budget of `steps * f32_epsilon * max_loss` — one f32 ulp per step, added,
+/// which is what `src/README.md` documents — is 9.5e-5 on the committed curve.
+/// `optim.AdamW.beta1` at 0.85 instead of 0.9 lands 1667x outside it, so that
+/// case is caught. A Debug build of the identical source lands 189x outside it,
+/// at step 74, and the run is fine. Worse, its disagreements are 39507, 6119,
+/// -51706, 3219 and 9508 ulp at successive rows: not growing, not shrinking,
+/// changing sign. That is trajectory chaos, where a one-ulp difference in an
+/// early weight changes every weight after it, and it is unbounded in the step
+/// count in a way no additive bound can express. A threshold between the two
+/// cases would have to be 0.018 to 0.158 wide, which is a chosen constant
+/// wearing a derivation's clothes, and it would move with the seed, the host's
+/// libm, and the length of the run.
+///
+/// So the default is loud. A mismatch is a discrepancy the reader has not yet
+/// explained, and this tool does not have the information to explain it: it can
+/// name the size and the step, and it cannot say whether a size that big is a
+/// broken build or a different machine. `ZTRANSFORMER_ACCEPT_LOSS_DIFFERENCE=1`
+/// is how a reader who has looked says so, and until they do the run fails and
+/// the committed curve is left alone. The variable does not promote anything: it
+/// acknowledges a difference the reader has taken responsibility for, which is
+/// a different act from changing the claim.
+///
+/// What survives from the threshold attempt is the measurement, because the
+/// reader needs a number to judge the difference by and the number is the same
+/// one either way: the largest disagreement, the step it is at, and the column.
+/// Nothing here asserts a cause. A reader who has a reason can act on it.
+///
+/// The committed file is never replaced on a mismatch and the pending file is
+/// never deleted, and the message says where the pending curve is and how to
+/// diff it in both cases. Nothing here discards a curve a reader has not read.
+fn settleCsv(io: Io, environ: *std.process.Environ.Map) !void {
     const dir = Io.Dir.cwd();
     const fresh = try dir.readFileAlloc(io, csv_pending_path, std.heap.page_allocator, .unlimited);
+    const committed = try dir.readFileAlloc(io, csv_path, std.heap.page_allocator, .unlimited);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(fresh, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
@@ -188,24 +244,130 @@ fn settleCsv(io: Io) !void {
         return;
     }
 
+    // The measurement, when the two files are comparable at all. A curve of a
+    // different shape has no cells to measure, and that is a louder failure than
+    // a large disagreement, not a quieter one.
+    const d = train.divergence(committed, fresh) catch |err| {
+        std.debug.print(
+            \\
+            \\zig build train: this run's curve could not be compared with the committed one ({s}).
+            \\
+            \\  committed  {s}  sha256 {s}
+            \\  this run   {s}  sha256 {s}
+            \\
+            \\  The two are not the same shape of file, so there is no cell-by-cell
+            \\  comparison to report. The committed curve was not replaced and this run's
+            \\  is at {s}, kept rather than deleted.
+            \\
+            \\  Compare them:  diff {s} {s}
+            \\  To accept this run as the committed one, copy it over {s} and update
+            \\  csv_sha256 in src/main.zig, which is where the digest is owned and
+            \\  where build.zig reads it from. That is a change to the claim, so it is
+            \\  yours to make.
+            \\
+        , .{
+            @errorName(err),
+            csv_path,
+            csv_sha256,
+            csv_pending_path,
+            hex,
+            csv_pending_path,
+            csv_path,
+            csv_pending_path,
+            csv_path,
+        });
+        return err;
+    };
+
+    // Acknowledged, or not. `ZTRANSFORMER_ACCEPT_LOSS_DIFFERENCE=1` is a reader
+    // saying they have looked at the two curves and know why they differ. It does
+    // not promote: the committed file is still only replaced on a digest match,
+    // because acknowledging a difference is not the same act as changing what
+    // this repository claims, and conflating the two is what made the old message
+    // assert a cause nobody had checked.
+    if (environ.get(accept_var) != null) {
+        std.debug.print(
+            \\
+            \\zig build train: this run did not reproduce the committed {s}, and you have
+            \\  acknowledged the difference with {s}=1.
+            \\
+            \\  committed  {s}  sha256 {s}
+            \\  this run   {s}  sha256 {s}
+            \\
+            \\  Largest disagreement  {d:.9} at step {d}, {s}: {d:.6} against {d:.6}
+            \\  On a curve of {d} steps with a largest loss of {d:.6}
+            \\
+            \\  Exiting 0 because you said so. The committed curve was NOT replaced and
+            \\  this run's is at {s}, kept. This message says the bytes differ and that
+            \\  you accepted that; it does not claim to know why they differ.
+            \\
+            \\  Compare them:  diff {s} {s}
+            \\
+        , .{
+            csv_path,           accept_var,       csv_path,   csv_sha256,
+            csv_pending_path,   hex,              d.absolute, d.step,
+            @tagName(d.column), d.committed,      d.fresh,    d.steps,
+            d.max_loss,         csv_pending_path, csv_path,   csv_pending_path,
+        });
+        return;
+    }
+
     std.debug.print(
         \\
-        \\zig build train: this run did not reproduce the committed {s}.
+        \\zig build train: this run did not reproduce the committed {s}. Failing, because
+        \\  nothing has established that the difference is benign.
+        \\
         \\  committed  {s}  sha256 {s}
         \\  this run   {s}  sha256 {s}
         \\
-        \\  Both files are intact and the run exited 0. They differ because the
-        \\  arithmetic is host- and configuration-dependent, not because anything
-        \\  here is wrong: @exp, @sqrt and @cos resolve to the platform libm, and
-        \\  Debug differs from release by about one f32 ulp per step. The
-        \\  criterion is one seed, one build configuration, one host; see the
-        \\  Reproducibility section of src/README.md.
+        \\  Largest disagreement  {d:.9} at step {d}, {s}: {d:.6} against {d:.6}
+        \\  On a curve of {d} steps with a largest loss of {d:.6}
         \\
-        \\  To see whether the run itself is sound, diff the two curves. To accept
-        \\  this run as the new committed one, copy it over {s} and put its digest
-        \\  in build.zig; that is a change to the claim, so it is yours to make.
+        \\  There are two reasons these bytes can differ, and this run cannot tell them
+        \\  apart. Either something is wrong with the run — a gradient, a schedule, an
+        \\  optimizer constant — or this is a different machine or a different build
+        \\  configuration, where @exp, @sqrt and @cos resolve to a different libm and a
+        \\  one-ulp difference in an early weight moves every weight after it. A wrong
+        \\  optimizer constant lands about 0.16 out at step 24 here; a Debug build of the
+        \\  identical source lands about 0.018 out at step 74. The gap between those is
+        \\  8.8x, it moves with the seed, the libm and the run length, and no threshold
+        \\  derived from it would be a fact about anything but this one host.
         \\
-    , .{ csv_path, csv_path, csv_sha256, csv_pending_path, hex, csv_path });
+        \\  So: look at the curve before deciding.
+        \\    compare  diff {s} {s}
+        \\    broken   a large disagreement from step 1, growing, is a defect
+        \\    host     a disagreement that wanders and changes sign is a different machine
+        \\
+        \\  If it is a host difference and you accept it, re-run with:
+        \\    {s}=1 zig build train
+        \\  which exits 0 and still does not replace the committed curve. Accepting a
+        \\  difference is not the same as changing the claim; to do that, copy {s} over
+        \\  {s} and update csv_sha256 in src/main.zig, which is where the digest is
+        \\  owned and where build.zig reads it from.
+        \\
+        \\  This run's curve is at {s} and was not deleted.
+        \\
+    , .{
+        csv_path,
+        csv_path,
+        csv_sha256,
+        csv_pending_path,
+        hex,
+        d.absolute,
+        d.step,
+        @tagName(d.column),
+        d.committed,
+        d.fresh,
+        d.steps,
+        d.max_loss,
+        csv_path,
+        csv_pending_path,
+        accept_var,
+        csv_pending_path,
+        csv_path,
+        csv_pending_path,
+    });
+    return error.CurveDiffers;
 }
 
 /// `zig build scale-profile`. Projects what the code's own formulas imply at
@@ -219,14 +381,21 @@ fn runScaleProfile(io: Io) !void {
     try stdout.interface.flush();
 }
 
-fn runRemoved(gpa: std.mem.Allocator, io: Io) !void {
+/// `arena` is `init.arena`, and the name is the point: this function is handed
+/// permanent storage and does not free as it goes. It was called `gpa` until the
+/// training run's allocator was split, and a parameter whose name says one thing
+/// while its value does another is how the run ended up on an arena in the first
+/// place. The export is a single forward sweep over six cases, so it holds one
+/// working set and the arena is the right allocator for it -- measured peak is
+/// 34 MB, which is the sweep, not a sum over anything.
+fn runRemoved(arena: std.mem.Allocator, io: Io) !void {
     // The exporter is the whole of this side of the harness. It runs in Zig
     // with no Python anywhere in sight, because AGENTS.md requires every
     // committed artifact to be reproducible from the toolchain the repository
     // claims to need. `tools/removed/oracle.txt` reads what this writes; it
     // never produces any of it.
     const s = parity.sweep();
-    const res = try parity.run(gpa, io, s);
+    const res = try parity.run(arena, io, s);
 
     var buffer: [256]u8 = undefined;
     var stdout: Io.File.Writer = .init(.stdout(), io, &buffer);

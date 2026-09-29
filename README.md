@@ -32,8 +32,10 @@ row below needs a Linux host with docker and a GPU. A fresh clone has no git hoo
 | `zig build train` | Trains one pass over a 64 KiB prefix of the corpus. Writes `outputs/loss.pending.csv` and promotes it to `outputs/loss.csv` only if it matches the committed digest, so a run never overwrites the evidence it failed to reproduce. | `outputs/loss.csv` |
 | `zig build scale-profile` | Projects the cost of shapes this model cannot be run at, from the code's own formulas. Every number is labelled a projection, and two runs are byte-identical. See `src/README.md`. | nothing |
 | `zig build test` | Runs the test suite, and writes nothing at all when it passes. | nothing |
-| `zig build verify` | The whole gate CI runs: `zig fmt --check`, the test suite in Debug and in ReleaseFast, the version banner, a sha256 check on each committed input and output: the corpus, against the digest `data/README.md` documents, and `outputs/loss.csv`, against the digest this file documents, and the scale tables quoted in `src/README.md`, against `zig build scale-profile`'s own output. Silent when it passes. | nothing |
-| `sh tools/removed/check.sh` | Compares the block against a Llama reference, tensor by tensor, then checks the report it just wrote against its committed digest. Needs the pinned oracle in a repo-local virtualenv; see `tools/README.md`. | `tools/removed/report.csv` |
+| `zig build verify` | The whole gate CI runs, silent when it passes: `zig fmt --check`; the test suite in Debug and in ReleaseFast; the version banner; a sha256 on each committed input and output, the corpus against the digest `data/README.md` documents and `outputs/loss.csv` against the digest this file documents; the scale tables quoted in `src/README.md` against `zig build scale-profile`'s own output; `tools/symbols.sh` against the symbol table in that same file; `tools/removed/report.csv` against carrying no failing row; and the training run's peak resident set size against a budget in `build.zig`, read through `/usr/bin/time` on both Darwin and Linux. | nothing |
+| `zig build bench` | Reports user CPU seconds per training step, median of `-Dbench-runs` runs (default 3). It reports and never gates: a time in seconds is a property of this program and this machine, and a threshold on one fires on somebody else's load average. The figure includes fixed startup work and says so in its own output. | nothing |
+| `zig build peak-rss` | The memory gate on its own, so the number can be read rather than inferred. Measures on Darwin and Linux, and **fails** on Linux rather than skipping when `/usr/bin/time` is absent, because CI runs there. Budget: 128 MiB, chosen to sit between two measured populations. Also runs as part of `verify`. | nothing |
+| `sh tools/removed/check.sh` | Compares the block against a Llama reference, tensor by tensor, then checks the report it just wrote against the committed record: the platform-independent projection on every host, and the exact bytes too where the oracle's versions match the committed ones. Needs the pinned oracle in a repo-local virtualenv; see `tools/README.md`. | `tools/removed/report.csv` |
 | `sh tools/removed/sensitivity.sh` | Proves those gates can fail: perturbs the exported weights on one side only and requires the check to catch it. Same venv requirement. | nothing |
 | `sh src/cuda/run-norm.sh` | Runs the RMSNorm kernel against its CPU twin across eighteen shapes: the parity table and the benchmark table, including where the GPU stops winning. Needs a Linux host with docker and a GPU. | nothing |
 | `sh src/cuda/run-probe.sh` | Compiles and runs one CUDA kernel on an NVIDIA GPU, in a container, and checks its integer sum against a closed form. Needs a Linux host with docker and a GPU. See `src/cuda/README.md`. | nothing |
@@ -43,26 +45,39 @@ row below needs a Linux host with docker and a GPU. A fresh clone has no git hoo
 The numerics run on CPU f32. The five block ops and the gradients are real and tested, and the block
 is checked against a Llama reference. The CUDA toolchain is proven end to end on a real
 GPU, and one CUDA source implements a transformer operation: RMSNorm, matching its CPU twin to 1e-5
-across eighteen shapes and benchmarked against it, ten times faster in isolation at the shipped model
-shape. `sh src/cuda/run-norm.sh` prints the ten times and names the shape they apply to. No
+across eighteen shapes and benchmarked against it, 9.5x faster in isolation at the shipped model
+shape. `sh src/cuda/run-norm.sh` prints the ratio and names the shape it applies to. No
 end-to-end speedup is claimed from it: the model has no device-resident tensor, so every other part
 of a step would have to cross PCIe to use the GPU as well, and there is no fused attention kernel.
 No checkpoint is written: a run leaves a loss curve and no model. The table above is the whole
-interface.
+interface a reader needs, and `build.zig` declares two steps beyond it that no reader needs:
+`zig build dbg-train`, a Debug `train` binary for reproducing a checked-build failure, and
+`zig build removed-digest`, the report gate that `sh tools/removed/check.sh` runs over the report it
+has just written. It is one command doing two checks, and which of them ran is printed on every
+invocation: a projection of the report that any host can check, and the exact bytes as well where
+the oracle's versions are the committed ones.
 
 `zig build train` links its own ReleaseFast binary whatever `-Doptimize` says, because one step is a
 dense f32 forward and backward over a 256-token window and Debug leaves both loops unoptimised.
 Its defaults are a smoke run rather than a recipe: 200 BPE merges, a 64 KiB corpus
 prefix, 123 windows, one epoch, seed 7. The whole 1.1 MB corpus is 2211 windows, eighteen times the
-work, so a full epoch belongs in a scheduled run.
+work, so a full epoch belongs in a scheduled run. That 2211 is an offline figure: it is the full
+corpus's token count over `ctx + 1`, and no command here produces it, because the binary reads no
+flags and `corpus_bytes` is fixed at 65536, so `zig build train` only ever prints the arithmetic
+for the prefix it runs.
 
-No wall time is published for `zig build train`, and that is the decision rather than an omission.
-A run of it on the host that committed the curve, on a machine already carrying unrelated load,
-spent less CPU time than it did wall time, by more than a factor of two — the shape of that gap is
-the reason a seconds figure is not a property of this program. A per-step rate would be worse than
-nothing, because the build check, BPE training and tokenization are fixed startup work that does not
-divide into a step cost, and a number derived from it would be wrong in a way nothing in the run
-would reveal. What the run does publish is its own configuration, on its first line, read back from
+No **wall** time is published for `zig build train`, and that is the decision rather than an
+omission. A run of it on the host that committed the curve, on a machine already carrying unrelated
+load, spent less CPU time than it did wall time, by more than a factor of two — the shape of that
+gap is the reason a wall-clock figure is not a property of this program.
+
+CPU time is a different quantity and `zig build bench` reports it, because the load argument above
+applies to wall clock specifically. What `bench` is for is comparing one code change against
+another, where the fixed startup work — build check, BPE training, tokenization — cancels because
+it is the same on both sides. It is **not** a cost model, and it says so: it divides the whole run
+including that startup by the steps the run reports, and prints the caveat in its own output. A
+per-step rate quoted as what the model costs would be exactly the number the caveat is there to
+disown. What the run itself publishes is its own configuration, on its first line, read back from
 `src/main.zig`, and the curve it writes, which is checked. The full-corpus epoch is not timed for the
 same reason: at eighteen times the windows it is a scheduled run, not a figure in a README.
 
@@ -101,7 +116,7 @@ rather than a claim that it is.
 | Sweep | sequence lengths 1, 8 and 257, at seeds 7 and 8. Six runs, 156 tensor rows, 532 argmax comparisons |
 | Result | 14 tensor kinds inside their gates, worst case 2.1e-06 against a 2.0e-05 gate |
 | Argmax | 532 of 532 rows pick the same token. Smallest reference top1-top2 margin 8.5e-04 |
-| Record | `tools/removed/report.csv`, one row per tensor per run. `check.sh` checks the report it just wrote against the digest held in `build.zig` (`c91abe2e 924883b5 19ecfa53 7f015de1 cf4d7e03 4fcbfd92 828e21d1 39c8d30e`), so the table above is the table a run reproduces, not one that was true once. |
+| Record | `tools/removed/report.csv`, one row per tensor per run. `check.sh` checks the report it just wrote against the digests held in `build.zig`: the byte digest `c91abe2e 924883b5 19ecfa53 7f015de1 cf4d7e03 4fcbfd92 828e21d1 39c8d30e`, and a digest over the same file with `max_abs_delta` and the six environment columns dropped. The projection is checked on every host, so the row set, the gates, the verdicts and the argmax count above are the table a run reproduces rather than one that was true once. The bytes are checked only where the oracle reports the same six version columns this file records, because a different host's BLAS rounds `max_abs_delta` its own way — `l0.v` reads `5.96e-08` on macOS and `1.043e-07` on glibc, both far inside the `1e-05` gate. `zig build removed-digest` prints which of the two it ran. |
 
 All fourteen gates and the argmax have to hold. The two are not ranked, and the argmax is not the
 sharper of the two: on this sweep the smallest reference top1-top2 margin is 8.5e-04 while the

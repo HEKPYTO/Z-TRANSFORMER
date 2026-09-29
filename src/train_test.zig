@@ -707,6 +707,153 @@ test "the csv is a header and one line per row, and it round trips" {
     try std.testing.expectEqual(rows.len, seen);
 }
 
+// The divergence tests below use the committed curve itself, read from the tree
+// rather than written as a literal here. A literal in this file would be a second
+// copy of the artifact that can drift from the first, and the point of the
+// measurement is that it describes the curve that is actually committed.
+// `zig build test` runs with the build root as the working directory, the same
+// place `zig build train` writes.
+const committed_curve = "outputs/loss.csv";
+
+fn readCommittedCurve() ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(std.testing.io, committed_curve, gpa, .unlimited);
+}
+
+test "a curve compared with itself disagrees by nothing" {
+    const text = try readCommittedCurve();
+    defer gpa.free(text);
+    const d = try train.divergence(text, text);
+
+    try std.testing.expectEqual(0.0, d.absolute);
+    // Read off the curve, not asserted as a restatement: 123 steps and a largest
+    // logged loss of 6.474011 are what `outputs/loss.csv` holds, and the
+    // measurement carries them so a reader can judge a disagreement as a
+    // fraction of the run rather than only as an absolute number.
+    try std.testing.expectEqual(123, d.steps);
+    try std.testing.expectEqual(6.474011, d.max_loss);
+}
+
+test "a wrong gradient is measured at the step it appears, not merely as a total" {
+    // The critic's experiment, as a fixture: `optim.AdamW.beta1` at 0.85 rather
+    // than 0.9 moves step 24's loss from 6.474011 to 6.632228. Measured on this
+    // host: 0.158217, the largest disagreement on the curve, at the first logged
+    // row. The magnitude and the step are both asserted because a report that
+    // named only "they differ" would leave the reader to recompute the one thing
+    // that tells them which kind of difference they are looking at.
+    const text = try readCommittedCurve();
+    defer gpa.free(text);
+    const broken =
+        "step,train_loss,val_loss,lr\n" ++
+        "24,6.632228,0.000000,0.29888502\n" ++
+        "49,6.059562,0.000000,0.24504843\n" ++
+        "74,5.832430,0.000000,0.13857324\n" ++
+        "99,5.686193,0.000000,0.03842629\n" ++
+        "122,5.593455,5.154903,0.00006977\n";
+
+    const d = try train.divergence(text, broken);
+    try std.testing.expectEqual(@as(usize, 24), d.step);
+    try std.testing.expectEqual(train.Column.train_loss, d.column);
+    try std.testing.expectEqual(6.474011, d.committed);
+    try std.testing.expectEqual(6.632228, d.fresh);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.158217), d.absolute, 1e-9);
+    // The budget this repository used to gate on, kept here as a measured
+    // distance rather than a gate: `steps * f32_epsilon * max_loss` on this
+    // curve, 9.5e-5. 1667x under the broken run, and 189x under a Debug build of
+    // the identical source that is not broken. A number both cases clear by three
+    // orders of magnitude is not a number that tells them apart, which is why
+    // nothing branches on it any more.
+    const budget = @as(f64, 123) * std.math.floatEps(f32) * 6.474011;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0000949267560), budget, 1e-12);
+    try std.testing.expect(d.absolute / budget > 1000);
+}
+
+test "a host difference is measured, and it is the same order as a broken run" {
+    // A Debug build of the identical source on this host, and the reason the
+    // budget was removed rather than widened. It disagrees by 0.017975 at step
+    // 74 — 189x the budget, so no derived threshold separates them — and its rows
+    // disagree by 39507, 6119, -51706, 3219 and 9508 ulp: the sign changes, so
+    // the difference is trajectory chaos rather than accumulated rounding, and
+    // it is unbounded in the step count. Asserted as facts about the two cases
+    // because they are the whole argument, and because a future change that
+    // reintroduced a threshold would be reintroducing a constant these numbers
+    // refute.
+    const text = try readCommittedCurve();
+    defer gpa.free(text);
+    const host =
+        "step,train_loss,val_loss,lr\n" ++
+        "24,6.489256,0.000000,0.29888502\n" ++
+        "49,6.061772,0.000000,0.24504843\n" ++
+        "74,5.814455,0.000000,0.13857324\n" ++
+        "99,5.687284,0.000000,0.03842629\n" ++
+        "122,5.596625,5.155396,0.00006977\n";
+
+    const d = try train.divergence(text, host);
+    try std.testing.expectEqual(@as(usize, 74), d.step);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.017975), d.absolute, 1e-9);
+
+    const budget = @as(f64, 123) * std.math.floatEps(f32) * 6.474011;
+    try std.testing.expect(d.absolute / budget > 100);
+    // The gap the reader is asked to judge by: a wrong optimizer constant is
+    // 8.8x a host difference here, which is a measurement on one host, one seed
+    // and one run length. Not a margin to gate on, and the code does not.
+    try std.testing.expectApproxEqAbs(@as(f64, 0.158217 / 0.017975), 8.8, 0.05);
+    // The sign of the disagreement changes across the curve, which is what
+    // separates a wandering host difference from a defect that grows from step
+    // 1. Step 24 is up, step 74 is down, and the largest of them is the down
+    // one, so the curve is not shifted one way.
+    const early = try train.divergence(
+        text,
+        "step,train_loss,val_loss,lr\n" ++
+            "24,6.489256,0.000000,0.29888502\n" ++
+            "49,6.059562,0.000000,0.24504843\n" ++
+            "74,5.832430,0.000000,0.13857324\n" ++
+            "99,5.686193,0.000000,0.03842629\n" ++
+            "122,5.593455,5.154903,0.00006977\n",
+    );
+    try std.testing.expectEqual(@as(usize, 24), early.step);
+    try std.testing.expect(early.fresh > early.committed);
+    try std.testing.expect(d.fresh < d.committed);
+    try std.testing.expectEqual(@as(usize, 74), d.step);
+}
+
+test "a curve of a different shape is refused rather than half compared" {
+    const text = try readCommittedCurve();
+    defer gpa.free(text);
+
+    // A row count that differs, which is what more or fewer epochs looks like.
+    try std.testing.expectError(
+        error.CurveShape,
+        train.divergence(text, "step,train_loss,val_loss,lr\n24,6.474011,0.000000,0.29888502\n"),
+    );
+    // A header that is not the one `writeCsv` writes.
+    try std.testing.expectError(
+        error.CurveShape,
+        train.divergence(text, "step,loss,val,lr\n24,6.474011,0.000000,0.29888502\n"),
+    );
+    // A row with a field that is not a number.
+    try std.testing.expectError(
+        error.CurveShape,
+        train.divergence(text, "step,train_loss,val_loss,lr\n24,6.474011,0.000000,oops\n"),
+    );
+    // A row with a field too few, and one with a field too many: both are a
+    // header and its rows disagreeing, and reading past the end of the former
+    // would compare a train loss against whatever came next.
+    try std.testing.expectError(
+        error.CurveShape,
+        train.divergence(text, "step,train_loss,val_loss,lr\n24,6.474011,0.000000\n"),
+    );
+    try std.testing.expectError(
+        error.CurveShape,
+        train.divergence(text, "step,train_loss,val_loss,lr\n24,6.474011,0.000000,0.29888502,1\n"),
+    );
+    // No rows at all: no step count and no scale, so there is nothing to measure
+    // against, and an empty comparison would report a zero disagreement.
+    try std.testing.expectError(
+        error.CurveShape,
+        train.divergence(text, "step,train_loss,val_loss,lr\n"),
+    );
+}
+
 test "a full run and its csv leak nothing" {
     const vocab = 32;
     const ctx = 32;
@@ -793,11 +940,12 @@ test "a run that overflows stops instead of logging non-finite rows forever" {
     // The guard that fires is the one on the loss, because the loss goes
     // non-finite on the same step the weights do. Whichever guard catches it
     // first, the run ends in an error and never returns a Result.
-    if (train.run(gpa, cfg, tokens, val)) |res| {
+    const outcome = train.run(gpa, cfg, tokens, val);
+    if (outcome) |*res| {
         // A run that completed is the bug: either it returned NaN rows, or it
         // returned finite rows, which would mean the overflow never happened
         // and the test is not testing what it says it is.
-        var owned = res;
+        var owned = res.*;
         defer owned.deinit();
         for (owned.rows) |row| {
             try std.testing.expect(std.math.isFinite(row.train_loss));
@@ -807,7 +955,13 @@ test "a run that overflows stops instead of logging non-finite rows forever" {
         // wrong, so there is nothing to assert about them.
         return error.OverflowRunCompletedWithFiniteLoss;
     } else |err| {
-        try std.testing.expect(err == error.NonFiniteLoss or err == error.NonFiniteGradient);
+        // The one error, not either of two. A disjunction here passed whether
+        // the loss guard or the gradient guard caught it, and those are different
+        // defects at different lines in the loop: the loss going non-finite
+        // makes the gradient non-finite on the same step, so deleting the loss
+        // guard outright still satisfied the old assertion. The comment above
+        // says which guard is under test, so this names it.
+        try std.testing.expectEqual(error.NonFiniteLoss, err);
     }
 }
 

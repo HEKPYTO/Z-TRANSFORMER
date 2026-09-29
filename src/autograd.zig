@@ -597,6 +597,21 @@ const AttnGrads = struct {
 /// The prefix is what makes d k and d v accumulate over t >= s rather than over
 /// every row: a key or value at position s is read only by rows t >= s, and
 /// dropping the restriction lets a later row's gradient leak backwards.
+///
+/// Four loops are unrolled eight ways and the softmax, exp and p_ds loops are
+/// not, because those three are already flat in `s` or a single chain over a
+/// handful of terms. The four that are:
+///     score    dot(q[t], k[s])      one chain of `dim` adds per position
+///     d p      dot(d h[t], v[s])    the same, against the same gathered rows
+///     d q      sum_s d score k[s]   `dim` independent chains over the prefix
+///     d k d v  d score q[t], p d h  `dim` independent read-modify-writes
+/// Each split runs the same terms into the same per-accumulator chain in the
+/// same ascending order as the scalar loop did, and no lane is ever added to
+/// another, so every value is bit for bit what it was. The split is on an axis
+/// that is independent per accumulator for that reason; a `@Vector` reduction
+/// over `j` or over `s` would reassociate and move the bytes, and none of these
+/// do. A count that is not a multiple of eight finishes on the scalar loop, so
+/// an odd `head_dim` or an odd prefix length costs nothing and changes nothing.
 fn attentionBackward(
     allocator: std.mem.Allocator,
     q: Tensor,
@@ -607,6 +622,13 @@ fn attentionBackward(
 ) !AttnGrads {
     const dim = cfg.head_dim;
     const group = cfg.n_heads / cfg.n_kv_heads;
+    // Four of the six loops below are unrolled this many ways, and it is the
+    // same latency fix `weightGrad` and `inputGrad` made, on the same two
+    // shapes: a dot product per position and a column per head, both a serial
+    // chain of f64 adds over a loop LLVM will not split because the trip count
+    // is `t + 1` and the rows are gathered. The lanes are never summed
+    // together, in any of the four, which is the property that keeps the bytes.
+    const lanes = 8;
     // The scale is the same one attention.forward divides by, kept in f64 so
     // the softmax this rebuilds matches the one the forward built.
     const scale = 1.0 / @sqrt(@as(f64, @floatFromInt(dim)));
@@ -626,6 +648,14 @@ fn attentionBackward(
     defer allocator.free(probs);
     var d_probs = try allocator.alloc(f64, q.rows);
     defer allocator.free(d_probs);
+    // probs * (d p - d p . p), which is the same number for every j and every
+    // accumulator below. It was computed inside those loops, `dim` times per
+    // row over a term that does not mention j, and hoisting it is the same
+    // operations in the same order: `p_ds[s]` is the f64 product of the same
+    // two f64 values the inner loop multiplied, and the multiply by the operand
+    // and by `scale` still happens left to right behind it.
+    var p_ds = try allocator.alloc(f64, q.rows);
+    defer allocator.free(p_ds);
 
     for (0..cfg.n_heads) |h| {
         const kv = h / group;
@@ -633,14 +663,35 @@ fn attentionBackward(
             const q_head = q.rowConst(t)[h * dim ..][0..dim];
             const dh = dout.rowConst(t)[h * dim ..][0..dim];
 
-            // Rebuild the forward's softmax over the causal prefix.
+            // Rebuild the forward's softmax over the causal prefix. The `s`
+            // loop is unrolled eight ways: eight prefixes are independent dot
+            // products, and one of them is a serial chain of `dim` f64 adds that
+            // cannot retire faster than the adder's latency. The lanes are
+            // never summed together, so each `probs[s]` is bit for bit what
+            // the scalar loop wrote.
             var row_max: f64 = -std.math.inf(f64);
-            for (0..t + 1) |s| {
-                const k_head = k.rowConst(s)[kv * dim ..][0..dim];
-                var dot: f64 = 0;
-                for (q_head, k_head) |a, b| dot += @as(f64, a) * @as(f64, b);
-                probs[s] = dot * scale;
-                row_max = @max(row_max, probs[s]);
+            {
+                var s: usize = 0;
+                while (s + lanes <= t + 1) : (s += lanes) {
+                    var rows: [lanes][]const f32 = undefined;
+                    for (0..lanes) |u| rows[u] = k.rowConst(s + u)[kv * dim ..][0..dim];
+                    var dot: [lanes]f64 = @splat(0);
+                    for (q_head, 0..) |a, jj| {
+                        const af: f64 = @floatCast(a);
+                        for (0..lanes) |u| dot[u] += af * @as(f64, rows[u][jj]);
+                    }
+                    for (0..lanes) |u| {
+                        probs[s + u] = dot[u] * scale;
+                        row_max = @max(row_max, probs[s + u]);
+                    }
+                }
+                while (s < t + 1) : (s += 1) {
+                    const k_head = k.rowConst(s)[kv * dim ..][0..dim];
+                    var dot: f64 = 0;
+                    for (q_head, k_head) |a, b| dot += @as(f64, a) * @as(f64, b);
+                    probs[s] = dot * scale;
+                    row_max = @max(row_max, probs[s]);
+                }
             }
             var denom: f64 = 0;
             for (0..t + 1) |s| {
@@ -652,30 +703,68 @@ fn attentionBackward(
             // d p[s] = dot(d h, v[s]), then d score[s] = p[s] (d p[s] - sum p d p)
             // with the sum over the prefix, which is the softmax Jacobian.
             var dot_pp: f64 = 0;
-            for (0..t + 1) |s| {
-                const v_head = v.rowConst(s)[kv * dim ..][0..dim];
-                var acc: f64 = 0;
-                for (0..dim) |j| acc += @as(f64, dh[j]) * @as(f64, v_head[j]);
-                d_probs[s] = acc;
-                dot_pp += probs[s] * acc;
+            {
+                var s: usize = 0;
+                while (s + lanes <= t + 1) : (s += lanes) {
+                    var rows: [lanes][]const f32 = undefined;
+                    for (0..lanes) |u| rows[u] = v.rowConst(s + u)[kv * dim ..][0..dim];
+                    var acc: [lanes]f64 = @splat(0);
+                    for (dh, 0..) |d, jj| {
+                        const df: f64 = @floatCast(d);
+                        for (0..lanes) |u| acc[u] += df * @as(f64, rows[u][jj]);
+                    }
+                    for (0..lanes) |u| {
+                        d_probs[s + u] = acc[u];
+                        dot_pp += probs[s + u] * acc[u];
+                    }
+                }
+                while (s < t + 1) : (s += 1) {
+                    const v_head = v.rowConst(s)[kv * dim ..][0..dim];
+                    var acc: f64 = 0;
+                    for (0..dim) |j| acc += @as(f64, dh[j]) * @as(f64, v_head[j]);
+                    d_probs[s] = acc;
+                    dot_pp += probs[s] * acc;
+                }
             }
+
+            for (0..t + 1) |s| p_ds[s] = probs[s] * (d_probs[s] - dot_pp);
 
             // d q[t] is written by this row alone, so it is assigned. d k and
             // d v accumulate over every row that reads the position.
-            for (0..dim) |j| {
+            for (0..dim / lanes) |g_lane| {
+                const j = g_lane * lanes;
+                var acc: [lanes]f64 = @splat(0);
+                for (0..t + 1) |s| {
+                    const k_head = k.rowConst(s)[kv * dim + j ..][0..lanes];
+                    for (0..lanes) |u| acc[u] += p_ds[s] * @as(f64, k_head[u]) * scale;
+                }
+                for (0..lanes) |u| g.dq.set(t, h * dim + j + u, @floatCast(acc[u]));
+            }
+            for (0..dim % lanes) |u| {
+                const j = (dim / lanes) * lanes + u;
                 var acc: f64 = 0;
                 for (0..t + 1) |s| {
                     const k_head = k.rowConst(s)[kv * dim ..][0..dim];
-                    acc += probs[s] * (d_probs[s] - dot_pp) * @as(f64, k_head[j]) * scale;
+                    acc += p_ds[s] * @as(f64, k_head[j]) * scale;
                 }
                 g.dq.set(t, h * dim + j, @floatCast(acc));
             }
             for (0..t + 1) |s| {
                 const dk_row = g.dk.row(s);
                 const dv_row = g.dv.row(s);
-                for (0..dim) |j| {
-                    dk_row[kv * dim + j] += @floatCast(probs[s] * (d_probs[s] - dot_pp) * @as(f64, q_head[j]) * scale);
-                    dv_row[kv * dim + j] += @floatCast(probs[s] * @as(f64, dh[j]));
+                const p_ds_s = p_ds[s];
+                const probs_s = probs[s];
+                for (0..dim / lanes) |g_lane| {
+                    const j = g_lane * lanes;
+                    for (0..lanes) |u| {
+                        dk_row[kv * dim + j + u] += @floatCast(p_ds_s * @as(f64, q_head[j + u]) * scale);
+                        dv_row[kv * dim + j + u] += @floatCast(probs_s * @as(f64, dh[j + u]));
+                    }
+                }
+                for (0..dim % lanes) |u| {
+                    const j = (dim / lanes) * lanes + u;
+                    dk_row[kv * dim + j] += @floatCast(p_ds_s * @as(f64, q_head[j]) * scale);
+                    dv_row[kv * dim + j] += @floatCast(probs_s * @as(f64, dh[j]));
                 }
             }
         }
@@ -772,13 +861,36 @@ fn normBackward(x: Tensor, w: Tensor, g: Tensor, dw: *Tensor, dx: *Tensor) void 
 /// gradient over two batches reduces the terms in the order the forward sums
 /// the same terms. f64 here would buy accuracy the f32 forward cannot
 /// reproduce anyway.
+///
+/// The column loop is unrolled eight ways, and like the tied head's this is a
+/// latency fix rather than a volume one. The op moves 12 bytes per element for
+/// one FMA and every one of those bytes is an L1 hit, so there is no volume to
+/// remove; what there is instead is a loop LLVM will not touch. `w_row[j] +=`
+/// is a read-modify-write through two pointers that may alias, and the
+/// vectoriser declines a store it cannot prove is safe, so it emitted
+/// `ldr/fmul/fadd/str` plus three instructions of loop overhead per element and
+/// ran the whole backward pass at 0.57 GFLOP/s. Eight independent columns give
+/// the scheduler eight chains to overlap and cut the overhead to under one
+/// instruction per element.
+///
+/// Byte-identity is a property of the split. Accumulator `j` accumulates
+/// exactly the terms `j` accumulated before, still in ascending `t`, so
+/// `w_row[j]` is bit for bit what the scalar loop left; nothing is combined
+/// across lanes and there is no second value to narrow. A width that is not a
+/// multiple of eight finishes on the scalar loop, so an odd shape costs
+/// nothing and changes nothing.
 fn weightGrad(w: *Tensor, input: Tensor, dout: Tensor) void {
+    const lanes = 8;
     for (0..input.cols) |i| {
         const w_row = w.row(i);
         for (0..input.rows) |t| {
             const scale = input.rowConst(t)[i];
             const dout_row = dout.rowConst(t);
-            for (0..dout.cols) |j| w_row[j] += scale * dout_row[j];
+            var j: usize = 0;
+            while (j + lanes <= dout.cols) : (j += lanes) {
+                for (0..lanes) |k| w_row[j + k] += scale * dout_row[j + k];
+            }
+            while (j < dout.cols) : (j += 1) w_row[j] += scale * dout_row[j];
         }
     }
 }
@@ -790,11 +902,41 @@ fn weightGrad(w: *Tensor, input: Tensor, dout: Tensor) void {
 /// The inner sum runs over W's columns at a fixed row, so both operands are
 /// read as contiguous rows. `out` arrives zeroed from Tensor.init, so
 /// accumulating in place is the whole assignment.
+///
+/// The row loop is unrolled eight ways, and it is the same latency fix as
+/// `weightGrad`'s column loop, on the other side of the pair. This is a dot
+/// product per output element, so a scalar accumulator is a serial chain of
+/// `W.cols` f32 adds that cannot retire faster than the adder's latency: at
+/// [T=256, d=128, ffn=512] the MLP branch below is two of these over 33.6M
+/// multiply-adds and it ran 12x under the rate the same machine retires a
+/// plain vector FMA at. Eight rows are independent, so eight chains fill the
+/// latency, and the operand rows are fetched once for the group instead of
+/// once per element.
+///
+/// Byte-identity is a property of the split. Accumulator `k` sums the same
+/// `j` in the same ascending order over the same terms as the scalar loop's
+/// accumulator did for row `k`, so `out_row[i + k]` receives bit for bit the
+/// value the scalar loop stored there. The lanes are never summed together,
+/// which is the one change that would have moved the bytes: a `@Vector`
+/// accumulator over `j` would reassociate the reduction, and this does not.
+/// A row count that is not a multiple of eight finishes on the scalar loop.
 fn inputGrad(out: *Tensor, dout: Tensor, w: Tensor) void {
+    const lanes = 8;
     for (0..dout.rows) |t| {
         const dout_row = dout.rowConst(t);
         const out_row = out.row(t);
-        for (0..w.rows) |i| {
+        var i: usize = 0;
+        while (i + lanes <= w.rows) : (i += lanes) {
+            var rows: [lanes][]const f32 = undefined;
+            for (0..lanes) |k| rows[k] = w.rowConst(i + k);
+            var acc: [lanes]f32 = @splat(0);
+            for (0..w.cols) |j| {
+                const dj = dout_row[j];
+                for (0..lanes) |k| acc[k] += dj * rows[k][j];
+            }
+            for (0..lanes) |k| out_row[i + k] += acc[k];
+        }
+        while (i < w.rows) : (i += 1) {
             const w_row = w.rowConst(i);
             var acc: f32 = 0;
             for (0..w.cols) |j| acc += dout_row[j] * w_row[j];

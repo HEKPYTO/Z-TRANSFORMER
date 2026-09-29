@@ -1,7 +1,8 @@
 # tools
 
 The parity harness: three files that compare this project's block against a Llama
-reference, and the committed record of that comparison.
+reference, and the committed record of that comparison. Plus one shell script that holds the symbol
+tables in `src/README.md` to the code they describe.
 
 ## Parity
 
@@ -16,7 +17,7 @@ three are separate on purpose: a machine without torch has not failed a parity c
 | Sweep | sequence lengths 1, 8 and 257, at seeds 7 and 8. Six runs, 156 tensor rows, 532 argmax comparisons |
 | Last verdict | OK. 14 tensor kinds inside their gates, worst 2.1e-06 against a 2.0e-05 gate |
 | Argmax | 532 of 532 rows pick the same token |
-| Record | `report.csv` in this directory, one row per tensor per run. `check.sh` checks the report it just wrote against the digest `build.zig` holds, so the two rows above are checked on every run rather than true once. |
+| Record | `report.csv` in this directory, one row per tensor per run. `check.sh` checks the report it just wrote against two digests `build.zig` holds, so the two rows above are checked on every run rather than true once. The portable one covers the row set, the shapes, the gates, the verdicts and the argmax count, and runs on every host. The byte digest covers `max_abs_delta` as well, and runs only where this host's oracle reports the same six version columns the committed file records. |
 
 All three are pinned, to the versions the committed `report.csv` records in every one of its 156
 rows, and each pin earns its place.
@@ -27,11 +28,19 @@ an unpinned oracle silently builds the reference with theta 10000 and disagrees 
 reads the theta the reference actually resolved and refuses to run if it is not the one this
 repository's config states, so that trap is caught as a setup error whatever the version is.
 
-`torch` and `numpy` do not change the answer; they change whether the run reproduces. Their pins are
-what turn a different build into a `pip` message instead of a digest mismatch against
-`report.csv`, which is the failure that looks like a numerics change and is not one. They are also
-what makes the `torch` version the `Reference` row above prints the one `pip` was told to install
-rather than the one that happened to be on the machine.
+`torch` and `numpy` do not change the answer; they change how much of the run is checked. Their pins
+are what turn a different build into a `pip` message instead of a *quieter* gate: a torch whose
+version string differs fails `removed-digest`'s environment predicate, and that host then gets the
+projection check without the byte digest, so its `max_abs_delta` values are never compared against
+the committed ones. A CUDA build spells its own version `2.14.0+cu130` and takes that path on its
+own, pins or no pins. They are also what makes the `torch` version the `Reference` row above prints
+the one `pip` was told to install rather than the one that happened to be on the machine.
+
+The environment predicate is the report's own six version columns, because the report records nothing
+else about the host that produced it. A host that reports the same six gets the byte digest, and a
+byte difference there is one the report cannot explain — so it is a red, not a skip. That is a real
+red, not a hypothetical one: a Linux host with a CPU-only the pinned build reports the committed columns
+and still rounds differently, and this gate is what says so.
 
 `_attn_implementation` defaults to `sdpa` in 4.57, which is a different kernel and a different
 reduction order, so `eager` is forced and the resolved value is printed in the header. That trap
@@ -64,15 +73,30 @@ one when both exist, so the pin is what actually runs.
 
 `check.sh` is the entry point, and the only place the two halves meet. It also runs
 `zig build removed-digest` over the report the oracle just wrote, which is the only thing that checks
-that report against its committed digest.
+that report against the digests `build.zig` holds. The step does both halves in one script and prints
+which ran, on every invocation rather than only on a failure: a gate that quietly stopped checking
+the bytes is indistinguishable from one that never did.
+
+    $ zig build removed-digest
+    removed-digest: projection OK; byte digest OK, environment matches the committed report.
+
+What the projection is, and what it gives up, is the honest part of this. It keeps eight of the
+report's fifteen columns — `kind`, `case`, `seq_len`, `tensor`, `rows`, `cols`, `gate`, `verdict` —
+and drops `max_abs_delta` plus the six environment columns. So a flipped verdict, a changed gate, a
+row added or removed, a changed argmax count and a report that is `sensitivity.sh`'s export instead
+of a comparison all fail on any host, and the delta *magnitudes* are checked only on a host whose
+versions match. A delta that grew from `5.96e-08` to `9.9e-06` — inside its gate, two orders of
+magnitude worse — passes on a host whose torch build differs. The projection is a check on the
+gates, not on the arithmetic behind them, and the byte digest is what covers the arithmetic.
 
 `zig build verify` cannot do it, and the boundary is worth stating once: the report is a product of
 the Python oracle, and AGENTS.md keeps Python out of the build graph. So the split is by what each
 side can reach. `verify` checks everything reproducible from Zig alone — the corpus digest and the
-committed loss curve. The parity digest is asserted at the moment the report exists, by the command
-that produced it, on a machine that already has the virtualenv. A hash check sitting in `verify`
-would prove only that some bytes are committed, not that a comparison reproduces them, which is the
-claim the record is for.
+committed loss curve, plus the weaker statement that the report carries no `FAIL` row, which is a
+property of a green run rather than of one byte sequence. The two parity digests are asserted at the
+moment the report exists, by the command that produced it, on a machine that already has the
+virtualenv. A hash check sitting in `verify` would prove only that some bytes are committed, not that
+a comparison reproduces them, which is the claim the record is for.
 
 `report.csv` is the committed record, and it lives beside the file that writes it so the two cannot
 drift apart. The export it describes is scratch, under `outputs/parity/`, and is not committed.
@@ -178,7 +202,8 @@ with a warm build cache; a cold cache adds compilation to both and moves neither
     zig build test -Doptimize=ReleaseFast        # ReleaseFast: 7 s here
 
 The difference is the suite executing, not compiling: a mutation invalidates one file either way. A
-Debug-only default is 39 minutes for 16 mutations, which is a number nobody runs, and a default
+Debug-only default is about 39 minutes for 16 mutations, at the 145 s a Debug mutation measured in
+`run.sh`'s own timing comment rather than at a second, conflicting figure, which is a number nobody runs, and a default
 nobody runs measures nothing. ReleaseFast is also the mode the `train` binary ships in.
 
 The cost is real and is stated rather than hidden: a defect only Debug's safety checks trip is
@@ -215,3 +240,21 @@ a number a reader would believe.
 `class` in that table is an author's claim, not a measurement: the suite's exit code alone decides
 caught or survived, and the class only labels the damage afterwards. `mutate list` prints the
 names, and `mutate show <name>` prints the exact before and after for any one of them.
+
+## Symbols
+
+`sh tools/symbols.sh [readme] [root]` fails unless every `module.Symbol` row in a symbol table names
+a declaration that is `pub` in `src/module.zig`. It exits 0 silently, or 1 listing every row that
+lies. `zig build verify` runs it against `src/README.md`; the arguments exist so a falsified copy can
+be checked without editing the real one.
+
+| | |
+|---|---|
+| Direction | Documented-as-pub, actually private. The one drift that has bitten: commit `6c2a9c5` made five `scale` helpers private and had to hand-edit five table rows, and this script run against that commit's parent names all five. |
+| Module to file | The file stem. The tables already say `tensor.Tensor` and the file is `src/tensor.zig`, so there is no map to keep in sync and no list of the script's own to go stale. |
+| Not checked | The other direction. A `pub` nobody documented is an omission and costs a reader nothing; `gradcheck` and `tokenizer` expose many, and listing them all would be churn for no safety. |
+| Skipped | A first cell naming no module on disk, such as `init.arena`, which is a column of the allocator table rather than a symbol. A missing `src/<mod>.zig` is a skip, not a failure. |
+
+It reads one shape — a first cell of exactly `` `module.Symbol` `` — because that is the only one the
+tables use. A row written differently is not seen, which is a hole in the check rather than in the
+README, and the failure mode is silence, so a reformat of the tables is the thing to re-run it after.

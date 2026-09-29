@@ -1,17 +1,20 @@
 # src
 
-Fifteen modules, plus the `main.zig` binary, `lib.zig` and the `tests.zig` root. 33 `.zig` files:
-4,136 lines outside the 15 `*_test.zig` files, 6,062 inside them.
+Fifteen modules, plus the `main.zig` binary, `lib.zig` and the `tests.zig` root. 33 `.zig` files,
+15 of them `*_test.zig`.
 
-    cat $(ls src/*.zig | grep -v _test) | wc -l    # 4136
-    cat src/*_test.zig | wc -l                    # 6062
+There is deliberately no line count here. Three of them have been written and all three were wrong
+within a commit, the last by 64 lines, because any line count is invalidated by every commit that
+adds a line and nothing in the build notices. The count that did survive being wrong is the file
+count, which only moves when a file is added or removed.
 
-Those two commands are the source of the two numbers, and they are the `cat` form on purpose.
-`wc -l src/*.zig | grep -v _test.zig | tail -1` looks equivalent and is not: `grep -v` filters
-lines, and the `total` line that `wc` appends does not contain `_test.zig`, so it survives and
-`tail -1` hands back the grand total of every file including the tests. An earlier version of this
-block used that command and labelled its output as the non-test count, which is how 7,123 became
-7,676 became 8,645 while the number underneath it was always the sum of both columns.
+The trap that made the first two wrong is worth keeping, because it is the same shape as a gate
+that measures the wrong thing. `wc -l src/*.zig | grep -v _test.zig | tail -1` looks like a
+non-test line count and is not: `grep -v` filters lines, and the `total` line that `wc` appends
+does not contain `_test.zig`, so it survives and `tail -1` hands back the grand total of every
+file including the tests. A version of this block used that command and labelled its output as the
+non-test count, which is how 7,123 became 7,676 became 8,645 while the number underneath was
+always the sum of both columns.
 
 Every module that allocates takes a `std.mem.Allocator` first and returns an error union. Two take
 no allocator because they build nothing: `tensor.matmul` reads it off `a` and `loss.forward`
@@ -126,6 +129,185 @@ leave the clip still NaN and the next step would spread them across every parame
 Validation is measured at every epoch end by `evalLoss`, over a fixed eight batches of a batcher
 that shares nothing with the training stream but the parameters. It runs no backward pass and no
 optimizer call.
+
+### The allocator `train.run` is handed
+
+`train.run` frees every per-step buffer as the step ends: the cache `Cache.deinit` names, the logits,
+the gradient of the logits, and the temporaries inside `backwardFrom`. None of that is a bulk reset,
+so the allocator has to be one whose `free` does something, and `main.zig` used to hand it
+`init.arena`, whose `free` is a no-op. Nothing here leaked in the sense the suite means by leaking —
+`std.testing.allocator` is a real allocator, so `train_test.zig` caught a missing free on any of
+those paths then and catches it now. It is only in the binary, where the one allocator in scope was
+an arena, that each step's working set survived to the end of the process. `main.zig` now splits the
+two the runtime already provides: the corpus, the vocabulary and the merges are read for the whole
+process and stay on `init.arena`, the run goes to `init.gpa`, and `Result.deinit` returns the
+trained weights to the same one.
+
+`zig build peak-rss` is the gate, `verify` runs it, and the budget is 134,217,728 B — the
+`peak_rss_budget` constant at the top of `build.zig`, beside the digests. It execs the ReleaseFast
+binary itself under `/usr/bin/time -l`, compares the maximum resident set size that tool reports
+against that one number, prints nothing when it passes, and prints the budget, the peak and the way
+back when it does not. It measures on Darwin and on Linux, and on Linux it **fails** rather than skips when
+`/usr/bin/time` is missing, because CI runs there and a green run that checked nothing is a claim
+rather than a gate. The one silent exit is a platform that is neither.
+
+The budget sits between two measured populations rather than beside either one. The fixed build read
+45,694,976 to 49,070,080 over five runs, so 128 MiB is 2.7x the worst of them. The arena build read
+387,661,824 at its lowest and 3,842,310,144 at its highest, so it is 2.9x under the lowest, and a
+budget placed near the 3.72 GiB the defect is famous for would have passed on the run that read
+387 MB. Peak resident size does not inflate under load the way a wall clock does, which is what makes
+this gate runnable inside `verify` at all, and the 2.7x is headroom for a differing allocator and
+libc rather than for a busy machine.
+
+Measured on the shipped 123-step run, the ReleaseFast `ztransformer-train` binary on its own under
+`/usr/bin/time -l`, every run taken. The second column says where each number came from, because one
+of these rows can no longer be taken by any command in this tree.
+
+| Allocator `train.run` is handed | Peak resident, every run | How it was taken |
+|---|---|---|
+| `init.gpa` | 49,070,080 / 48,529,408 / 47,841,280 / 47,316,992 / 45,694,976 B | `/usr/bin/time -l` on the binary, five runs; `zig build peak-rss` is that measurement and a budget |
+| `init.arena` | 3,842,310,144 / 3,288,449,024 / 3,180,314,624 / 387,661,824 B | the same command on the pre-split `main.zig`, four runs. Observation: this tree has no build that takes them |
+
+The gate's own two runs on the committed tree and on `src/main.zig` reverted to the arena, taken
+through `zig build peak-rss` and reported by it:
+
+| Build | Peak resident | Gate |
+|---|---|---|
+| `init.gpa`, committed | 48,955,392 B | green, 85,262,336 B under budget |
+| `init.arena`, `src/main.zig` reverted | 993,738,752 B | red, 7.4x over budget |
+
+That second row is the reason the budget is where it is, and it is not the 3.72 GiB this defect is
+known by: the arena's peak is whatever the host chose to keep resident of an unbounded accumulation,
+and on this run it reported 993 MB rather than 3,989 MB. A gate that only fires above 3.7 GiB would
+have watched that run happen. The run itself is 2:20 here, and the same number on the same box is
+what the fixture costs either way.
+
+67x at the median of the first table, and the more useful half of the answer is the shape of its two
+rows: the arena's peak is unstable across runs of the identical binary, because how much of an
+unbounded accumulation the kernel keeps resident is the host's decision, while the gpa's peak is one
+step's working set and moves 7%. Three more numbers were taken alongside those runs and no command in
+this tree produces them now, so they are observations and the method is named: a 0.4 s RSS sampler
+running next to the run — on the arena the resident set climbed 1,338 MB to 3,032 MB across the run's
+second half at about 26 MB per step, and on the gpa it held 45.4 MB to 46.8 MB across the same window
+— and the `user`, `sys` and page-reclaim fields of the same `/usr/bin/time -l` report, which read
+`sys` 0.83 to 4.73 s against 0.50 to 0.92 s and page reclaims 244,000 to 258,000 against 11,000 to
+17,000. `zig build peak-rss` keeps that report and throws the rest of it away, because those fields
+move with the host and the budget is about one of them.
+
+`/usr/bin/time -l zig build train` is not the way to measure this, and its number would have hidden
+the defect completely: it read 570,769,408 B before this change and 561,856,512 B after it, because
+`zig build` runs the binary as a grandchild and the grandchild's peak does not reach the number. The
+binary has to be timed on its own, which is why the gate takes the built binary's path and execs it
+rather than depending on the `train` step that would have run it as a grandchild. Both of those two
+numbers are observations taken that way, the "after" one reproducible with
+`/usr/bin/time -l zig build train` and the "before" one not, for the reason in the table above.
+
+There is no step-time cost, and the host this was measured on could not have shown one. `user` time
+across both arms spans 71 to 96 s and is a monotone function of `real` time across the two arms
+alike, because the machine was at load 8 to 14 on eight cores throughout; at the two most comparable
+samples the gpa arm was 3% the faster of the two. What is not contention is the `sys` time and the
+page-reclaim count above, both of which fall with the memory.
+
+`outputs/loss.csv` hashes to `f1dd5444...` either way, which is the point worth making explicit: an
+allocator decides where the bytes live and not what they add up to. Nothing in the loop reads an
+address — the batch order is an index array, the optimizer pairs parameters and gradients by
+position, the clipper's single norm sums the flat view in index order, and every reduction walks a
+fixed order — so there is no path by which a different `free` could reach the arithmetic.
+
+### Step time, and what it is not
+
+`zig build bench` is the command. It reports the median of N runs of the whole training run, divided
+by the steps the run reports, so the denominator comes from the run rather than from a constant here:
+
+```
+$ zig build bench -Doptimize=ReleaseFast
+bench  3 runs of 123 steps, user CPU seconds per step
+       median 0.2793   min 0.2785   max 0.2808
+       spread 0.8% of the median
+       whole run including tokenizer startup, over the steps it did
+```
+
+That is the figure at `HEAD` after both unroll rounds. An earlier version of this block quoted
+0.2934, which was measured before either round and was left sitting above a paragraph claiming
+0.2721 — a stale transcript contradicting the number next to it by 7.8%. The 0.2721 below is the
+same tree measured in a different sitting; this box's load average moves, and the honest reading is
+that the step is **0.27 to 0.28** and either single figure is a measurement of one moment.
+
+It is user CPU time and not wall clock, and getting that wrong was the first bug in it: macOS
+`/usr/bin/time -l` prints real, user and sys on one line, so a pattern matching `.*user.*` captures
+the **first** number on that line, which is real. On `sleep 1` it read 1.00 where user was 0.00,
+and the first version of this table was wall clock under a label saying CPU. The pattern now
+anchors on the column.
+
+Three direct `/usr/bin/time -l` runs of the same binary read 0.2988, 0.2998 and 0.3038. `bench` has
+read 0.2934 and 0.3031 in separate invocations, so it lands in and around that set rather than
+systematically above or below it, and the two methods agree to within about 3%. Which direction any
+single pair differs by is not stable and is not claimed to be: both were taken on a box whose load
+average was moving, and that is the likeliest reason.
+
+It reports and never gates, and the asymmetry with `peak-rss` is deliberate. A peak in bytes is a
+property of the program, so it can have a threshold. A time in seconds is a property of the program
+and the machine and the hour, so a threshold on it fires on somebody else's load average and teaches
+the gate to be ignored. `-Dbench-runs=9` for a number you intend to quote.
+
+Two rounds of unrolling the backward pass took the whole run from **0.4522 to 0.2721 CPU seconds per
+step**, both figures the median of three `zig build bench` runs taken in one session on the same
+machine at a load average of 4.6, with spreads of 1.8% and 0.4%. The loss curve is byte-identical at
+`f1dd5444...` across both. An earlier version of this line quoted 0.563 and 0.373, read off a console
+transcript at a load average of 15 to 19; the ratio was 1.51x and this one is 1.66x, and neither pair
+should be compared with the other because the load differed. Those two are the numbers
+`zig build bench` produced in one sitting, and the rule here is that a number either comes out of
+that command or says where it came from.
+
+**The rest of this section does not come out of `bench`, and an earlier version of it implied that
+it did.** The per-call and per-phase figures below come from an instrumented copy that is not
+committed — two `clock_gettime(PROCESS_CPUTIME_ID)` reads at function entry and exit, none inside
+the loops. Treat them as observations with the method named, not as measurements a reader can
+re-run. `bench` reports the whole run and nothing below its level.
+
+The first round unrolled `weightGrad`'s column loop and `inputGrad`'s row loop eight ways, which
+were 77% of the backward. The second went after `attentionBackward`, at an observed 10.54 ms a call
+and 14.7% of a step, and took it to 6.11 ms and 9.1%: 4.43 ms a call times 4 calls is 17.7 ms a step
+against an observed 18.2 ms a step end to end, so 3% of the gain came from anywhere else. Note that
+0.4522 to 0.2721 is the span of **both** rounds, not of the second alone.
+
+What made the second round different is that its split axis was neither a column nor a row. The two
+gathered-row dot products split on `s`, giving eight independent chains of length `dim`; the `d q`
+and `d k`/`d v` loops split on `j`. The `d k`/`d v` case is the instructive one, because those
+*accumulate* over `s`: the unroll is only over `j` within one `s`, and the `s` loop that does the
+accumulating is untouched, so the read-modify-write order is unchanged. Unrolling a reduction is
+what moves bytes, and the way not to is to never add one lane to another. Byte-identity is a
+property of the split rather than a hope: each lane accumulates exactly the terms its scalar
+counterpart did, in the same ascending order, and the lanes are never summed together. A `@Vector`
+accumulator over the reduction axis would have reassociated the sum and moved the bytes.
+
+What made it worth doing is that neither kernel was bandwidth-bound. `weightGrad` moves 12 bytes per
+FMA and at the shipped shape the whole backward is a few megabytes of L1-resident rows, so bandwidth
+was never the constraint — instruction issue was. LLVM declines to vectorise `w_row[j] +=` because it
+is a read-modify-write through two pointers it cannot prove disjoint, and Zig has no `noalias` on a
+function parameter, so the fix is code rather than a signature.
+
+Three of the seven unrolled loops in `src/` reach a fast path that no finite-difference check
+executed for most of this history, and the failures were of two kinds. The `s`-split loops in
+`attentionBackward` need at least eight tokens to unroll at all, and every `checkAll` in the
+repository was passed a four-token array, so their eight-way bodies ran only in `train_test.zig` --
+which compares `train.run` against `clearedWalk`, two calls to the same `backward`, so a wrong
+unroll is wrong identically in both arms. The `head_dim`-split bodies need a `head_dim` above
+`lanes` and a kv head other than the first, and every fixture was `n_heads 1, n_kv_heads 1`, which
+makes `h * dim` and `kv * dim` identically zero in the only check that reached them.
+
+`unroll_s` in `src/autograd_test.zig` is nine tokens at `n_heads 4, n_kv_heads 2, head_dim 12`, and
+it is the only fixture that executes those paths. The proof that it is load-bearing is a manual experiment rather than a committed
+mutation, and there is no `tools/mutation` entry for it: no mutation in `mutate.zig` targets an
+unrolled lane. Replacing one unrolled lane write with lane zero's value fails that test and
+**only** it, 191 of 192 still passing, because every other gradcheck in the file never reaches that
+code at all. A reviewer read the test names back and observed that `train_test.zig` does reach the
+`s`-splits at `ctx 32`; whether its other assertions would catch a bad `d q` lane is not checkable
+from the tree, so the "only it" is what was measured, not what is proven.
+
+The scalar tail that finishes an odd width was covered by none of the fixtures either, because every fixture lands on a multiple of
+eight by accident. `unroll_tail` in `src/autograd_test.zig` is the fixture that is not, at
+`d_model` 12.
 
 ## Model
 
@@ -242,6 +424,13 @@ be tight against a spread that depends on the weights, so `k` absorbs all of it.
 of those 550 sweeps sat at **0.651 of budget**, which bounds the observed worst case with 35% to
 spare; the same formula under the old one measured 2.02, failing 62 of the 550 sweeps outright.
 
+Those 550 sweeps are an offline analysis, and this is the one number in this file that no command in
+the repository reproduces: the sweep harness was not committed, and the 110-config grid it walked
+does not exist here. What is committed is the constant it selected, `k = 12` in `src/gradcheck.zig`,
+and the test that asserts against it. So the number above is the evidence for the constant rather
+than a measurement of the tree, and it is quoted as one on purpose. Re-deriving `k` means
+rebuilding the sweep, not re-running a command.
+
 Three terms the derivation omits, and why:
 
 | Omitted | Why |
@@ -313,13 +502,15 @@ README can quote it.
 | `scale.project` | `project(Shape) !Projection` | Every term for one shape. Rejects a config `model.validate` rejects. |
 | `scale.Projection` | 18 fields | FLOPs per term, element counts for parameters, gradients, AdamW state and activations, and the four byte counts. |
 | `scale.coreOverMlp` | `coreOverMlp(Projection) f64` | The attention core against one layer's MLP. The number the fused-kernel deferral rests on. |
-| `scale.layerStep` | `layerStep(Projection) f64` | One layer's whole step: forward plus `weightGrad` and `inputGrad`, so three times the forward. |
-| `scale.tiedOverStep` | `tiedOverStep(Projection) f64` | The tied head against every layer's step plus itself. |
 | `scale.crossoverT` | `crossoverT(h, bar) f64` | The `T` at which `core/mlp` reaches `bar`: `3 * bar * h - 1`. |
-| `scale.tiedCrossoverVocab` | `tiedCrossoverVocab(h, bar) f64` | The `vocab` at which the tied head reaches `bar` of one MLP layer: `bar * 3 * h`. |
-| `scale.attention_bar` | `0.25` | The bar a deferred item has to clear. A choice, and named as one. |
-| `scale.host_bytes` | 32 GiB | The memory a `fits` verdict is a statement about. |
 | `scale.print` | `print(w: *std.Io.Writer) !void` | The whole report to the writer it is given, never to a stream. |
+
+Those seven are the whole public surface, because `main.zig` calls one of them. Everything else
+`scale.zig` needs is private: the bar a deferred item has to clear (`attention_bar`, `0.25`, a
+choice and named as one), the 32 GiB a `fits` verdict is a statement about (`host_bytes`), one
+layer's whole step (`layerStep`), the tied head's share of a step (`tiedOverStep`), the core's
+share of a step (`coreOverStep`), the tied head's vocabulary crossover (`tiedCrossoverVocab`) and
+the dense score matrix's context ceiling (`denseScoreCtx`).
 
 ### What it says about the deferred work
 
@@ -368,10 +559,10 @@ at-parity-12d            yes          yes          yes           no     over hos
 <!-- scale-profile:end -->
 
 **The `T > 6 * d` claim is wrong by a factor of two, and it is the deferral's own arithmetic.**
-`attention.forward` walks `0..t + 1` (attention.zig:54), so it computes half of a dense score
+`attention.forward` walks `0..t + 1`, so it computes half of a dense score
 matrix, and the core is `2 * d * T * (T + 1)` rather than `4 * T^2 * d`. The MLP half of the
 comparison is correct and is `mlp`'s own shape: three matmuls of a `[T, d]` input against
-`[d, h]`, `[d, h]` and `[h, d]` (model.zig:376) is `6 * T * d * h`, which is `24 * T * d^2` at
+`[d, h]`, `[d, h]` and `[h, d]` is `6 * T * d * h`, which is `24 * T * d^2` at
 `ffn_mult = 4`. So `core / mlp = (T + 1) / (3 * h)`, parity is `T = 12 * d` and not `6 * d`, and
 the 6% the note names is `T = 0.71 * d` rather than whatever the dense count gives. The direction of
 the deferral survives, and it was the right call anyway: the core is 3.9% of a layer's step at the
@@ -390,8 +581,8 @@ The tied head was the one that should not have waited, and it is the one that di
 step at the shipped shape and 5.6% at 8B, and the reason is arithmetic intensity rather than an
 arithmetic count: `tiedHead` does `2 * T * vocab * d` operations over `4 * T * vocab * d` bytes,
 which is 0.5 flop per byte with no reuse in it, where one MLP layer re-reads its weights once for
-all `T` rows and gets `T / 2 = 32` at `T = 64`. That is a 64x gap, and it is arithmetic a reader can
-do off `model.zig:339` and `model.zig:376`; no timing is claimed for it here, because no command in
+all `T` rows and gets `T / 2`, which is `128` at the shipped `T = 256`. That is a 256x gap, and it is arithmetic a reader can
+do off `model.tiedHead` and `model.initLayer`; no timing is claimed for it here, because no command in
 this repository measures one and a wall time would outlive the shape it was taken at.
 
 Low intensity cannot be fixed by reducing traffic when there is no reuse to recover, so the lever
@@ -459,7 +650,7 @@ makes the test blind to the thing it is for.
 
 ### Two survivors that are not holes
 
-`tools/mutation` leaves three survivors after that test. Two of them are not coverage holes, and
+`tools/mutation` leaves two survivors after that test. Neither is a coverage hole, and
 neither is going to become one, so they are recorded here rather than left for the next person to
 spend a day on. `clip-ge` is the `>` / `>=` question settled above: bit-identical, uncaughtable.
 `norm-reassociate` is `v / rms * w[i]` written as `v * w[i] / rms`, and the measured answer is that

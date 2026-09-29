@@ -3,44 +3,35 @@
 //!
 //! This is a projection, not a benchmark, and it says so in its own output. No
 //! forward pass is run at any shape here, no wall time is printed, and nothing
-//! below is a measurement. Every constant is read from a module rather than
-//! copied out of it, so a shape that changes changes the number instead of
-//! leaving a stale one behind, and the comment on each term names the line the
-//! term came from.
+//! below is a measurement.
 //!
-//! Two things are deliberately absent. There is no `@setRuntimeSafety` escape
-//! and no unsafe, so every product below is checked: a shape whose arithmetic
-//! overflows `u64` traps rather than printing a wrapped number. And the softmax
-//! is left out of the attention FLOP count, which is a bound rather than an
-//! oversight: `attention.forward` does four non-multiply-add operations per
-//! score against `head_dim` multiply-adds, so the whole softmax term is
-//! `4 / head_dim` of the attention core and under 3% at any head_dim this
-//! project uses. It is named in the output so the omission is checkable.
+//! There is no `@setRuntimeSafety` escape and no unsafe, so every product below
+//! is checked: a shape whose arithmetic overflows `u64` traps rather than
+//! printing a wrapped number. The softmax is left out of the attention FLOP
+//! count, which is a bound rather than an oversight: `attention.forward` does
+//! four non-multiply-add operations per score against `head_dim` multiply-adds,
+//! so the whole softmax term is `4 / head_dim` of the attention core and under
+//! 3% at any head_dim this project uses. It is named in the output so the
+//! omission is checkable.
 
 const std = @import("std");
 const model = @import("model.zig");
 
 /// One row of the sweep: a name a reader can look up and a shape to project.
-///
 /// `cfg` is a real `model.Config`, so a row cannot claim a shape the model
-/// would refuse to build. `model.validate` rejects a config whose kv heads do
-/// not divide the query heads, whose head_dim is odd, or that has no layer, and
-/// `Project` calls it, so a row added here with one of those is an error rather
-/// than a plausible line of output.
+/// would refuse to build.
 pub const Shape = struct {
     name: []const u8,
     cfg: model.Config,
 };
 
-/// The sweep: the shipped shape first, then the same width at longer contexts,
-/// then a width that is a real model's, and two rows chosen to bracket the
-/// crossovers the deferred work was argued from.
-///
-/// The last two are not aspirations. `llama3-8b-32k` is the first row whose
-/// attention core passes the bar `attention_bar`, and `at-parity-12d` sits
-/// exactly on the context where the attention core equals one layer's MLP, so
-/// the crossover is a line of this tool's output rather than a sentence in a
-/// document that has to be taken on trust.
+/// The shipped shape first, then the same width at longer contexts, then a
+/// width that is a real model's, then two rows that bracket the crossovers the
+/// deferred work was argued from. The last two are not aspirations:
+/// `llama3-8b-32k` is the first row whose attention core passes
+/// `attention_bar`, and `at-parity-12d` sits exactly on the context where the
+/// core equals one layer's MLP, so a crossover is a line of this tool's output
+/// rather than a sentence in a document that has to be taken on trust.
 pub const sweep = [_]Shape{
     .{ .name = "shipped", .cfg = model.defaultConfig() },
     .{ .name = "ctx-1k", .cfg = withCtx(model.defaultConfig(), 1024) },
@@ -60,7 +51,7 @@ fn withCtx(cfg: model.Config, n_ctx: usize) model.Config {
 /// Llama-3 8B's shape with this repository's own feed-forward rule, which is
 /// `ffn_mult * d_model` with `ffn_mult` an integer and so is 4x where Llama-3
 /// is 3.5x rounded to a multiple of 256. `ffn_mult = 4` is stated here rather
-/// than inherited so a reader can see the one place this row is not Llama-3's.
+/// than inherited so the one place this row is not Llama-3's is visible.
 fn llamaThree(n_ctx: usize) model.Config {
     return .{
         .n_layers = 32,
@@ -73,26 +64,23 @@ fn llamaThree(n_ctx: usize) model.Config {
     };
 }
 
-/// Bytes of f32 in a host that a person can buy. Used only to say whether a
-/// tensor is out of reach, so the number is a round figure and the column says
-/// which one.
-pub const host_bytes: u64 = 32 * 1024 * 1024 * 1024;
+/// Bytes of f32 in a host a person can buy. A round figure, and the column says
+/// so: it is only ever the thing a `fits` verdict is a statement about.
+const host_bytes: u64 = 32 * 1024 * 1024 * 1024;
 
 /// The bar a deferred item has to clear before it is worth doing, as a share of
-/// one layer's MLP arithmetic.
-///
-/// A choice, and named as one: nothing in the code derives it. It is stated here
-/// so a reader who prefers a different bar can see which number moved, because
-/// the ratios the bar is compared against are measured-by-formula and the bar is
-/// the only judgement in the table.
-pub const attention_bar: f64 = 0.25;
+/// one layer's MLP arithmetic. A choice, and named as one: nothing derives it.
+/// The ratios it is compared against are counted by formula and this is the
+/// only judgement in the table, so it is stated here and a reader who prefers a
+/// different bar can see which number moved.
+const attention_bar: f64 = 0.25;
 
 /// Every projected quantity for one shape, in f32, in the units the field name
 /// says. Nothing here was timed.
 pub const Projection = struct {
     shape: Shape,
-    /// `model.dModel` (model.zig:68), `model.ffnDim` (model.zig:72) and
-    /// `n_kv_heads * head_dim` (model.zig:369).
+    /// `model.dModel`, `model.ffnDim` and the `kv_dim` of
+    /// `model.initLayer`, which is `n_kv_heads * head_dim`.
     d: u64,
     h: u64,
     kv: u64,
@@ -103,22 +91,22 @@ pub const Projection = struct {
     attn_core: u64,
     attn_proj: u64,
     mlp: u64,
-    /// FLOP for the whole step: the tied head's forward (`model.tiedHead`,
-    /// model.zig:339) and the two products its backward runs at
-    /// autograd.zig:190-203, which is one forward and two backward.
+    /// FLOP for the whole step: the tied head's forward (`model.tiedHead`)
+    /// and the two products its backward runs at, which is one forward and
+    /// two backward. Once per step rather than per layer, and the
+    /// embeddings are the only parameter that takes both paths.
     tied_head: u64,
-    /// FLOP per layer, `autograd.weightGrad` over the seven projections it is
-    /// called on (autograd.zig:368,393,394,422,436,437,438).
+    /// FLOP per layer, `autograd.weightGrad` over the seven projections it
+    /// is called on: one each for wq, wk, wv, wo, w_gate, w_up and w_down.
     weight_grad: u64,
-    /// f32 elements, from `model.initLayer`'s `shapes` array (model.zig:370)
-    /// and `initParams`' two outer tensors (model.zig:151,155).
+    /// f32 elements, from the `shapes` array in `model.initLayer` and the
+    /// two outer tensors in `model.initParams`.
     params: u64,
-    /// `autograd.zeroGrads` mirrors `Params` element for element
-    /// (autograd.zig:54), and `train.run` flattens `2 + 9 * n_layers` tensors
-    /// over it (train.zig:118).
+    /// `autograd.zeroGrads` mirrors `Params` element for element, and
+    /// `train.run` flattens `2 + 9 * n_layers` tensors over it.
     grads: u64,
     /// `optim.AdamW` holds `m` and `v`, each shaped like the parameter it
-    /// updates (optim.zig:26).
+    /// updates.
     adam: u64,
     /// f32 elements live at the peak of `autograd.backward`, named term by term
     /// in `activationElems`.
@@ -128,10 +116,10 @@ pub const Projection = struct {
     /// materialize it, which is what `scores_row` is for.
     scores_dense: u64,
     /// What `attention.forward` actually allocates: one f64 row of `T`, reused
-    /// across rows and heads (attention.zig:45).
+    /// across rows and heads.
     scores_row: u64,
-    /// `T * vocab * d * 4`: `tiedHead` reads a whole `tok_embed` row per token
-    /// (model.zig:342), so the table is walked `T` times.
+    /// `T * vocab * d * 4`: `tiedHead` reads a whole `tok_embed` row per
+    /// token, so the table is walked `T` times.
     tied_stream: u64,
     /// `n_layers * n_kv_heads * T * head_dim * 2 * 4`: k and v, f32, for every
     /// layer. Not implemented; the number is what implementing it costs.
@@ -149,25 +137,24 @@ pub fn project(shape: Shape) !Projection {
     const t: u64 = cfg.n_ctx;
     const l: u64 = cfg.n_layers;
 
-    // attention.zig:54-58 walks `0..t + 1`, so the score matrix is triangular:
-    // n_heads * T(T+1)/2 dots of head_dim, each a multiply-add. The weighted sum
-    // at attention.zig:73-78 is the same count over the same prefix. Together
-    // 2 * d * T * (T + 1), which is HALF the `4 * T^2 * d` the deferral note
-    // quotes, because that figure is the dense non-causal one every public
-    // attention count uses.
+    // `attention.forward` walks `0..t + 1` in its score loop, so the score
+    // matrix is triangular: n_heads * T(T+1)/2 dots of head_dim, each a
+    // multiply-add, and its weighted sum over the same prefix is the same
+    // count over the same prefix. Together 2 * d * T * (T + 1), which is HALF
+    // the `4 * T^2 * d` the deferral note quotes: that figure is the dense
+    // non-causal one every public attention count uses.
     const attn_core = 2 * d * t * (t + 1);
-    // model.zig:372-379: wq and wo are [d, d], wk and wv are [d, kv], and
-    // tensor.matmul (tensor.zig:61) is one multiply-add per element of [T,k] and
+    // In `model.initLayer`'s `shapes`, wq and wo are [d, d] and wk and wv are
+    // [d, kv], and `tensor.matmul` is one multiply-add per element of [T,k] and
     // [k,n]. So T * (2d^2 + 2 * d * kv) multiply-adds.
     const attn_proj = 2 * t * (2 * d * d + 2 * d * kv);
-    // model.zig:376-379: w_gate and w_up are [d, h] and w_down is [h, d], so
-    // 3 * T * d * h multiply-adds. At `ffn_mult = 4` that is the `24 * T * d^2`
-    // the deferral note quotes, and it is right.
+    // Still `model.initLayer`: w_gate and w_up are [d, h] and w_down is [h, d],
+    // so 3 * T * d * h multiply-adds. At `ffn_mult = 4` that is the
+    // `24 * T * d^2` the deferral note quotes, and it is right.
     const mlp = 2 * (3 * t * d * h);
-    // model.tiedHead (model.zig:339-350) is T * vocab * d multiply-adds, and the
-    // backward's head loop (autograd.zig:190-203) is two per element of the
-    // same three loops. Three forwards' worth, once per step rather than per
-    // layer, and the embeddings are the only parameter that takes both paths.
+    // `model.tiedHead` is T * vocab * d multiply-adds, and the head loop in
+    // `autograd.backwardFrom` is two per element of the same three loops. Three
+    // forwards' worth, once per step.
     const tied_head = 2 * (3 * t * cfg.vocab_size * d);
     // One weight gradient per projection, each `input` rows by `dout` columns.
     const weight_grad = 2 * t * (2 * d * d + 2 * d * kv + 3 * d * h);
@@ -196,13 +183,11 @@ pub fn project(shape: Shape) !Projection {
     };
 }
 
-/// f32 elements live at the peak of one backward pass, term by term.
-///
-/// Every term is a tensor the code allocates and keeps, from `train.run` and
-/// `autograd.backward`. A term that is off by one tensor is off by 4 bytes out
-/// of billions and does not matter; a term that is missing entirely is a
-/// different memory profile, so the list is written out rather than collapsed
-/// into a coefficient.
+/// f32 elements live at the peak of one backward pass, term by term. Every term
+/// is a tensor the code allocates and keeps, from `train.run` and
+/// `autograd.backward`. A term off by one tensor is off by 4 bytes out of
+/// billions; a term missing entirely is a different memory profile, so the list
+/// is written out rather than collapsed into a coefficient.
 fn activationElems(cfg: model.Config) u64 {
     const d: u64 = model.dModel(cfg);
     const h: u64 = model.ffnDim(cfg);
@@ -210,21 +195,19 @@ fn activationElems(cfg: model.Config) u64 {
     const t: u64 = cfg.n_ctx;
     const l: u64 = cfg.n_layers;
 
-    // logits and dlogits (train.zig:169,180), both [T, vocab]: 4.2 GB of f32
-    // for one of them at T=8192, vocab=128256. At 32 layers that is 9% of this
-    // total, and the per-layer blocks below are 90%, so the number a reader
-    // arrives with is not the one that fills the machine.
+    // logits and dlogits, both [T, vocab]. A tenth of the
+    // total, so the per-layer blocks below are what fills the machine and not
+    // the pair a reader arrives with.
     const head = 2 * t * cfg.vocab_size;
-    // The cache's block input (autograd.zig, `Cache.init`): one [T, d]. It used
-    // to be a slice of L + 1 of them, one per layer boundary, but the stream a
-    // block starts from is now the previous block's `out` and is not held twice.
+    // The cache's block input (`Cache.init`), one [T, d]: the stream a block
+    // starts from is the previous block's `out` and is not held twice.
     const stream = t * d;
     // One `Block` per layer (`autograd.Cache`): six [T, d] (`attn_in`, `q_pos`,
     // `ctx`, `x_mid`, `mlp_in`, `out`), two [T, kv] (`k_pos`, `v`) and three
     // [T, h] (`gate`, `up`, `a`).
     const blocks = l * t * (6 * d + 2 * kv + 3 * h);
     // `final_h`, `d_final_h`, `d_x` and the layer loop's `d_next`
-    // (autograd.zig, `backwardFrom`), all [T, d], one `d_next` alive at a time.
+    // (`backwardFrom`), all [T, d], one `d_next` alive at a time.
     const grads = 4 * t * d;
     // `attentionBackward`'s dq, dk and dv plus its two f64 row buffers, which
     // are f32 elements' worth twice over.
@@ -240,16 +223,16 @@ pub fn coreOverMlp(p: Projection) f64 {
 /// One layer's whole step: forward, then `weightGrad` and `inputGrad` per
 /// projection, which is three times the forward. Three and not two because the
 /// backward runs both a weight and an input gradient for every projection
-/// (autograd.zig:366-445), and for the attention core it rebuilds the scores a
-/// second time (autograd.zig:486), so the same factor covers it.
-pub fn layerStep(p: Projection) f64 {
+/// (`weightGrad` and `inputGrad`), and for the attention core it rebuilds the
+/// scores a second time (`attentionBackward`), so the same factor covers it.
+fn layerStep(p: Projection) f64 {
     return 3 * (toF(p.attn_core) + toF(p.attn_proj) + toF(p.mlp));
 }
 
 /// The tied head over the whole step: every layer's arithmetic, forward and
 /// backward, plus the tied head. The two are the same cost model, so the share
 /// is over the same denominator.
-pub fn tiedOverStep(p: Projection) f64 {
+fn tiedOverStep(p: Projection) f64 {
     const l: f64 = @floatFromInt(p.shape.cfg.n_layers);
     const tied = toF(p.tied_head);
     return tied / (l * layerStep(p) + tied);
@@ -258,7 +241,7 @@ pub fn tiedOverStep(p: Projection) f64 {
 /// The attention core over one layer's whole step. The deciding number for a
 /// fused kernel, which is a share of everything the step does rather than of
 /// the one term the deferral note happens to name.
-pub fn coreOverStep(p: Projection) f64 {
+fn coreOverStep(p: Projection) f64 {
     return toF(p.attn_core) / layerStep(p);
 }
 
@@ -282,22 +265,18 @@ pub fn crossoverT(h: usize, bar: f64) f64 {
 }
 
 /// The vocabulary at which the tied head reaches `bar` of one MLP layer's
-/// arithmetic, forward and backward on both sides.
-///
-/// `6 * T * vocab * d = bar * 3 * 6 * T * d * h` gives `vocab = bar * 3 * h`.
-/// At the bar this file prints that is a quarter of three times the feed-forward
-/// width, or `bar * 3 * ffn_mult * d`. At `bar = 1` it is `3 * h`: the tied head
-/// costs a whole layer's MLP once the vocabulary reaches three times the
-/// feed-forward width, which is below every vocabulary in this sweep.
-pub fn tiedCrossoverVocab(h: usize, bar: f64) f64 {
+/// arithmetic, forward and backward on both sides. `6 * T * vocab * d = bar * 3 *
+/// 6 * T * d * h` gives `vocab = bar * 3 * h`, or `bar * 3 * ffn_mult * d`: a
+/// quarter of three times the feed-forward width at the bar this file prints,
+/// and `3 * h` at `bar = 1`, which is below every vocabulary in this sweep.
+fn tiedCrossoverVocab(h: usize, bar: f64) f64 {
     return bar * 3.0 * @as(f64, @floatFromInt(h));
 }
 
 comptime {
     // Every row of the sweep has to be a config `model.validate` accepts, and
     // the check is here rather than in `print` so a bad row is a compile error
-    // instead of a run that fails in the middle of a table. `model.validate` is
-    // private, which is the only reason this duplicates it.
+    // instead of a run that fails in the middle of a table.
     for (sweep) |shape| {
         _ = project(shape) catch @compileError("scale.sweep: " ++ shape.name ++
             " is not a config model.validate accepts");
@@ -432,15 +411,26 @@ pub fn print(w: *std.Io.Writer) std.Io.Writer.Error!void {
         \\chosen and not derived. tied_head is tied_head / (3 * mlp) against the
         \\same bar, forward and backward on both sides. wgrad_swap is not a
         \\ratio: it is a constant no, and the reason is in the code rather than
-        \\in a number. matmul (tensor.zig:65), weightGrad (autograd.zig:662) and
-        \\inputGrad (autograd.zig:680) each stream three contiguous rows and
-        \\accumulate in place, so there is no strided read to block away, and any
-        \\reorder sums the same terms in another order and changes the bytes.
+        \\in a number. matmul, weightGrad and inputGrad each stream three
+        \\contiguous rows and accumulate in place, so there is no strided read
+        \\to block away, and any reorder sums the same terms in another order
+        \\and changes the bytes.
         \\
         \\
     , .{attention_bar});
 
+    // Every crossover below is one of two closed forms applied to the shipped
+    // row, and the tables above already carry the shapes they come from, so
+    // they are named here rather than spelled out sixteen times inline.
     const any = ps[0];
+    const ctx_bar = crossoverT(any.h, attention_bar);
+    const ctx_parity = crossoverT(any.h, 1.0);
+    const ctx_six_pct = crossoverT(any.h, 0.06);
+    const vocab_bar = tiedCrossoverVocab(any.h, attention_bar);
+    const host_gib = toF(host_bytes) / toF(1024 * 1024 * 1024);
+    // What the tied head walks at T=64 on the d4096 row, in GB and the bandwidth
+    // moving it implies.
+    const stream_gb = toF(64 * 128256 * 4096 * 4) / 1e9;
     try w.print(
         \\
         \\CROSSOVERS, the context or vocabulary at which each verdict flips
@@ -462,28 +452,28 @@ pub fn print(w: *std.Io.Writer) std.Io.Writer.Error!void {
         \\
         \\  Why the tied head is the expensive one is arithmetic intensity and
         \\  not arithmetic, and it is readable from the two loops rather than
-        \\  from a stopwatch. tiedHead (model.zig:339) does 2 * T * vocab * d
-        \\  operations over 4 * T * vocab * d bytes, which is {d:.2} flop per
-        \\  byte with no reuse to find, while one MLP layer re-reads its
-        \\  3 * d * h weights once for all T rows and so gets T / 2 = {d:.0}
-        \\  flop per byte. At T=64 that is {d:.0}x. The {d:.1} GB it has to move
-        \\  at that shape, and the {d:.2} GB/s that implies, are derived here;
-        \\  no wall time is, because this tool projects rather than measures.
+        \\  from a stopwatch. tiedHead does 2 * T * vocab * d operations
+        \\  over 4 * T * vocab * d bytes, which is {d:.2} flop per byte with
+        \\  no reuse to find, while one MLP layer re-reads its 3 * d * h
+        \\  weights once for all T rows and so gets T / 2 = {d:.0} flop per
+        \\  byte. At T=64 that is {d:.0}x. The {d:.1} GB it has to move at
+        \\  that shape, and the {d:.2} GB/s that implies, are derived here; no
+        \\  wall time is, because this tool projects rather than measures.
         \\
     , .{
-        crossoverT(any.h, attention_bar),
-        crossoverT(any.h, attention_bar) / toF(any.d),
-        crossoverT(any.h, 1.0),
-        crossoverT(any.h, 1.0) / toF(any.d),
-        crossoverT(any.h, 0.06),
-        crossoverT(any.h, 0.06) / toF(any.d),
-        tiedCrossoverVocab(any.h, attention_bar),
-        tiedCrossoverVocab(any.h, attention_bar) / toF(any.d),
-        toF(host_bytes) / toF(1024 * 1024 * 1024),
+        ctx_bar,
+        ctx_bar / toF(any.d),
+        ctx_parity,
+        ctx_parity / toF(any.d),
+        ctx_six_pct,
+        ctx_six_pct / toF(any.d),
+        vocab_bar,
+        vocab_bar / toF(any.d),
+        host_gib,
         denseScoreCtx(ps[0]),
         denseScoreCtx(ps[3]),
-        toF(64 * 128256 * 4096 * 4) / 1e9,
-        toF(64 * 128256 * 4096 * 4) / 1e9 / 116.0,
+        stream_gb,
+        stream_gb / 116.0,
         0.5,
         64 / 2,
         64 / 2 / 0.5,

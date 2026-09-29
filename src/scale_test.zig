@@ -18,7 +18,7 @@ const shipped = model.defaultConfig();
 test "scale: attention core is 2*d*T*(T+1) on the shipped shape, by hand" {
     // d = n_heads * head_dim = 4 * 32 = 128. T = n_ctx = 256.
     //
-    // attention.forward's score loop (attention.zig:54-58) is
+    // attention.forward's score loop is
     //   for h in 0..n_heads, for t in 0..T, for s in 0..t+1, dot over head_dim
     // so its multiply-adds are n_heads * head_dim * sum_{t=0}^{T-1} (t + 1)
     //   = 128 * (1 + 2 + ... + 256) = 128 * 32896 = 4210688
@@ -27,7 +27,7 @@ test "scale: attention core is 2*d*T*(T+1) on the shipped shape, by hand" {
     const score_macs: u64 = 128 * sum_prefix; // 4210688
     try std.testing.expectEqual(@as(u64, 4210688), score_macs);
     //
-    // The weighted sum (attention.zig:73-78) is the same count over the same
+    // The weighted sum over the same prefix is the same count over the same
     // prefix, and 2 FLOP per multiply-add gives
     //   2 * (4210688 + 4210688) = 16842752 = 2 * 128 * 256 * 257
     const p = try scale.project(.{ .name = "shipped", .cfg = shipped });
@@ -66,7 +66,7 @@ test "scale: attention core matches what attention.forward's loops walk" {
 
 test "scale: mlp is 24*T*d^2 at the shipped shape, by hand" {
     // w_gate [d,h], w_up [d,h], w_down [h,d] against a [T,d] input
-    // (model.zig:376-379): 3 * T * d * h multiply-adds, 2 FLOP each.
+    // (model.initLayer): 3 * T * d * h multiply-adds, 2 FLOP each.
     // d = 128, h = 512, T = 256.
     //   2 * 3 * 256 * 128 * 512 = 100663296
     //   = 24 * 256 * 128 * 128   = 24 * T * d^2, the deferral note's figure
@@ -121,8 +121,8 @@ test "scale: crossoverT solves the ratio it claims to" {
 }
 
 test "scale: tied head is 6*T*vocab*d and streams 4*T*vocab*d bytes" {
-    // model.tiedHead (model.zig:339-350) is T * vocab * d multiply-adds at
-    // 2 FLOP each. The head's backward (autograd.zig:190-203) does two more
+    // model.tiedHead is T * vocab * d multiply-adds at
+    // 2 FLOP each. The head's backward does two more
     // per element of the same three loops, so the step is three forwards.
     // At T=64, d=4096, vocab=128256:
     //   6 * 64 * 128256 * 4096 = 201729245184
@@ -147,7 +147,7 @@ test "scale: tied head is 6*T*vocab*d and streams 4*T*vocab*d bytes" {
 }
 
 test "scale: parameter count is the shapes initLayer allocates" {
-    // Per layer, model.zig:370-380: 2 norms of d, wq and wo of d^2 each, wk and
+    // Per layer, model.initLayer: 2 norms of d, wq and wo of d^2 each, wk and
     // wv of d*kv each, and three of d*h. Plus tok_embed of vocab*d and
     // final_norm of d. Shipped: d=128, h=512, kv=64, vocab=1024, 4 layers.
     //   per layer = 256 + 16384 + 16384 + 16384 + 196608 = 246016
@@ -190,7 +190,7 @@ test "scale: parameter count matches what initParams actually allocates" {
 test "scale: the dense score matrix is n_layers * n_heads * T * T * 4" {
     // At the shipped shape: 4 * 4 * 256 * 256 * 4 = 4194304 = 4 MiB.
     // What the code allocates instead is n_heads * T * 8 = 4 * 256 * 8 = 8192,
-    // one f64 row (attention.zig:45), 512 times smaller.
+    // one f64 row, 512 times smaller.
     const p = try scale.project(.{ .name = "shipped", .cfg = shipped });
     try std.testing.expectEqual(@as(u64, 4 * 4 * 256 * 256 * 4), p.scores_dense);
     try std.testing.expectEqual(@as(u64, 4_194_304), p.scores_dense);
@@ -278,18 +278,27 @@ test "scale: rejects a config model.validate would reject" {
 }
 
 test "scale: every row of the sweep projects" {
-    // The comptime block in scale.zig already refuses a row that does not, so
-    // reaching this test at all means every one of them is a valid config.
+    // The comptime block in scale.zig already refuses a row that is not a valid
+    // config, so reaching this test at all means every one of them is legal.
+    //
+    // All of them, and the loop used to `break` after the first. The test is
+    // named for the sweep and checked one row of it, and the three assertions
+    // are true of any positive projection, so the other six rows were never
+    // looked at. The name was the only thing claiming coverage.
+    try std.testing.expect(scale.sweep.len >= 2);
     for (scale.sweep) |shape| {
         const p = try scale.project(shape);
         try std.testing.expect(p.d > 0);
         try std.testing.expect(p.mlp > 0);
         try std.testing.expect(p.act > 0);
-        // The shipped row is first, so a reader who runs this gets the shape
-        // the rest of the repository documents before anything else.
-        try std.testing.expectEqualStrings("shipped", shape.name);
-        break;
+        // The two the deferrals are argued from, so a row that projects zero
+        // for either cannot pass as a row where a kernel would pay.
+        try std.testing.expect(p.attn_core > 0);
+        try std.testing.expect(p.tied_head > 0);
     }
+    // The shipped row is first, so a reader who runs this gets the shape the
+    // rest of the repository documents before anything else.
+    try std.testing.expectEqualStrings("shipped", scale.sweep[0].name);
 }
 
 test "scale: the report is byte-identical across two runs" {

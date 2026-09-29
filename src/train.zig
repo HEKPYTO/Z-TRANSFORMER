@@ -249,6 +249,146 @@ pub fn run(
     };
 }
 
+/// The header `writeCsv` writes and `divergence` reads. One spelling, so a
+/// column cannot be renamed in one place and looked for in another.
+pub const csv_header = "step,train_loss,val_loss,lr";
+
+/// A step, and the three numbers logged at it in the order `csv_header` names.
+const Cell = struct {
+    step: usize,
+    values: [3]f64,
+};
+
+/// Which logged column a disagreement was found in. The order is `csv_header`'s,
+/// because that is the order `row` fills `Cell.values` in.
+pub const Column = enum {
+    train_loss,
+    val_loss,
+    lr,
+};
+
+/// How far apart two runs' curves are, and where: the largest disagreement over
+/// every cell, and the row and column it is at.
+///
+/// A measurement, deliberately not a verdict. There was a budget here once —
+/// `steps * f32_epsilon * max_loss`, one f32 ulp per step added, which is what
+/// `src/README.md` documents — and it was refuted by this repository's own two
+/// cases. `optim.AdamW.beta1` at 0.85 lands 1667x outside it. So does a Debug
+/// build of the identical source, at 189x, and the run is fine: its successive
+/// rows disagree by 39507, 6119, -51706, 3219 and 9508 ulp, changing sign,
+/// because a one-ulp difference in an early weight moves every weight after it.
+/// That is trajectory chaos and it is unbounded in the step count, so an additive
+/// bound cannot describe it, and any threshold separating the two cases would be
+/// a number fitted to this host's seed, libm and run length.
+///
+/// What is left is what a reader needs to judge the difference themselves, which
+/// is the number itself and the step it is at. The caller decides what it means.
+pub const Divergence = struct {
+    /// Largest absolute disagreement over every cell, 0 for identical curves.
+    absolute: f64,
+    /// The row and column that disagree most, and both sides of it.
+    step: usize,
+    column: Column,
+    committed: f64,
+    fresh: f64,
+    /// The size of the curve it was measured on, so a disagreement can be read
+    /// as a fraction of the run rather than only as an absolute number.
+    steps: usize,
+    max_loss: f64,
+};
+
+/// Measures how far `fresh` is from `committed`, cell by cell.
+///
+/// `error.CurveShape` when the two are not the same shape of file: a different
+/// header, a different number of rows, a field that is not a number. All three
+/// are refused rather than tolerated, because a curve this cannot read is not
+/// one it can measure, and reading past the end of a row is how a difference
+/// gets attributed to the wrong column and reported as rounding.
+///
+/// Nothing allocates: both curves are read into fixed arrays, and `max_rows` is
+/// refused rather than grown, so a longer curve fails instead of being silently
+/// compared only in part.
+pub fn divergence(committed: []const u8, fresh: []const u8) !Divergence {
+    var a: [max_rows]Cell = undefined;
+    var b: [max_rows]Cell = undefined;
+    const n = try parse(committed, &a);
+    if (try parse(fresh, &b) != n) return error.CurveShape;
+
+    var steps: usize = 0;
+    var max_loss: f64 = 0;
+    for (a[0..n]) |c| {
+        steps = @max(steps, c.step + 1);
+        // The two loss columns, not `lr`: the budget is in loss units.
+        max_loss = @max(max_loss, @abs(c.values[0]), @abs(c.values[1]));
+    }
+
+    var worst: Divergence = .{
+        .absolute = 0,
+        .step = a[0].step,
+        .column = .train_loss,
+        .committed = a[0].values[0],
+        .fresh = a[0].values[0],
+        .steps = steps,
+        .max_loss = max_loss,
+    };
+    for (a[0..n], b[0..n]) |ca, cb| {
+        for (ca.values, cb.values, 0..) |va, vb, i| {
+            const d = @abs(va - vb);
+            if (d > worst.absolute) {
+                worst.absolute = d;
+                worst.step = ca.step;
+                worst.column = switch (i) {
+                    0 => .train_loss,
+                    1 => .val_loss,
+                    else => .lr,
+                };
+                worst.committed = va;
+                worst.fresh = vb;
+            }
+        }
+    }
+    return worst;
+}
+
+/// A curve longer than this is refused. The shipped run logs five rows; the cap
+/// is a stack array rather than an allocation, so that `divergence` needs no
+/// allocator argument and cannot leak one.
+const max_rows = 256;
+
+fn parse(text: []const u8, out: *[max_rows]Cell) !usize {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    const header = lines.next() orelse return error.CurveShape;
+    if (!std.mem.eql(u8, header, csv_header)) return error.CurveShape;
+    var n: usize = 0;
+    while (lines.next()) |line| {
+        // The newline the last row ends on leaves one empty field behind.
+        if (line.len == 0) continue;
+        if (n == out.len) return error.CurveShape;
+        out[n] = try cell(line);
+        n += 1;
+    }
+    // A curve with no rows has no step count and no scale, so there is nothing
+    // to measure against and nothing for a budget to be computed from.
+    if (n == 0) return error.CurveShape;
+    return n;
+}
+
+fn cell(line: []const u8) !Cell {
+    var fields = std.mem.splitScalar(u8, line, ',');
+    var c: Cell = undefined;
+    c.step = std.fmt.parseInt(usize, fields.next() orelse return error.CurveShape, 10) catch
+        return error.CurveShape;
+    for (&c.values) |*v| {
+        v.* = std.fmt.parseFloat(f64, fields.next() orelse return error.CurveShape) catch
+            return error.CurveShape;
+    }
+    // A fourth field means the header and the rows disagree about the shape,
+    // which is the one case where reading the first four and moving on would
+    // compare a train loss against whatever happened to be next.
+    if (fields.next() != null) return error.CurveShape;
+    return c;
+}
+
 /// Writes a header line and one line per row, truncating `path` first.
 ///
 /// Losses carry six decimals and the rate eight, fixed, so the file is a
@@ -270,7 +410,7 @@ pub fn writeCsv(path: []const u8, rows: []const Row) !void {
     var buffer: [128]u8 = undefined;
     var out: std.Io.File.Writer = .init(file, io, &buffer);
     const w = &out.interface;
-    try w.print("step,train_loss,val_loss,lr\n", .{});
+    try w.print(csv_header ++ "\n", .{});
     for (rows) |row| {
         try w.print("{d},{d:.6},{d:.6},{d:.8}\n", .{
             row.step,
