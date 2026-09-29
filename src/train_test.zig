@@ -7,6 +7,7 @@
 //! measurement on this host, so the assertions are about the margin a run
 //! actually produced.
 const std = @import("std");
+const autograd = @import("autograd.zig");
 const model = @import("model.zig");
 const train = @import("train.zig");
 const optim = @import("optim.zig");
@@ -333,6 +334,164 @@ test "a gradient cap below the norm stops the step, an uncapped one moves it by 
         defer res.deinit();
         try expectEqualBits(&before.layers[0].w_gate, &res.params.layers[0].w_gate);
     }
+}
+
+test "the gradient buffers are cleared between steps, so a step is one backward pass" {
+    const vocab = 32;
+    const ctx = 32;
+    // One window and two epochs: the same batch twice, so both walks below see
+    // the same tokens and the only thing that can move the two apart is what the
+    // loop did to the gradient buffers between the steps.
+    const tokens = try syntheticTokens(tokensFor(1, ctx), vocab, 1);
+    defer gpa.free(tokens);
+    const val = try syntheticTokens(tokensFor(3, ctx), vocab, 2);
+    defer gpa.free(val);
+
+    const cfg = train.Config{
+        .model = tiny_model(vocab, ctx, 4, 1),
+        .epochs = 2,
+        .ctx = ctx,
+        .lr = 0.1,
+        .warmup = 0,
+        .weight_decay = 0.0,
+        // Above every gradient norm this model makes, so `clipByNorm` returns the
+        // norm and scales nothing. This is a property of the hand walk, not a
+        // loosening: the loop clips on a global norm over all eleven tensors, and
+        // reproducing that scale by hand is a second thing to get right.
+        .max_grad_norm = 1e9,
+        .seed = 23,
+        .log_every = 1,
+    };
+    var res = try train.run(gpa, cfg, tokens, val);
+    defer res.deinit();
+    try std.testing.expectEqual(cfg.epochs, res.steps);
+
+    // The same two steps by hand: forward, backward, optimizer, and then this
+    // step's gradient is gone before the next backward pass starts.
+    //
+    // The loss cannot see this. `backward` accumulates into whatever the buffers
+    // hold, so a loop that never clears hands AdamW the sum of both steps on the
+    // second one, and AdamW's m/sqrt(v) normalises an accumulated sum back to
+    // about the same size step, so the curve falls either way. The weights are
+    // where the difference is, compared bit for bit because both walks run the
+    // same code on the same numbers in the same order.
+    //
+    // Every tensor is updated, not one. Step two's gradient is taken at the
+    // weights step one left behind, so a walk that moved only `w_gate` would
+    // diverge on a detail this test is not about.
+    const inputs = tokens[0..ctx];
+    const targets = tokens[1 .. ctx + 1];
+    var p = try model.initParams(gpa, cfg.model, cfg.seed);
+    defer p.deinit();
+    var g = try autograd.zeroGrads(gpa, p);
+    defer g.deinit();
+
+    // One window per epoch, so the run's whole step count is its epoch count and
+    // the schedule below is the one the loop computed.
+    const total: u64 = @intCast(cfg.epochs);
+    const states = try clearedWalk(p, &g, cfg, inputs, targets, total);
+    defer {
+        for (states) |*one| one.deinit();
+        gpa.free(states);
+    }
+    try expectParamsEqualBits(&p, &res.params);
+}
+
+/// The two steps of the test above, driven by hand through the same optimizer
+/// the loop uses, with the gradient buffers cleared after every step.
+///
+/// The flat view is built in the order `train.run` builds it, so the pairing of a
+/// parameter with its gradient and the order the optimizer walks them are the
+/// loop's own and not this file's guess at them.
+fn clearedWalk(
+    p: model.Params,
+    g: *autograd.Grads,
+    cfg: train.Config,
+    inputs: []const u32,
+    targets: []const u32,
+    total: u64,
+) ![]optim.AdamW {
+    const n = 2 + 9 * p.layers.len;
+    const flat_p = try gpa.alloc(Tensor, n);
+    defer gpa.free(flat_p);
+    const flat_g = try gpa.alloc(Tensor, n);
+    defer gpa.free(flat_g);
+    flatten(&p, g, flat_p, flat_g);
+
+    const states = try gpa.alloc(optim.AdamW, n);
+    errdefer gpa.free(states);
+    // A half-built set of states is freed by the caller's loop only if it gets
+    // all of them, so the ones that exist are the ones the errdefer hands back.
+    var built: usize = 0;
+    errdefer for (states[0..built]) |*one| one.deinit();
+    while (built < n) : (built += 1) states[built] = try optim.AdamW.init(gpa, flat_p[built]);
+
+    for (0..cfg.epochs) |at| {
+        var logits = try model.forward(gpa, p, cfg.model, inputs);
+        defer logits.deinit();
+        var dlogits = try autograd.dLossDLogits(gpa, logits, targets);
+        defer dlogits.deinit();
+        try autograd.backward(gpa, p, g, cfg.model, inputs, dlogits);
+        const lr = optim.cosineLR(@intCast(at), total, 0, cfg.lr);
+        for (flat_p, flat_g, states) |*one, grad, *s| {
+            try s.step(one, grad, lr, cfg.weight_decay);
+        }
+        // The line under test, at the same point in the step as the loop's.
+        for (flat_g) |*one| one.fill(0);
+    }
+    return states;
+}
+
+/// Parameters and gradients in one fixed order: tok_embed, then each layer's
+/// nine in field order, then final_norm. The same order `train.run` uses, so the
+/// optimizer pairs each parameter with its own gradient here too.
+fn flatten(p: *const model.Params, g: *autograd.Grads, ps: []Tensor, gs: []Tensor) void {
+    std.debug.assert(ps.len == gs.len);
+    ps[0] = p.tok_embed;
+    gs[0] = g.tok_embed;
+    for (p.layers, g.layers, 0..) |l, gl, i| {
+        const at = 1 + 9 * i;
+        ps[at + 0] = l.attn_norm;
+        gs[at + 0] = gl.attn_norm;
+        ps[at + 1] = l.wq;
+        gs[at + 1] = gl.wq;
+        ps[at + 2] = l.wk;
+        gs[at + 2] = gl.wk;
+        ps[at + 3] = l.wv;
+        gs[at + 3] = gl.wv;
+        ps[at + 4] = l.wo;
+        gs[at + 4] = gl.wo;
+        ps[at + 5] = l.mlp_norm;
+        gs[at + 5] = gl.mlp_norm;
+        ps[at + 6] = l.w_gate;
+        gs[at + 6] = gl.w_gate;
+        ps[at + 7] = l.w_up;
+        gs[at + 7] = gl.w_up;
+        ps[at + 8] = l.w_down;
+        gs[at + 8] = gl.w_down;
+    }
+    ps[ps.len - 1] = p.final_norm;
+    gs[gs.len - 1] = g.final_norm;
+}
+
+/// Two parameter sets, every tensor of both, bit for bit. Every tensor and not
+/// one: a loop that cleared all but one of the buffers moves the cleared ten the
+/// same way it moves the one left dirty, and a single comparison would not see
+/// that.
+fn expectParamsEqualBits(want: *const model.Params, got: *const model.Params) !void {
+    try expectEqualBits(&want.tok_embed, &got.tok_embed);
+    for (want.layers, got.layers) |*w, *gt| {
+        try expectEqualBits(&w.attn_norm, &gt.attn_norm);
+        try expectEqualBits(&w.wq, &gt.wq);
+        try expectEqualBits(&w.wk, &gt.wk);
+        try expectEqualBits(&w.wv, &gt.wv);
+        try expectEqualBits(&w.wo, &gt.wo);
+        try expectEqualBits(&w.mlp_norm, &gt.mlp_norm);
+        try expectEqualBits(&w.w_gate, &gt.w_gate);
+        try expectEqualBits(&w.w_up, &gt.w_up);
+        try expectEqualBits(&w.w_down, &gt.w_down);
+    }
+    try expectEqualBits(&want.final_norm, &got.final_norm);
 }
 
 test "the csv lr column is the warmup then cosine schedule" {

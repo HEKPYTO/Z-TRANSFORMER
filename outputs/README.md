@@ -2,17 +2,14 @@
 
 Everything the repository generates lands here, and one file is committed: `loss.csv`, the measured
 loss curve of a real run, because a repository that claims reproducible numbers has to carry at
-least one of them. The rest is ignored by `.gitignore`: `outputs/vocab.json`, `outputs/*.bin` and
-`outputs/parity/`, the last being the largest class of generated file here.
-That split is input against result. A vocabulary is an input to a run, and `tools/train_bpe`
-rebuilds it from the corpus byte for byte, so committing it would put a large regenerable file in
-the tree and buy nothing. A loss curve is the run's output and cannot be rebuilt without paying for
-the run, so it ships. Nothing here is ever written by hand.
+least one of them. The rest is ignored by `.gitignore`: `outputs/*.bin` and `outputs/parity/`, the
+last being the largest class of generated file here. A loss curve is the run's output and cannot be
+rebuilt without paying for the run, so it ships; the parity export is scratch that the committed
+`tools/removed/report.csv` already stands in for. Nothing here is ever written by hand.
 
 | File | Committed | Written by | What it is |
 |---|---|---|---|
 | `loss.csv` | yes | `zig build train` | The loss curve of one training run. Header `step,train_loss,val_loss,lr`, then one line per logged step, six decimals on the two losses and eight on the rate. The file is truncated first, so a shorter run leaves no tail of the previous curve behind. |
-| `vocab.json` | no | `tools/train_bpe`, see `tools/README.md` | The learned byte-level BPE merge list, and nothing else. |
 | `parity/` | no | `ztransformer parity`, see `tools/README.md` | Scratch for the external comparison: the exported weights, an index, the config line, and the per-case inputs. Regenerated on every run of `sh tools/removed/check.sh` and never committed, because the committed record of that comparison is `tools/removed/report.csv`. It sits beside its writer rather than here so it cannot drift away from it. |
 
 

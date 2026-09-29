@@ -389,6 +389,20 @@ test "a zero context is an error, not a stream of empty batches" {
     try std.testing.expectError(error.BadContext, data.Batcher.init(std.testing.allocator, &stream, 0, 1));
 }
 
+test "a context at the top of the range is an error, not a wrapped stride" {
+    const stream = [_]u32{ 1, 2, 3, 4 };
+    // The other end of the range `ctx == 0` guards. The stride is `ctx + 1`, so
+    // this one overflows: the checked build panics with `integer overflow`, and
+    // a build that elides the check hands back a stride of 0 and a batcher that
+    // reports no windows at all instead of refusing. A context comes from
+    // configuration, so a panic is a crash rather than a diagnostic, and the
+    // repo's rule is that an input the loop cannot use is an error.
+    try std.testing.expectError(
+        error.BadContext,
+        data.Batcher.init(std.testing.allocator, &stream, std.math.maxInt(usize), 1),
+    );
+}
+
 fn initDrainRelease(allocator: std.mem.Allocator, stream: []const u32) !void {
     var b = try data.Batcher.init(allocator, stream, 2, 4);
     defer b.deinit();

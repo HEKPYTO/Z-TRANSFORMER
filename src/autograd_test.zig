@@ -25,17 +25,19 @@ pub const tiny = model.Config{
 /// Two layers, for the paths only a real stack of blocks reaches. A backward
 /// pass that handles the last layer and stops passes with one and fails here.
 ///
-/// `n_kv_heads = 1` against two query heads, so `group = 2` and every query head
-/// shares one kv head. With `n_kv_heads == n_heads` the grouping is the
-/// identity: `kv = h / group` becomes `kv = h`, the dk/dv accumulation across
-/// query heads sums one term instead of two, and none of the code that makes
-/// grouped-query attention different from plain attention is ever differenced.
-/// The parity harness is forward-only, so a regression here would have no
-/// oracle at all and would ship green.
+/// `n_kv_heads` deliberately equals `n_heads` here, so the grouping is the
+/// identity. Setting it to 1, so that every query head shares a kv head, is the
+/// obvious way to cover grouped-query attention in this fixture and it was
+/// tried: at this size the derived budget cannot pay for it. A shared kv head
+/// doubles the terms behind every `dk` and `dv`, the finite difference carries
+/// that as noise, and `tok_embed[30]` came out 4.6% over budget in ReleaseFast
+/// — a CORRECT gradient reported as a mismatch, which is worse than no coverage
+/// because it teaches a maintainer to ignore the suite. The grouped path is
+/// covered by its own test at a size where the budget has headroom.
 const two_layers = model.Config{
     .n_layers = 2,
     .n_heads = 2,
-    .n_kv_heads = 1,
+    .n_kv_heads = 2,
     .head_dim = 4,
     .n_ctx = 32,
     .vocab_size = 16,
@@ -617,4 +619,31 @@ fn lossAndGradsVoid(
     g: *autograd.Grads,
 ) !void {
     _ = try lossAndGrads(allocator, cfg, p, tokens, targets, g);
+}
+
+test "autograd: gradcheck covers grouped-query attention" {
+    // `n_kv_heads` below `n_heads` is the whole point: with them equal the
+    // grouping is the identity, `kv = h / group` becomes `kv = h`, and the dk/dv
+    // accumulation across query heads sums one term instead of two. Nothing else
+    // in the suite differences that, because the parity harness is forward-only.
+    //
+    // The shape is larger than `two_layers` on purpose. Grouping adds a second
+    // term to every dk and dv, and the gradcheck budget is derived from f32 logit
+    // representation error, which does not grow with it. On the tiny fixture that
+    // imbalance is fatal — a correct gradient read 4.6% over budget in
+    // ReleaseFast. Widening the model moves the signal away from the roundoff the
+    // budget describes, so the same comparison has headroom to be meaningful.
+    const gqa = model.Config{
+        .n_layers = 1,
+        .n_heads = 4,
+        .n_kv_heads = 2,
+        .head_dim = 4,
+        .n_ctx = 32,
+        .vocab_size = 32,
+        .ffn_mult = 1,
+    };
+    try std.testing.expect(gqa.n_heads > gqa.n_kv_heads);
+    var p = try liveParams(std.testing.allocator, gqa);
+    defer p.deinit();
+    try gradcheck.checkAll(std.testing.allocator, gqa, p, tok, tgt);
 }

@@ -83,6 +83,16 @@ pub fn build(b: *std.Build) void {
     const train_step = b.step("train", "Train and write outputs/loss.csv");
     train_step.dependOn(&train_run.step);
 
+    // `zig build scale-profile` prints the projections behind the deferred work.
+    // The same Debug binary as `run`, because it runs no arithmetic of its own
+    // over a tensor: it is Config arithmetic and a table, so there is nothing
+    // here for ReleaseFast to make faster. No corpus dependency, so it works in
+    // a clone that has not fetched one, and it writes nothing.
+    const scale_run = b.addRunArtifact(exe);
+    scale_run.addArg("scale-profile");
+    const scale_step = b.step("scale-profile", "Print the projected cost of shapes this model cannot be run at");
+    scale_step.dependOn(&scale_run.step);
+
     // One test binary per mode. The two run concurrently: `train_test.zig`
     // writes its scratch CSVs under a per-process directory, so two copies in one
     // tree no longer delete each other's files. They used to, which is why this

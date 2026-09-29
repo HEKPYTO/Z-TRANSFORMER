@@ -2,14 +2,12 @@ zig-out/
 .zig-cache/
 .worktrees/
 outputs/*.bin
-outputs/vocab.json
 outputs/parity/
 venv-removed/
 __pycache__/
 samples/
 *.o
 *.obj
-train_bpe
 
 # AGENTS.md allows only README.md, LICENSE and CHANGELOG.md in the commit tree.
 docs/

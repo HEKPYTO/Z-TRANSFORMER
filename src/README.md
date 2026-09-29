@@ -1,15 +1,17 @@
 # src
 
 Fourteen modules, plus the `main.zig` binary, `lib.zig` and the `tests.zig` root. 31 `.zig` files:
-8,645 lines outside the 14 `*_test.zig` files, 5,284 inside them.
+3,316 lines outside the 16 `*_test.zig` files, 5,228 inside them.
 
-    wc -l src/*.zig | grep -v _test.zig | tail -1    # 8645 total
-    wc -l src/*_test.zig | tail -1                    # 5284 total
+    cat $(ls src/*.zig | grep -v _test) | wc -l    # 3316
+    cat src/*_test.zig | wc -l                    # 5228
 
-Those two commands are the source of the two numbers, and they are here so the pair cannot be
-edited into disagreement: this block shipped claiming 29 files, 7,123 and 4,244 while the commands
-underneath it printed 7,676 and 4,335, and a reader running them would have found the paragraph
-lying to them.
+Those two commands are the source of the two numbers, and they are the `cat` form on purpose.
+`wc -l src/*.zig | grep -v _test.zig | tail -1` looks equivalent and is not: `grep -v` filters
+lines, and the `total` line that `wc` appends does not contain `_test.zig`, so it survives and
+`tail -1` hands back the grand total of every file including the tests. An earlier version of this
+block used that command and labelled its output as the non-test count, which is how 7,123 became
+7,676 became 8,645 while the number underneath it was always the sum of both columns.
 
 Every module that allocates takes a `std.mem.Allocator` first and returns an error union. Two take
 no allocator because they build nothing: `tensor.matmul` reads it off `a` and `loss.forward`
@@ -24,7 +26,7 @@ imported directly puts one file in two Zig modules, which the build refuses.
 One directory here is not Zig. `src/cuda/` holds the CUDA source and the container recipe that
 compiles and runs it, because `nvcc` cannot be installed on a GPU host without root, and the CUDA
 the distribution's NVIDIA repository ships is version-skewed against the one this repository targets.
-No `src/*.zig` file imports it and `build.zig` does not reference it yet, so the other 29 `.zig`
+No `src/*.zig` file imports it and `build.zig` does not reference it yet, so the other 30 `.zig`
 files above are still the whole compiled surface, and their line counts have not moved. `sh
 src/cuda/run-probe.sh` compiles the probe and runs it on the local GPU; `src/cuda/README.md` says
 what that does and does not establish.
@@ -42,7 +44,8 @@ what that does and does not establish.
 | `tensor.Tensor.rowConst` | `rowConst(Tensor, r) []const f32` | Immutable view of row `r`. |
 | `tensor.Tensor.fill` | `fill(*Tensor, v) void` | Sets every element. |
 | `tensor.matmul` | `matmul(a, b) !Tensor` | `[m,k] @ [k,n] -> [m,n]`. Errors on shape mismatch. No allocator argument. |
-| `norm.forward` | `forward(allocator, x, weight) !Tensor` | RMSNorm, eps 1e-5, per row, weight fused. |
+| `norm.forward` | `forward(allocator, x, weight) !Tensor` | RMSNorm, per row, weight fused. |
+| `norm.eps` | `pub const eps: f64 = 1e-5` | The additive epsilon, public because the gradient and the parity export are the same constant. `autograd.normBackward` differentiating a private copy of it would differentiate a different function than the forward pass evaluates, and no finite difference would catch it. |
 | `rope.forward` | `forward(allocator, x, pos, theta, head_dim) !Tensor` | Rotary embedding, Llama-3 half-split. Row `r` sits at `pos + r`. |
 | `mlp.forward` | `forward(allocator, x, w_gate, w_up, w_down) !Tensor` | SwiGLU feed-forward. |
 | `mlp.silu` | `silu(z: f32) f32` | `z * sigmoid(z)`, safe in the negative tail. |
@@ -101,6 +104,14 @@ a deinit that frees nothing misstates ownership.
 decision was made on. A non-finite norm comes back unscaled: the scaling is guarded by
 `norm > max_norm`, and a NaN fails that test, so there is no scale to divide by.
 
+That `>` is not `>=`, and no test here can tell the two apart, so there is no test for it.
+`tools/mutation`'s `clip-ge` makes the change and survives; the reason is arithmetic rather than a
+missing assertion. The two spellings differ only when `norm == max_norm` exactly, and there
+`scale = max / norm = 1` exactly in f64, so every element is multiplied by `1.0` and both return
+the same norm. That is a bit-for-bit identical run, not a close one, and no tolerance catches a
+difference of zero. A test that passed there would be passing for a reason unrelated to the
+mutation, which is worse than no test.
+
 `train.run` refuses to carry a number it cannot trust. `lr`, `max_grad_norm`, `weight_decay`,
 `log_every`, `epochs` and the length of the training stream are all checked before the first step
 (`error.BadLr`, `error.BadMaxGradNorm`, `error.BadWeightDecay`, `error.BadLogEvery`,
@@ -130,7 +141,8 @@ optimizer call.
 | `model.forwardWith` | `forwardWith(allocator, p, cfg, tokens, ?*Sink) !Tensor` | The same pass, handing each intermediate to a `Sink`. `forward` is this with a null sink. |
 | `model.Name` | 14 values | Which intermediate a `Sink.put` call is about. |
 | `model.Sink` | `{ put }` | A callback, not a bag of pointers: the intermediates live in buffers the pass frees before it returns. |
-| `parity.run` | `run(allocator, io, Sweep) !Summary` | Writes the weights, intermediates, token ids and shape to `outputs/parity/`. |
+| `parity.run` | `run(allocator, io, s: Sweep) !Summary` | Writes the weights, intermediates, token ids and shape to `outputs/parity/`. |
+| `parity.runInto` | `runInto(allocator, io, out_dir, s: Sweep) !Summary` | `run` with the output directory as an argument. One caller overrides it: `removed_test.zig`, which would otherwise overwrite the sweep the Python oracle reads with a one-layer fixture. |
 | `parity.sweep` | `sweep() Sweep` | The shape and the sequence lengths and seeds the harness compares. |
 
 Pre-norm: the norm sits inside the residual branch, not on the sum. Tied embeddings mean `tok_embed`
@@ -217,26 +229,114 @@ corrupt one element and assert on the returned `Mismatch` rather than scraping s
 restores `p` element by element as it goes, error path included, which is what let the `tol`
 parameter go: the caller never has to put the parameters back, so no call site has to be told to.
 
+## Scale
+
+`zig build scale-profile` prints what the code's own formulas imply at shapes the code cannot be run
+at. It is a projection, not a benchmark, it says so in its own output, and it times nothing: no
+forward pass runs at any shape here, so no wall time can leak into a number. Everything it prints is
+arithmetic over `model.Config`, the shapes in `model.initLayer`, the eleven tensors in
+`autograd.Block` and the two moments in `optim.AdamW`, and every term in `scale.zig` names the line
+it came from. The output carries no timestamp and no address, so two runs are byte-identical and a
+README can quote it.
+
+| Symbol | Signature | Purpose |
+|---|---|---|
+| `scale.Shape` | `{ name, cfg }` | One row of the sweep. A real `model.Config`, so a row cannot claim a shape the model would refuse to build. |
+| `scale.sweep` | 7 rows | The shipped shape, then the same width at 1k and 4k context, then a 32-layer `d_model 4096` at 4k, 8k and 32k, then the row that sits on the crossover. |
+| `scale.project` | `project(Shape) !Projection` | Every term for one shape. Rejects a config `model.validate` rejects. |
+| `scale.Projection` | 20 fields | FLOPs per term, element counts for parameters, gradients, AdamW state and activations, and the four byte counts. |
+| `scale.coreOverMlp` | `coreOverMlp(Projection) f64` | The attention core against one layer's MLP. The number the fused-kernel deferral rests on. |
+| `scale.layerStep` | `layerStep(Projection) f64` | One layer's whole step: forward plus `weightGrad` and `inputGrad`, so three times the forward. |
+| `scale.tiedOverStep` | `tiedOverStep(Projection) f64` | The tied head against every layer's step plus itself. |
+| `scale.crossoverT` | `crossoverT(h, bar) f64` | The `T` at which `core/mlp` reaches `bar`: `3 * bar * h - 1`. |
+| `scale.tiedCrossoverVocab` | `tiedCrossoverVocab(h, bar) f64` | The `vocab` at which the tied head reaches `bar` of one MLP layer: `bar * 3 * h`. |
+| `scale.attention_bar` | `0.25` | The bar a deferred item has to clear. A choice, and named as one. |
+| `scale.host_bytes` | 32 GiB | The memory a `fits` verdict is a statement about. |
+| `scale.print` | `print(w: *std.Io.Writer) !void` | The whole report to the writer it is given, never to a stream. |
+
+### What it says about the deferred work
+
+Three items were deferred on arithmetic asserted in prose. This is the arithmetic, and one of the
+three claims does not survive it.
+
+The tables below are copied from `zig build scale-profile`, not written here.
+
+```
+ARITHMETIC, PROJECTED, GFLOP
+name              attn_core   attn_proj         mlp   tied_head weight_grad  core/mlp   core%   tied%
+shipped                0.02        0.03        0.10        0.20        0.13     0.167    3.9%   10.5%
+ctx-1k                 0.27        0.10        0.40        0.81        0.50     0.667   11.6%    8.0%
+ctx-4k                 4.30        0.40        1.61        3.22        2.01     2.667   22.7%    4.1%
+d4096-ctx4k          137.47      343.60     1649.27    12910.67     1992.86     0.083    2.2%    5.9%
+llama3-8b            549.82      687.19     3298.53    25821.34     3985.73     0.167    4.0%    5.6%
+llama3-8b-32k       8796.36     2748.78    13194.14   103285.37    15942.92     0.667   11.9%    4.2%
+at-parity-12d      19791.61     4123.17    19791.21   154928.06    23914.38     1.000   15.1%    3.6%
+
+BYTES, PROJECTED, GiB
+name               params     grads      adam       act      peak    scores   tied_GB  kv_cache
+shipped             0.001     0.001     0.002     0.003     0.007     0.004     0.125     0.000
+ctx-1k              0.001     0.001     0.002     0.013     0.017     0.063     0.500     0.002
+ctx-4k              0.001     0.001     0.002     0.050     0.054     1.000     2.000     0.008
+d4096-ctx4k         7.740     7.740    15.479    10.830    41.788    64.000  8016.000     1.000
+llama3-8b           7.740     7.740    15.479    21.660    52.618   256.000 16032.000     2.000
+llama3-8b-32k       7.740     7.740    15.479    86.641   117.599  4096.000 64128.000     8.000
+at-parity-12d       7.740     7.740    15.479   129.961   160.919  9216.000 96192.000    12.000
+
+VERDICTS, one line per deferred item, at 32 GiB of host memory
+shape             fused_attn     kv_cache    tied_head   wgrad_swap  dense_scores
+shipped                   no           no          yes           no          fits
+ctx-1k                   yes          yes          yes           no          fits
+ctx-4k                   yes          yes          yes           no          fits
+d4096-ctx4k               no           no          yes           no     over host
+llama3-8b                 no           no          yes           no     over host
+llama3-8b-32k            yes          yes          yes           no     over host
+at-parity-12d            yes          yes          yes           no     over host
+```
+
+**The `T > 6 * d` claim is wrong by a factor of two, and it is the deferral's own arithmetic.**
+`attention.forward` walks `0..t + 1` (attention.zig:54), so it computes half of a dense score
+matrix, and the core is `2 * d * T * (T + 1)` rather than `4 * T^2 * d`. The MLP half of the
+comparison is correct and is `mlp`'s own shape: three matmuls of a `[T, d]` input against
+`[d, h]`, `[d, h]` and `[h, d]` (model.zig:376) is `6 * T * d * h`, which is `24 * T * d^2` at
+`ffn_mult = 4`. So `core / mlp = (T + 1) / (3 * h)`, parity is `T = 12 * d` and not `6 * d`, and
+the 6% the note names is `T = 0.71 * d` rather than whatever the dense count gives. The direction of
+the deferral survives, and it was the right call anyway: the core is 3.9% of a layer's step at the
+shipped shape and 4.0% at Llama-3 8B. The threshold was wrong.
+
+The three thresholds, as the tool prints them:
+
+| Deferred item | Worth doing at | Deciding number |
+|---|---|---|
+| Fused IO-aware attention | `T >= 3 * d` | `core/mlp >= 0.25`. No at the shipped shape (0.167) and no at 8B (0.167), yes at 32k (0.667). |
+| KV cache | `T >= 3 * d` | The same term, because the only thing a cache removes is the recompute of the quadratic part. It also costs 2 GiB at 8B and 12 GiB at the parity row. |
+| Tied-head restructure | `vocab >= 3 * d` | `tied / (3 * mlp) >= 0.25`. Yes at every row here, including the shipped one at 10.5% of the step. |
+| `weightGrad` loop-order swap | never | Not a ratio. It reorders a fixed multiply-add count, so no shape improves it, and `matmul`, `weightGrad` and `inputGrad` already stream contiguous rows. |
+
+The tied head is the one that should not have waited. It is 10.5% of a step at the shipped shape
+and 5.6% at 8B, and the 116 s figure is not an arithmetic problem at all: `tiedHead` does
+`2 * T * vocab * d` operations over `4 * T * vocab * d` bytes, which is 0.5 flop per byte with no
+reuse in it, where one MLP layer re-reads its weights once for all `T` rows and gets `T / 2 = 32` at
+`T = 64`. That is a 64x gap and it is the whole of the 116 s.
+
 ## Tokenizer
 
 | Symbol | Signature | Purpose |
 |---|---|---|
 | `tokenizer.byte_vocab_size` | `256` | Every byte is a token, so encoding is total. |
 | `tokenizer.Merge` | `{ left: u32, right: u32 }` | One learned merge, named by the two ids it joins. |
-| `tokenizer.Tokenizer` | `init`, `deinit`, `train`, `encode`, `decode`, `save`, `load` | Byte-level BPE. |
+| `tokenizer.Tokenizer` | `init`, `deinit`, `train`, `encode`, `decode` | Byte-level BPE. |
 
 There is no pre-tokenizer, so merges may cross any byte boundary and the merge list is a property of
 the corpus alone. That costs some compression against a GPT-2-style split. There is no `ranks` array
 either: the rank is the merge index, merge `r` yields id `256 + r`, and a parallel array is state
-that can go stale. The persisted file is the merge list and nothing else, so a saved vocabulary
-cannot carry a byte table that disagrees with its merges; `load` treats the file as untrusted input
-and refuses a forward reference, where a merge names an id built after it.
+that can go stale. The vocabulary is never written to disk: `src/main.zig` trains the merges in
+memory on every run, so there is nothing to persist and nothing to keep in step with the merges.
 
 ## Tests
 
 One test file per module, collected by `comptime` blocks in `tests.zig`. Zig has no test globbing,
 so a new test file is inert until it is named there, and nothing fails when a name goes missing.
-`tests.zig` is 68 lines and holds 3 tests of its own, the third being the guard that closes that gap:
+`tests.zig` is 72 lines and holds 3 tests of its own, the third being the guard that closes that gap:
 Zig 0.16 has no comptime filesystem, so it walks `src/` at test time against its own source embedded
 with `@embedFile`, and fails with `error.TestUnreferencedTestFile` on any `*_test.zig` the blocks
 above do not name. It is a test rather than a compile error, which means a cached run can skip it, so
@@ -244,11 +344,43 @@ a developer who adds a test file may have to re-run before believing a green. It
 walk found a directory, because an empty listing passes every check above it vacuously.
 
 Expected values are hand-computed literals, never the output of another function in this repo. A test
-comparing an implementation against itself passes when both halves are wrong. Three tests here were
+comparing an implementation against itself passes when both halves are wrong. Four tests here were
 written specifically to defeat a mutation that the original suite could not see: a 512-token
 non-dyadic attention case that fails if the accumulator drops to `f32`, a 512-element RMSNorm row
-that fails if `sum_sq` drops to `f32`, and a `init` overflow case that fails only in the release modes
-where the multiply used to wrap.
+that fails if `sum_sq` drops to `f32`, a `init` overflow case that fails only in the release modes
+where the multiply used to wrap, and a 256-by-512-by-128 matmul that fails if the `k` reduction is
+carried in `f64`.
+
+That last one is worth the shape, because the five smaller matmul tests could not have caught it and
+no tighter version of them would. They reduce `k <= 3` terms, where an `f32` and an `f64` reduction
+agree to the last bit. The accumulator's error grows with `k`, and `w_down` at the shipped config
+multiplies a 256-token batch through the 512-long reduction into 128 columns, which is the widest
+reduction the model has. Its two gates are the same formula with the machine epsilon of the
+accumulator swapped in, `(k - 1) * e` against the sum of the absolute products, so nothing is picked:
+`1.14e-13` for `f64` and `6.09e-5` for `f32`, with the measured divergence of 1.98e-7 between them.
+An `f64` accumulator lands on the exact reduction and the divergence is `0`; an `f32` one is two
+hundred times under the `f32` gate. The reference is narrowed to `f32` before it is compared,
+because that is what `matmul` returns — comparing an `f32` against an unrounded `f64` sum leaves the
+store rounding on one side only, and that term alone is `9.3e-9`, which passes the `f64` gate and
+makes the test blind to the thing it is for.
+
+### Two survivors that are not holes
+
+`tools/mutation` leaves three survivors after that test. Two of them are not coverage holes, and
+neither is going to become one, so they are recorded here rather than left for the next person to
+spend a day on. `clip-ge` is the `>` / `>=` question settled above: bit-identical, uncaughtable.
+`norm-reassociate` is `v / rms * w[i]` written as `v * w[i] / rms`, and the measured answer is that
+it is below the resolution of any tolerance that could be written down.
+
+The reassociation touches no reduction, so its error is the rounding of one element's three
+operations and cannot grow with `d`: measured at 1.1 to 1.6 `f32` ulp for `d` from 4 to 4096, flat.
+The gate in `norm_test.zig` is `1e-6`, which is 8.4 ulp at a value of one, so catching it would mean
+a sub-ulp tolerance. There is a second and stronger reason, and it is the reason no such test should
+be written: every weight in `norm_test.zig` is a power of two — `0.5`, `1`, `2`, `0.25` — and a power
+of two commutes exactly with a single `f32` division. Measured on all three hand-computed rows, the
+two spellings differ by `0.0`: they are bit-identical, so they are identical at a tolerance of zero
+and not merely at `1e-6`. Catching this needs a non-dyadic weight, and then the divergence is one
+ulp, which is a statement about `f32` and not about this function. The `tol` is left where it is.
 
 Reproducibility is per build configuration and per host, and the distinction is measured rather
 than assumed. Two runs at one seed in one build produce byte-identical output. Across optimization

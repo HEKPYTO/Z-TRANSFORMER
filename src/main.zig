@@ -19,6 +19,7 @@ const data = @import("data.zig");
 const model = @import("model.zig");
 const train = @import("train.zig");
 const parity = @import("removed.zig");
+const scale = @import("scale.zig");
 
 const corpus_path = "data/tinyshakespeare.txt";
 const csv_path = "outputs/loss.csv";
@@ -50,9 +51,18 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(gpa);
 
     if (args.len > 1) {
-        if (std.mem.eql(u8, args[1], "train")) return runTrain(gpa, init.io);
-        if (std.mem.eql(u8, args[1], "parity")) return runRemoved(gpa, init.io);
-        std.debug.print("usage: {s} [train|parity]\n", .{args[0]});
+        // Exactly one argument. The binary reads no flags, so a second one is
+        // a flag that was meant to change the run and did not: `train
+        // --epochs 20` used to train for the hard-coded epoch count and say
+        // nothing, which is a 90 second run on the wrong configuration. The two
+        // callers this ships to, `zig build train` and `zig build run -- parity`,
+        // each pass one, so nothing legitimate is refused.
+        if (args.len == 2) {
+            if (std.mem.eql(u8, args[1], "train")) return runTrain(gpa, init.io);
+            if (std.mem.eql(u8, args[1], "parity")) return runRemoved(gpa, init.io);
+            if (std.mem.eql(u8, args[1], "scale-profile")) return runScaleProfile(init.io);
+        }
+        std.debug.print("usage: {s} [train|parity|scale-profile]\n", .{args[0]});
         return error.UnknownCommand;
     }
 
@@ -127,6 +137,17 @@ fn runTrain(gpa: std.mem.Allocator, io: Io) !void {
         csv_path,
     });
     try w.flush();
+}
+
+/// `zig build scale-profile`. Projects what the code's own formulas imply at
+/// shapes it cannot be run at, and prints nothing it measured: the whole output
+/// is arithmetic over `model.Config`, and a reader who cannot tell a projection
+/// from a benchmark is the failure this exists to prevent.
+fn runScaleProfile(io: Io) !void {
+    var buffer: [4096]u8 = undefined;
+    var stdout: Io.File.Writer = .init(.stdout(), io, &buffer);
+    try scale.print(&stdout.interface);
+    try stdout.interface.flush();
 }
 
 fn runRemoved(gpa: std.mem.Allocator, io: Io) !void {

@@ -2,9 +2,9 @@
 //!
 //! One backward function per forward function, no tape and no graph nodes: the
 //! pass walks the same ops in reverse and rebuilds each block's intermediates
-//! from the layer input it already has. Every gradient is therefore readable
-//! from the loss down to one tensor without jumping, and checkable against a
-//! finite difference of the real forward.
+//! once, from the layer input it already has, then consumes them. Every gradient
+//! is therefore readable from the loss down to one tensor without jumping, and
+//! checkable against a finite difference of the real forward.
 const std = @import("std");
 const model = @import("model.zig");
 const tensor = @import("tensor.zig");
@@ -137,24 +137,36 @@ pub fn backward(
     const d = model.dModel(cfg);
     if (p.tok_embed.rows != cfg.vocab_size or p.tok_embed.cols != d) return error.DimensionMismatch;
 
-    // Replay the forward, keeping each block's input. A tape would keep every
-    // intermediate instead; this keeps T*d floats per block, which is the one
-    // place the hand-written decision shows up in the memory profile.
+    // Replay the forward, keeping every block's intermediates. A tape would keep
+    // each op's output separately, which is a wider set than the eleven tensors
+    // `blockBackward` actually reads, so the replay keeps a `Block` per layer
+    // instead. They are built once and the second loop below consumes them, so
+    // the values the loss was built from are the values the gradients are
+    // differentiated from. At the shipped shape that is 9.5 MiB, which is the
+    // one place the hand-written decision shows up in the memory profile.
     var xs = try allocator.alloc(Tensor, p.layers.len + 1);
     defer allocator.free(xs);
     var kept: usize = 0;
     defer {
         for (xs[0..kept]) |*one| one.deinit();
     }
+    var blocks = try allocator.alloc(Block, p.layers.len);
+    defer allocator.free(blocks);
+    var built: usize = 0;
+    defer {
+        for (blocks[0..built]) |*one| one.deinit();
+    }
     xs[0] = try embed(allocator, p, tokens, d);
     kept = 1;
     for (p.layers) |l| {
-        var b = try blockForward(allocator, l, xs[kept - 1], cfg);
-        defer b.deinit();
+        // Stored before the residual add, so a failed add unwinds the block that
+        // exists rather than leaking it or half-freeing it.
+        blocks[built] = try blockForward(allocator, l, xs[kept - 1], cfg);
+        built += 1;
         // x_out = x_mid + ff, and x_mid already carries the attention branch.
         // Adding ff to the block input instead would drop that branch from the
         // stream every layer after the first.
-        xs[kept] = try residual(allocator, b.x_mid, b.ff);
+        xs[kept] = try residual(allocator, blocks[built - 1].x_mid, blocks[built - 1].ff);
         kept += 1;
     }
     const stream = xs[kept - 1];
@@ -195,19 +207,18 @@ pub fn backward(
     defer d_x.deinit();
     normBackward(stream, p.final_norm, d_final_h, &g.final_norm, &d_x);
 
-    // Each block, last to first. The block owns the forward intermediates its
-    // own backward needs, so the replay above is the only extra work.
+    // Each block, last to first, on the intermediates the replay above already
+    // built. Recomputing them here would be a second forward per block and a
+    // backward that costs more than the forward it differentiates.
     var layer = p.layers.len;
     while (layer > 0) {
         layer -= 1;
-        var b = try blockForward(allocator, p.layers[layer], xs[layer], cfg);
-        defer b.deinit();
         // Two buffers, swapped. One would mean a memcpy of the whole stream per
         // layer, and one allocation per layer, for a tensor whose only reader is
         // the scatter at the bottom of this function.
         var d_next = try Tensor.init(allocator, t_count, d);
         defer d_next.deinit();
-        try blockBackward(&d_next, p.layers[layer], &g.layers[layer], b, xs[layer], d_x, cfg);
+        try blockBackward(&d_next, p.layers[layer], &g.layers[layer], blocks[layer], xs[layer], d_x, cfg);
         const spare = d_x;
         d_x = d_next;
         d_next = spare;
@@ -225,7 +236,8 @@ pub fn backward(
 /// The eleven tensors one block's backward pass reads. `model.forward` builds
 /// the same values in the same order and frees them again; this struct exists
 /// because a hand-written backward has no tape to hang them on, so it rebuilds
-/// them from the block input instead.
+/// them from the block input and keeps them, one per layer, for the second loop
+/// in `backward` to read.
 const Block = struct {
     attn_in: Tensor, // norm(x_in, attn_norm)          [T, d]
     q_pos: Tensor, // rope(x_in @ wq)                   [T, d]

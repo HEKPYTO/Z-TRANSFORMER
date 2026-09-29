@@ -12,7 +12,9 @@ could scale up, and three things say so. The feed-forward width is `ffn_mult * d
 cannot express Llama-3's at all. There is no RoPE scaling, so long context is out. The embeddings
 are tied, where Llama-3 8B's are not. Everything is f32, not bf16, and the model has no KV cache,
 so a position is always 0. At the 8B shape this does not run: one layer of the tied head alone
-takes about two minutes at T=64, and the logits tensor at T=8192 is 4.2 GB.
+takes about two minutes at T=64, and the logits tensor at T=8192 is 4.2 GB. `zig build scale-profile`
+prints what the formulas behind those statements say at every shape from the shipped one to 32k
+context, every number labelled a projection and none of them measured.
 
 Requires Zig 0.16.0, enforced by `build.zig` rather than by hope. There is nothing to install and
 no package manager step. Tested on macOS on Apple Silicon; the CPU path is portable, but the CUDA
@@ -26,9 +28,11 @@ row below needs a Linux host with docker and a GPU. A fresh clone has no git hoo
 | `zig build` | Builds the binary. | `zig-out/bin/ztransformer` |
 | `zig build run` | Runs it. With no argument it prints the version banner; `zig build run -- train` reaches training. | nothing |
 | `zig build train` | Trains one pass over a 64 KiB prefix of the corpus. | `outputs/loss.csv` |
+| `zig build scale-profile` | Projects the cost of shapes this model cannot be run at, from the code's own formulas. Every number is labelled a projection, and two runs are byte-identical. See `src/README.md`. | nothing |
 | `zig build test` | Runs the test suite, and writes nothing at all when it passes. | nothing |
 | `zig build verify` | The whole gate CI runs: `zig fmt --check`, the test suite in Debug and in ReleaseFast, the version banner, and a sha256 check that the corpus still hashes to the digest `data/README.md` documents. Silent when it passes. | nothing |
 | `sh tools/removed/check.sh` | Compares the block against a Llama reference, tensor by tensor. Needs the pinned oracle in a repo-local virtualenv; see `tools/README.md`. | `tools/removed/report.csv` |
+| `sh tools/removed/sensitivity.sh` | Proves those gates can fail: perturbs the exported weights on one side only and requires the check to catch it. Same venv requirement. | nothing |
 | `sh src/cuda/run-probe.sh` | Compiles and runs one CUDA kernel on an NVIDIA GPU, in a container, and checks its integer sum against a closed form. Needs a Linux host with docker and a GPU. See `src/cuda/README.md`. | nothing |
 
 ## Status
@@ -84,8 +88,9 @@ rather than a claim that it is.
 All fourteen gates and the argmax have to hold. The two are not ranked, and the argmax is not the
 sharper of the two: on this sweep the smallest reference top1-top2 margin is 8.5e-04 while the
 widest gate on the logits is 2e-4, so any run that passes the gates cannot have flipped a token. The
-gates are what catch a real difference: perturbing one weight element by 1e-3 fails 51 of them, and
-scaling a whole projection by a tenth of a percent still fails 16. The argmax earns its place by saying *why* a row failed: on any row where the
+gates are what catch a real difference, and `sh tools/removed/sensitivity.sh` is the command that
+proves it: perturbing one element of `wq` by 1e-3 fails 21 of them, and scaling the whole
+projection by a tenth of a percent still fails 27. The argmax earns its place by saying *why* a row failed: on any row where the
 two disagree, the reference's own top1-top2 margin is printed, which turns "it failed" into "it
 failed on a near-tie" or "it failed outright".
 

@@ -77,7 +77,11 @@ pub const Batcher = struct {
     prng: std.Random.Xoshiro256,
 
     pub fn init(allocator: std.mem.Allocator, tokens: []const u32, ctx: usize, seed: u64) !Batcher {
-        if (ctx == 0) return error.BadContext;
+        // Both ends of the range, and the top one because the stride below is
+        // `ctx + 1`: it overflows there, so the checked build panics on a value
+        // the caller configures, and a build that elides the check hands back a
+        // stride of zero and a window count of zero as if the stream were empty.
+        if (ctx == 0 or ctx == std.math.maxInt(usize)) return error.BadContext;
         const stride = ctx + 1;
         const count = if (tokens.len < stride) 0 else tokens.len / stride;
         const order = try allocator.alloc(usize, count);

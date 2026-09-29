@@ -17,18 +17,6 @@ const round_trip_text = "To be, or not to be: that is the question";
 /// replace; a byte-level one has to carry them through unchanged.
 const hostile_bytes = [_]u8{ 0x00, 0xff, 0xfe, 0x80, 0x41, 0x00, 0xc3, 0x28, 0xed, 0xa0, 0x80, 0xf5, 0x00 };
 
-/// `tmp.sub_path` is a bare directory name inside the build cache, not a path
-/// from the process working directory, so the file calls go through the handle
-/// the TmpDir already holds. Everything the tests write then lands where
-/// `tmp.cleanup` deletes it.
-fn expectLoadFails(dir: std.Io.Dir, sub_path: []const u8) !void {
-    if (Tokenizer.load(gpa, dir, io, sub_path)) |ok| {
-        var leaked = ok;
-        leaked.deinit();
-        return error.TestExpectedError;
-    } else |_| {}
-}
-
 /// The first `len` bytes of the vendored corpus, on its own heap so the caller
 /// frees exactly what it asked for. Truncating is the point: the compression
 /// test needs a fixed, named input size rather than whatever the corpus weighs
@@ -267,79 +255,6 @@ test "200 merges on 20k corpus bytes beat the raw byte count" {
         if (id >= 256) merged_id_seen = true;
     }
     try std.testing.expect(merged_id_seen);
-}
-
-test "save then load encodes to identical ids and re-saves identically" {
-    const corpus = try readCorpusPrefix(2_000);
-    defer gpa.free(corpus);
-    var tk = try Tokenizer.init(gpa);
-    defer tk.deinit();
-    try tk.train(corpus, 40);
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tk.save(tmp.dir, io, "vocab.json");
-
-    var reloaded = try Tokenizer.load(gpa, tmp.dir, io, "vocab.json");
-    defer reloaded.deinit();
-
-    const before = try tk.encode(gpa, corpus);
-    defer gpa.free(before);
-    const after = try reloaded.encode(gpa, corpus);
-    defer gpa.free(after);
-    try std.testing.expectEqualSlices(u32, before, after);
-
-    try reloaded.save(tmp.dir, io, "again.json");
-    var again = try Tokenizer.load(gpa, tmp.dir, io, "again.json");
-    defer again.deinit();
-    const third = try again.encode(gpa, corpus);
-    defer gpa.free(third);
-    try std.testing.expectEqualSlices(u32, before, third);
-
-    // Byte for byte, so the committed artifact is reproducible from the
-    // trainer and a second pass through the file cannot reformat it.
-    const first_json = try tmp.dir.readFileAlloc(io, "vocab.json", gpa, .unlimited);
-    defer gpa.free(first_json);
-    const second_json = try tmp.dir.readFileAlloc(io, "again.json", gpa, .unlimited);
-    defer gpa.free(second_json);
-    try std.testing.expectEqualStrings(first_json, second_json);
-}
-
-test "load rejects a file that is not a vocabulary" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const cases = [_]struct { name: []const u8, body: []const u8 }{
-        .{ .name = "not_json.json", .body = "this is not json" },
-        .{ .name = "empty_object.json", .body = "{}" },
-        .{ .name = "empty_array.json", .body = "[]" },
-        .{ .name = "foreign_field.json", .body = "{\"vocab\":[65,66]}" },
-        .{ .name = "merges_as_string.json", .body = "{\"merges\":\"ab\"}" },
-        .{ .name = "short_pair.json", .body = "{\"merges\":[[1]]}" },
-        .{ .name = "pair_as_ints.json", .body = "{\"merges\":[1,2]}" },
-    };
-    for (cases) |c| {
-        try tmp.dir.writeFile(io, .{ .sub_path = c.name, .data = c.body });
-        // An error, never a panic: a merge list that fails to parse has to come
-        // back as a value the caller can handle.
-        try expectLoadFails(tmp.dir, c.name);
-    }
-
-    try std.testing.expectError(error.FileNotFound, Tokenizer.load(gpa, tmp.dir, io, "absent.json"));
-}
-
-test "load rejects a merge that names a token that does not exist yet" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    // Token 300 cannot be a merge input: only the 256 bytes and the 0 merges
-    // before this one exist. Reading it as an index would run off the end of
-    // the vocabulary.
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "forward_ref.json",
-        .data = "{\"merges\":[{\"left\":300,\"right\":1}]}",
-    });
-    try std.testing.expectError(error.InvalidMerge, Tokenizer.load(gpa, tmp.dir, io, "forward_ref.json"));
 }
 
 test "decode rejects a token id past the vocabulary" {

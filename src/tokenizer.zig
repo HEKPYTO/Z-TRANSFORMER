@@ -1,4 +1,4 @@
-//! Byte-level BPE: 256 base byte tokens plus learned merges, trained and serialized in Zig.
+//! Byte-level BPE: 256 base byte tokens plus learned merges, trained in Zig.
 
 const std = @import("std");
 
@@ -15,19 +15,6 @@ pub const Merge = struct {
     left: u32,
     right: u32,
 };
-
-/// The file is the merge list and nothing else. The 256 byte tokens are implied
-/// by the layout, and a merged token is the concatenation of the two tokens it
-/// came from, so both are rebuilt on load and a saved vocabulary cannot carry a
-/// byte table that disagrees with its merges.
-const Persisted = struct {
-    merges: []const Merge,
-};
-
-/// 16 MiB. Orders of magnitude above any vocabulary a real corpus produces,
-/// low enough that a corrupt or hostile file fails fast instead of taking the
-/// memory with it.
-const max_vocab_bytes = 1 << 24;
 
 /// A pair is only worth a merge once it occurs twice. A pair seen once cannot
 /// shorten anything that shows up again, so keeping one-off sequences out of
@@ -57,8 +44,8 @@ pub const Tokenizer = struct {
     /// `byte_vocab_size + rank`.
     merges: std.ArrayList(Merge),
     /// Rank per adjacent pair, so encoding asks one map lookup per pair instead
-    /// of walking the merge list. Built by `init` and every `addMerge`, never
-    /// read from the file, so it cannot go stale.
+    /// of walking the merge list. Built by `init` and every `addMerge`, so it
+    /// cannot go stale.
     pair_ranks: std.AutoHashMap(Pair, u32),
     allocator: std.mem.Allocator,
 
@@ -257,37 +244,5 @@ pub const Tokenizer = struct {
             at += token.len;
         }
         return out;
-    }
-
-    /// Writes the merge list as JSON under `dir`. The directory is a parameter
-    /// rather than an assumption about the process working directory, so a
-    /// caller can hand over a temporary directory and have the file land there.
-    pub fn save(self: *const Tokenizer, dir: std.Io.Dir, io: std.Io, sub_path: []const u8) !void {
-        var buffer: std.Io.Writer.Allocating = .init(self.allocator);
-        defer buffer.deinit();
-        try std.json.Stringify.value(Persisted{ .merges = self.merges.items }, .{}, &buffer.writer);
-        try dir.writeFile(io, .{ .sub_path = sub_path, .data = buffer.written() });
-    }
-
-    /// The file is untrusted input: a shape std.json does not recognise, a pair
-    /// wider than the tokens that exist, or a file that is not there at all come
-    /// back as errors, never as a half-built vocabulary.
-    pub fn load(allocator: std.mem.Allocator, dir: std.Io.Dir, io: std.Io, sub_path: []const u8) !Tokenizer {
-        const bytes = try dir.readFileAlloc(io, sub_path, allocator, .limited(max_vocab_bytes));
-        defer allocator.free(bytes);
-        const parsed = try std.json.parseFromSlice(Persisted, allocator, bytes, .{});
-        defer parsed.deinit();
-
-        var self = try Tokenizer.init(allocator);
-        errdefer self.deinit();
-        for (parsed.value.merges, 0..) |merge, rank| {
-            // Only the 256 bytes and the `rank` merges before this one exist
-            // when this merge is applied, so a larger id on either side is a
-            // forward reference the file is not allowed to make.
-            const known: u32 = byte_vocab_size + @as(u32, @intCast(rank));
-            if (merge.left >= known or merge.right >= known) return error.InvalidMerge;
-            try self.addMerge(merge.left, merge.right);
-        }
-        return self;
     }
 };
