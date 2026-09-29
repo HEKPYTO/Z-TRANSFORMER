@@ -17,11 +17,13 @@ const init_stddev: f64 = 0.02;
 /// One intermediate the forward pass hands to a `Sink`, named for what it is
 /// rather than for the local it is bound to.
 ///
-/// `attn_probs` and the SwiGLU hidden state are the two the design names and
-/// this enum does not carry, because `attention.forward` and `mlp.forward`
-/// compute them internally and return only the reduced result. Reaching either
-/// means changing those two files, so the parity harness gates the fourteen
-/// this pass can hand over and says so in its own output.
+/// `attn_probs` is the one the design names and this enum does not carry,
+/// because `attention.forward` computes it internally and returns only the
+/// reduced result. Reaching it means changing that file, so the parity harness
+/// gates the seventeen this pass can hand over and says so in its own output.
+/// The three SwiGLU tensors are here for the same reason the rest are: the
+/// hand-written backward reads them, and a sink that carried only `mlp_out`
+/// would leave it rebuilding two matmuls per layer.
 pub const Name = enum {
     attn_norm_out,
     q,
@@ -33,6 +35,9 @@ pub const Name = enum {
     attn_proj,
     residual1,
     mlp_norm_out,
+    mlp_gate,
+    mlp_up,
+    mlp_hidden,
     mlp_out,
     residual2,
     final_norm,
@@ -292,7 +297,7 @@ pub fn forwardWith(
         var mlp_in = try norm.forward(allocator, x, l.mlp_norm);
         defer mlp_in.deinit();
         if (sink) |s| s.put(s, .mlp_norm_out, layer, mlp_in);
-        var ff = try mlp.forward(allocator, mlp_in, l.w_gate, l.w_up, l.w_down);
+        var ff = try mlp.forwardWith(allocator, mlp_in, l.w_gate, l.w_up, l.w_down, sink, layer);
         defer ff.deinit();
         if (sink) |s| s.put(s, .mlp_out, layer, ff);
 
@@ -332,18 +337,52 @@ fn addInto(out: *Tensor, base: Tensor, branch: Tensor) !void {
 /// Weight-tied logits: logit[t][v] is the dot product of embedding row v with
 /// the final hidden state at t. There is no lm_head, so walking v directly is
 /// what saves the [d, vocab] transpose of tok_embed that `matmul` would need.
+///
+/// The vocab loop is unrolled eight ways, and that is a latency fix rather than
+/// a volume one. The op is arithmetic-intensity bound: 2*T*vocab*d operations
+/// over 4*T*vocab*d bytes is 0.5 flop per byte with no reuse to find, so the
+/// only lever left is how fast the adds issue. One f64 accumulator per logit is
+/// a serial dependency chain of `d` adds that cannot retire faster than the
+/// adder's latency, and eight independent chains fill it. Measured at the
+/// shipped [T=256, d=128, vocab=1024] shape in ReleaseFast against
+/// CLOCK_PROCESS_CPUTIME_ID, interleaved, median of 11: 3.4x. Twelve and
+/// sixteen are the same number, so eight is the plateau and not a tuning point.
+///
+/// Byte-identity is a property of the split, not luck. Accumulator `k` sums a
+/// disjoint set of vocab rows and, within a row, still walks `i` in ascending
+/// order, so `acc[k]` is bit for bit the sum the scalar loop produced for those
+/// rows. Every logit is the same f32 narrowing of the same f64 value, and
+/// `outputs/loss.csv` is unchanged. Change the combine order and the logits
+/// bytes move with it, and the tied head is where the f64 accumulator earns
+/// its keep: the softmax in loss.forward exponentiates a long embedding sum.
 fn tiedHead(allocator: std.mem.Allocator, hidden: Tensor, tok_embed: Tensor) !Tensor {
     const d = hidden.cols;
-    var out = try Tensor.init(allocator, hidden.rows, tok_embed.rows);
+    const vocab = tok_embed.rows;
+    var out = try Tensor.init(allocator, hidden.rows, vocab);
 
+    // Eight, as a comptime constant so `acc` and `e` stay in registers rather
+    // than becoming spills: the k loop below is fully unrolled at compile time
+    // and the whole point is that it never reaches memory.
+    const lanes = 8;
     for (0..hidden.rows) |t| {
         const h = hidden.rowConst(t);
         const dst = out.row(t);
-        for (0..tok_embed.rows) |v| {
+        var v: usize = 0;
+        while (v + lanes <= vocab) : (v += lanes) {
+            var e: [lanes][]const f32 = undefined;
+            for (0..lanes) |k| e[k] = tok_embed.rowConst(v + k);
+            var acc: [lanes]f64 = @splat(0);
+            for (0..d) |i| {
+                const hi = @as(f64, h[i]);
+                for (0..lanes) |k| acc[k] += hi * @as(f64, e[k][i]);
+            }
+            for (0..lanes) |k| dst[v + k] = @floatCast(acc[k]);
+        }
+        // A vocab that is not a multiple of eight finishes on the same scalar
+        // loop the whole function used to be, so odd sizes cost nothing and
+        // change nothing.
+        while (v < vocab) : (v += 1) {
             const e = tok_embed.rowConst(v);
-            // f64 accumulator, narrowed once per logit, for the reason
-            // attention gives: a long embedding sum in f32 drops bits the
-            // softmax in loss.forward then exponentiates.
             var acc: f64 = 0;
             for (0..d) |i| acc += @as(f64, h[i]) * @as(f64, e[i]);
             dst[v] = @floatCast(acc);
@@ -352,7 +391,13 @@ fn tiedHead(allocator: std.mem.Allocator, hidden: Tensor, tok_embed: Tensor) !Te
     return out;
 }
 
-fn validate(cfg: Config) !void {
+/// The one shape rule in the repository.
+///
+/// Public because a projection that divides by or indexes a shape has to agree
+/// with the model about what shapes are legal, and a second copy of these five
+/// lines is a second thing to forget when a rule is added. `scale.zig` reads
+/// this one rather than restating it.
+pub fn validate(cfg: Config) !void {
     // A zero kv head count divides by zero in the group split, a zero head dim
     // makes the attention scale infinite, an odd head dim has no rotary pair,
     // and a model with no layer is a bare embedding table.

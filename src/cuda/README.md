@@ -189,7 +189,8 @@ GPU does not pay is not a comparison.
 | `gpu_sync` | this kernel, launch and synchronize on every call |
 | `gpu_e2e` | host to device, kernel, device to host, on every call |
 
-Microseconds per call, RTX 3080 Ti against the same Fedora host:
+Every number in this section is the output of `sh src/cuda/run-norm.sh`, on the RTX 3080 Ti and
+host named above, quoted as it printed. Microseconds per call:
 
 ```
 shape        size          elements        cpu   cpu_core        gpu   gpu_sync    gpu_e2e      win
@@ -204,18 +205,21 @@ r1024c2048   1024x2048      2097152   11272.11    5623.92      28.79      32.75 
 big          4096x4096     16777216   91628.05   43564.09     228.07     231.06   21826.60   191.0x
 ```
 
-Run to run the small shapes move by up to about 15 percent, which is the fixed launch cost moving
-around; the large shape is repeatable to about 2 percent.
+A rerun does not print these bytes again, and the reason is on the next line: run to run the small
+shapes move by up to about 15 percent, which is the fixed launch cost moving around; the large shape
+is repeatable to about 2 percent. So this table is a record of one run, the ratios are what to read,
+and every figure quoted below is a subtraction or a ratio of two cells in it.
 
 ### The two numbers that were asked for
 
 **Shipped model shape, `256x128`**, which is `d_model 128` at a full context window of 256. The
 kernel on its own is `7.72 us`; `norm.zig`'s arithmetic is `78.95 us`. On that measure the GPU is
-`10.2x` faster.
+`10.2x` faster, and that is the two cells in the `ship` row divided.
 
 **Large shape, `4096x4096`.** The kernel is `228 us`; `norm.zig`'s arithmetic is `43.6 ms`. The GPU
-is `191x` faster, and here the number means what it looks like: 200 MB of traffic at roughly 900 GB/s
-is about 220 us, which is what the kernel does.
+is `191x` faster, and here the number means what it looks like: `4096 * 4096 * 4` bytes in and the
+same out is 128 MiB, and 128 MiB of traffic at roughly 900 GB/s is about 220 us, which is what the
+kernel does.
 
 ### The crossover, and why the shipped-shape number is not the interesting one
 
@@ -228,18 +232,20 @@ That floor is the whole story at the shipped size, and it is why the `10.2x` sho
 
 - The kernel takes `3.70 us` at 1024 elements, `3.37 us` at 4096, `4.73 us` at 16384 and `7.72 us` at
   32768. From 1024 to 32768 elements, thirty-two times the work, and the time only doubles. Almost
-  all of it is launch and block scheduling. The actual work at `256x128` is 256 KB of traffic, about
+  all of it is launch and block scheduling. The actual work at `256x128` is 256 KiB of traffic, about
   `0.3 us` at peak bandwidth.
-- The CPU side is slow for a reason that is specific to `norm.zig` rather than to RMSNorm. `2.4
-  ns` per element is a serial `f64` accumulation: each row is one dependency chain of 128 `f64` adds
-  at about four cycles of latency each, with no ILP to fill it. That is a correct and deliberate
-  choice for the CPU implementation, and this kernel is not evidence that it was the wrong one.
+- The CPU side is slow for a reason that is specific to `norm.zig` rather than to RMSNorm. `78.95
+  us` over `32768` elements is `2.4 ns` per element, and the reason is readable in the source: it is
+  a serial `f64` accumulation, so each row is one dependency chain of 128 `f64` adds with no ILP to
+  fill it. That is a correct and deliberate choice for the CPU implementation, and this kernel is
+  not evidence that it was the wrong one.
 
 The number that actually governs a decision is `gpu_e2e`, and at the shipped shape it is `55.87 us`
 against a CPU call of `162.88 us`. This repository has no device-resident tensor type yet, so every
-call copies 128 KB in and 128 KB out over PCIe, and that transfer is roughly six tenths of the
-whole call. With 4 layers and 2 norms per layer, one forward pass spends about 450 us copying
-RMSNorm inputs before any arithmetic happens.
+call copies 128 KiB in and 128 KiB out over PCIe, and that transfer is all but the `7.72 us` of
+kernel: `55.87 - 7.72` is six tenths of the `78.95 us` the CPU spends on the same arithmetic. With
+4 layers and 2 norms per layer, one forward pass spends `8 * 55.87`, about 450 us, copying RMSNorm
+inputs before any arithmetic happens.
 
 **So: no end-to-end speedup is claimed at the shipped model size.** The kernel is correct there, it
 is faster than this CPU implementation there when the buffers are already on the device, and neither
@@ -265,13 +271,13 @@ in this directory changes that yet.
 
 ### Known limitation
 
-`tall` at `4096x128` is the same element count as `r256c2048` and takes `84.96 us` against
-`8.60 us`, about 10x worse, with no more memory traffic. The cause is the fixed block size: at
+`tall` at `4096x128` is the same element count as `r256c2048` and takes `83.51 us` against
+`8.67 us`, about 10x worse, with no more memory traffic. The cause is the fixed block size: at
 `cols = 128` only 128 of the 256 threads in a block have an element to read, so half the block idles,
 and 4096 blocks each pay the full per-block cost for one element. Widening the row hides it and
 narrowing it exposes it.
 
-`ship` is `256x128` and costs `7.32 us`, so the shipped model is on the right side of this for its
+`ship` is `256x128` and costs `7.72 us`, so the shipped model is on the right side of this for its
 row count, but a batch large enough to make 4096 rows out of 128-wide rows would land in the slow
 case. The fix is to dispatch on a block size that fits the row, which needs the warp count to be a
 template parameter rather than the `WARPS` constant it is now. Not done: it is an optimisation, not

@@ -1,5 +1,6 @@
 const std = @import("std");
 const model = @import("model.zig");
+const norm = @import("norm.zig");
 const tensor = @import("tensor.zig");
 const Tensor = tensor.Tensor;
 
@@ -207,6 +208,52 @@ test "model is pre-norm: zero weights leave the embedding passed through the fin
         if (v == 0 or v == 1) continue;
         try std.testing.expectEqual(@as(f32, 0), logits.at(0, v));
         try std.testing.expectEqual(@as(f32, 0), logits.at(1, v));
+    }
+}
+
+test "the tied head sums a vocab that is not a multiple of its unroll width" {
+    // The tied head walks the vocab eight rows at a time, and every other
+    // config in this file has a vocab that divides by eight, so nothing else
+    // here reaches the remainder loop. This config does.
+    const odd = model.Config{
+        .n_layers = 1,
+        .n_heads = 2,
+        .n_kv_heads = 2,
+        .head_dim = 4,
+        .n_ctx = 32,
+        .vocab_size = 13,
+        .ffn_mult = 1,
+    };
+    var p = try blank(std.testing.allocator, odd);
+    defer p.deinit();
+    // Distinct values, not zeros and not all equal, so a lane that mixed up
+    // which vocab row it was summing would not sum to the same answer.
+    for (p.tok_embed.data, 0..) |*c, k| c.* = @floatCast(@as(f32, @floatFromInt(k % 7)) * 0.25 - 0.5);
+
+    var logits = try model.forward(std.testing.allocator, p, odd, &.{0});
+    defer logits.deinit();
+
+    // `blank` zeroes the 28 projections, so the stream reaching the final norm
+    // is the embedding lookup untouched, and `norm` is what the model itself
+    // ran. Referencing the real norm output is what makes the expectation exact
+    // in f32 rather than close, which is the bar this test has to hold: a
+    // reassociated sum is a different f64 value, not a nearby one.
+    var stream = try Tensor.init(std.testing.allocator, 1, 8);
+    defer stream.deinit();
+    @memcpy(stream.row(0), p.tok_embed.rowConst(0));
+    var final = try norm.forward(std.testing.allocator, stream, p.final_norm);
+    defer final.deinit();
+    const h = final.rowConst(0);
+    // Ascending `i`, one f64 accumulator, narrowed once: the scalar loop the
+    // unroll replaced, restated as the oracle. Bit equality, not a tolerance.
+    for (0..odd.vocab_size) |v| {
+        const e = p.tok_embed.rowConst(v);
+        var acc: f64 = 0;
+        for (0..e.len) |i| acc += @as(f64, h[i]) * @as(f64, e[i]);
+        try std.testing.expectEqual(
+            @as(u32, @bitCast(@as(f32, @floatCast(acc)))),
+            @as(u32, @bitCast(logits.at(0, v))),
+        );
     }
 }
 
@@ -480,11 +527,11 @@ test "the sink reports every intermediate, once per layer" {
     var out = try model.forwardWith(std.testing.allocator, p, two_layers, &tokens, rec.asSink());
     defer out.deinit();
 
-    // 12 per-layer names over 2 layers, plus final_norm and logits once each.
-    try std.testing.expectEqual(@as(usize, 12 * two_layers.n_layers + 2), rec.seen);
-    try std.testing.expectEqual(@as(usize, 12 * two_layers.n_layers), rec.per_layer);
+    // 15 per-layer names over 2 layers, plus final_norm and logits once each.
+    try std.testing.expectEqual(@as(usize, 15 * two_layers.n_layers + 2), rec.seen);
+    try std.testing.expectEqual(@as(usize, 15 * two_layers.n_layers), rec.per_layer);
     try std.testing.expectEqual(@as(usize, 2), rec.non_layer_zero);
-    // Each of the 12 layer-scoped names fires once per layer, so the two layers
+    // Each of the 15 layer-scoped names fires once per layer, so the two layers
     // contribute evenly and no name is reported for a layer that did not run.
     for (std.enums.values(model.Name)) |n| {
         const want: usize = switch (n) {

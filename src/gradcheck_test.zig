@@ -28,6 +28,23 @@ const two_layers = model.Config{
     .ffn_mult = 1,
 };
 
+/// Grouped-query attention at `n_kv_heads = 1`: every query head shares one kv
+/// head, so `dk` and `dv` each sum four terms where an ungrouped head sums one.
+/// That is the accumulation the budget has to survive, and it is the fixture
+/// that measures the budget rather than inheriting a verdict: `mismatch == null`
+/// only says the check did not fail, while `headroom` says how much room was
+/// left. The wider shape is `autograd_test.zig`'s, reused rather than reinvented,
+/// so the two suites grade the same model.
+const gqa = model.Config{
+    .n_layers = 1,
+    .n_heads = 4,
+    .n_kv_heads = 1,
+    .head_dim = 4,
+    .n_ctx = 32,
+    .vocab_size = 32,
+    .ffn_mult = 1,
+};
+
 const tok: []const u32 = &.{ 3, 1, 4, 0 };
 const tgt: []const u32 = &.{ 1, 4, 0, 2 };
 
@@ -69,14 +86,17 @@ test "gradcheck: compare returns the whole sweep as data" {
         try std.testing.expectEqual(@as(?usize, 0), r.groups[1 + i].layer);
     }
 
-    // The floor is a real number and a discriminating one: above nothing, and
+    // The budget is a real number and a discriminating one: above nothing, and
     // a small fraction of the largest gradient in the model, or it would be a
     // budget that cannot fail. `floor < gmax` alone is far too loose to do that
     // job: the measured floor is 1.1e-4 against a gmax of 0.88, so the bound
     // permits a budget nearly four thousand times looser than the real one, and
     // the corruption test below perturbs by 1.0, which such a budget would still
     // catch. A tenth of a percent is the bound `src/README.md` already states in
-    // prose, so this is the assertion that keeps that sentence true.
+    // prose, so this is the assertion that keeps that sentence true. It is the
+    // complement to the headroom assertion below: this one forbids a budget so
+    // loose it cannot fail, that one forbids one so tight a correct gradient
+    // trips over it.
     try std.testing.expect(r.floor > 0);
     var gmax: f64 = 0;
     for (g.tok_embed.data) |v| gmax = @max(gmax, @abs(@as(f64, @floatCast(v))));
@@ -114,6 +134,66 @@ test "gradcheck: compare finds the first element that does not fit" {
     // The budget is per element, so this element's is at or under the largest
     // the Report carries, and the gap is over its own rather than merely near it.
     try std.testing.expect(m.budget <= r.floor);
+    try std.testing.expect(m.diff > m.budget);
+}
+
+test "gradcheck: the budget bounds a correct gradient on grouped-query attention" {
+    // The load-bearing assertion of the whole module, and the one the old
+    // `sqrt(vocab / T)` budget fails. It failed on a correct gradient and
+    // nothing else: the grouped path sums four dk terms per kv head, the finite
+    // difference carries that as noise, and `tok_embed[30]` read 5.6% over budget
+    // at vocab 256 while at vocab 16 the same formula was a thousand times looser
+    // than the discrepancy it was describing. A check that reports a correct
+    // gradient as wrong is worse than no check, because a maintainer learns to
+    // ignore the only instrument there is.
+    var p = try liveParams(std.testing.allocator, gqa);
+    defer p.deinit();
+    var g = try grads(std.testing.allocator, gqa, p);
+    defer g.deinit();
+
+    const r = try gradcheck.compare(std.testing.allocator, gqa, p, tok, tgt, &g);
+    defer r.deinit();
+
+    // Two bounds, not one: `mismatch == null` is also true of a budget that has
+    // been multiplied by a hundred, and the corruption test in
+    // `autograd_test.zig` is the only thing that would notice. `headroom` is the
+    // margin itself, so a floor on it says the formula is a bound with room to
+    // spare rather than a constant that happened to clear this fixture.
+    //
+    // The headroom is asserted as a BAND around a measured value, and the band
+    // is the fix. The assertion used to be a one-sided floor, `headroom > 1.5`,
+    // and a floor cannot catch a budget that has been loosened: weakening
+    // multiplies the budget, which DIVIDES `diff / budget`, which RAISES the
+    // headroom. The sweep at k = 12 measures 2.6184, so a 1.5x weakening reports
+    // 3.93 and sails under a 1.5 floor, and raising the floor to 3.93 to catch
+    // it would have made every correct gradient a failure. The gate was pointed
+    // the wrong way: it could only ever catch a budget that had been tightened.
+    //
+    // So both sides are asserted, and the reference is a measurement. This
+    // fixture is PINNED — `liveParams` draws from the literal 0xbeef — so the
+    // sweep is the same sweep every run: 2.6184 in ReleaseFast, 2.6442 in Debug.
+    // The tolerance is 0.35, about 13%, which is an order of magnitude above the
+    // 1% spread between the two configurations and an order of magnitude below
+    // the 51% a 1.5x weakening moves it by.
+    //
+    // What that buys, as arithmetic. A budget multiplied by f reports 2.6184 * f,
+    // so the band catches any change beyond roughly 0.87x to 1.13x in either
+    // direction. The 1.5x weakening that 1.5 could not see reports 3.93 and is
+    // caught. A budget inflated ten times reports 26 and is caught. The broken
+    // `sqrt(vocab / T)` budget measures 0.88 at this vocab and 0.62 at
+    // `vocab 16`, and both are caught, as is any budget tightened toward 1.0,
+    // which is the failure the old floor was the only thing watching for.
+    try std.testing.expectApproxEqAbs(2.62, r.headroom, 0.35);
+
+    // And the budget is still small enough to catch a wrong gradient. Corrupting
+    // `wk` by twice the budget has to be reported, or the headroom above is only
+    // slack in one direction.
+    const before = g.layers[0].wk.data[5];
+    g.layers[0].wk.data[5] = before + @as(f32, @floatCast(2.0 * r.floor));
+    const bad = try gradcheck.compare(std.testing.allocator, gqa, p, tok, tgt, &g);
+    defer bad.deinit();
+    const m = bad.mismatch orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("wk", m.field);
     try std.testing.expect(m.diff > m.budget);
 }
 
@@ -194,6 +274,11 @@ test "gradcheck: report writes the table it is handed" {
         try std.testing.expect(renders(row, group.worst, "{e:.3}"));
         try std.testing.expect(std.mem.indexOf(u8, row, "h 1e-3") != null);
         try std.testing.expect(renders(row, r.floor, "{e:.3}"));
+        // The headroom, in the column the table gives it: a passing sweep that
+        // says nothing about how much room it had left cannot be told apart from
+        // one whose budget is too loose to catch anything.
+        try std.testing.expect(renders(row, r.headroom, "{e:.2}"));
+        try std.testing.expect(std.mem.indexOf(u8, row, "headroom") != null);
         // The index, read from the column it belongs to rather than from the row
         // at large, since every other column carries digits too.
         const at = std.mem.indexOf(u8, row, "at ") orelse return error.TestUnexpectedResult;

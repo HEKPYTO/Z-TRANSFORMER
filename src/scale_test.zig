@@ -206,11 +206,11 @@ test "scale: activations are the per-layer blocks, not the logits, at depth" {
     //
     // The term-by-term split, in f32 elements:
     //   head  logits + dlogits   2 * 8192 * 128256      =  2101346304
-    //   blocks 32 layers of the eleven tensors in autograd.Block
+    //   blocks 32 layers of the eleven tensors in autograd's Block
     //                               32 * 8192 * 75776   = 19864223744
-    // so the blocks are 85% and the head 9%. The logits are the number a
-    // reader arrives with and they are not the largest thing here: the replay
-    // in autograd.backward keeps one Block per layer, and at 32 layers that is
+    // so the blocks are 90% and the head 9%. The logits are the number a
+    // reader arrives with and they are not the largest thing here: the cache
+    // the backward fills holds one Block per layer, and at 32 layers that is
     // what fills the machine.
     const p = try scale.project(.{ .name = "llama3-8b", .cfg = .{
         .n_layers = 32,
@@ -224,7 +224,11 @@ test "scale: activations are the per-layer blocks, not the logits, at depth" {
     const one_logit = 8192 * 128256 * 4;
     try std.testing.expectEqual(@as(u64, 4_202_692_608), one_logit);
     const head: u64 = 2 * one_logit / 4;
-    const stream: u64 = 33 * 8192 * 4096;
+    // One [T, d] for the first block's input. It was 33 of them while the
+    // backward ran its own forward and kept a slice of the stream at every
+    // layer boundary; the stream a block starts from is the previous block's
+    // output now, so it is not held a second time.
+    const stream: u64 = 8192 * 4096;
     const blocks: u64 = 32 * 8192 * (6 * 4096 + 2 * 1024 + 3 * 16384);
     const grads: u64 = 4 * 8192 * 4096;
     const attn_back: u64 = 8192 * (4096 + 2 * 1024) + 4 * 8192;
@@ -232,7 +236,7 @@ test "scale: activations are the per-layer blocks, not the logits, at depth" {
     try std.testing.expectEqual(@as(u64, 19_864_223_744), blocks);
     // All five terms, added up by hand against the projection.
     try std.testing.expectEqual(head + stream + blocks + grads + attn_back, p.act);
-    try std.testing.expectEqual(@as(u64, 23_257_448_448), p.act);
+    try std.testing.expectEqual(@as(u64, 22_183_706_624), p.act);
     // The blocks are the larger term by a wide margin, and the head is under a
     // tenth of the total.
     try std.testing.expect(blocks > 4 * head);

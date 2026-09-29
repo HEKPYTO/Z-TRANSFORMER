@@ -3,7 +3,7 @@
 # somebody can check?
 #
 #   sh tools/mutation/run.sh                    the default set
-#   sh tools/mutation/run.sh matmul,rope        only those, by name
+#   sh tools/mutation/run.sh matmul,rope        only those, matched as substrings
 #   MUTATION_MODE=debug sh tools/mutation/run.sh    re-adjudicate in Debug
 #
 # It mutates source, runs the suite, and reports which tests caught the defect.
@@ -17,7 +17,10 @@
 # next `zig build` reports a failure nobody caused, in a line nobody wrote, and
 # the honest fix — finding out which line — is the one thing nobody thinks to do.
 # The trap below removes the worktree on every exit path including SIGINT, and
-# the last thing printed is proof it is gone.
+# the last thing printed is proof it is gone — and a check that fails sets the
+# exit status, because a check that only prints is a check nobody has to believe.
+# SIGKILL cannot be trapped, so a killed run leaves the scratch directory, which
+# opens with a file naming the repository and the one command that clears it.
 #
 # It runs `zig fmt` on each mutant before the suite. `verify` gates its two
 # test binaries on `zig fmt --check`, so an unformatted mutant is rejected by
@@ -29,11 +32,17 @@
 # It exits 0 whenever the run completed and every mutation got a verdict,
 # survivors included. A coverage number is a measurement, not a pass/fail gate:
 # a suite is not imperfect, it is measured, and a command that went red the
-# first time it was run would be deleted rather than fixed. Exit 1 means the
-# measurement is untrustworthy — a mutation whose pattern no longer matches, or
-# one that does not compile, so a number was reported for code that never ran.
-# Exit 2 means the harness could not run at all.
-set -u
+# first time it was run would be deleted rather than fixed. Exit 1 means
+# something makes the output untrustworthy — a mutation whose pattern no longer
+# matches, one that does not compile so a number was reported for code that never
+# ran, or a restoration check that failed, which means the run left something of
+# itself behind. Exit 2 means the harness could not run at all.
+#
+# Restoration failure is an exit status and not a line of output. A FAIL that
+# prints and returns 0 is worse than no check at all: it trains the reader to
+# see the word FAIL and reach for the number in front of the shell, which is
+# exactly the habit that lets a mutant sit in a checkout for a week.
+set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd) || exit 2
 here=$root/tools/mutation
@@ -54,9 +63,9 @@ fi
 #
 # What this costs is stated rather than assumed, because it is a real limit and
 # not a formality: a defect only Debug's safety checks trip is invisible to the
-# default run, so Debug-only catches are not counted. The three survivors in the
+# default run, so Debug-only catches are not counted. The two survivors in the
 # default set were re-run through this same script with MUTATION_MODE=debug and
-# all three survive Debug too, so on this set the choice cost nothing measured.
+# both survive Debug too, so on this set the choice cost nothing measured.
 # `MUTATION_MODE=debug` re-adjudicates the whole selection in Debug for anyone
 # who wants the other gate, which is how a survivor gets promoted to caught
 # without paying for the set twice.
@@ -67,61 +76,114 @@ case "$mode" in
     *)       set_cmd="verify" ;;
 esac
 
-# A digest of the whole of src/, taken before anything happens and compared
-# after. Not `git status`, because this repository's working tree legitimately
-# carries uncommitted work from other work at times, and a status-based check
-# would then either report a false failure or — worse, to pass it — be
-# loosened until it reported nothing. A digest of the bytes is the claim being
-# made: this harness did not write to src/, and it can be checked without
-# knowing anything about what else was going on.
-src_digest() {
-    find "$root/src" -type f -name '*.zig' -print0 |
-        LC_ALL=C sort -z |
-        xargs -0 shasum -a 256 2>/dev/null |
-        shasum -a 256 2>/dev/null | cut -d' ' -f1
+# A digest of the whole of src/ used to be taken here and compared after. It is
+# gone, because it could only ever detect one of two things and the two are not
+# distinguishable from inside the run: this harness writing to the caller's
+# checkout, and somebody else editing the checkout at the same time. It never
+# does the first, and it did not once fail to be wrong about the second — in a
+# shared tree a colleague's `vim src/model.zig` produced "FAIL src/ changed",
+# and the fix for a check that cries wolf every ten minutes is to delete it, not
+# to tune it.
+#
+# What is left is the claim the harness can actually stand behind: it wrote in
+# two places, both of which it owns and both of which it destroys. The worktree,
+# checked through git's own registry rather than by looking for a directory,
+# because a directory that is gone but still registered is what outlives a run;
+# and the scratch directory holding the mutator, its build cache and the log.
+wt_list() {
+    git -C "$root" worktree list --porcelain 2>/dev/null |
+        sed -n 's/^worktree //p' | LC_ALL=C sort
 }
 
-before=$(src_digest)
+before=$(wt_list)
 if [ -z "$before" ]; then
-    echo "mutation: could not digest src/ (exit 2)" >&2
+    echo "mutation: could not read \`git worktree list\` (exit 2)" >&2
     exit 2
 fi
 
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/ztransformer-mutation.XXXXXX") || exit 2
+# A separate assignment, because `${TMPDIR:-/tmp%/}` only strips the slash from
+# the fallback: TMPDIR on macOS ends in one, and the path is printed twice in the
+# output, where a `//` reads like a different path.
+tmp=${TMPDIR:-/tmp}
+scratch=$(mktemp -d "${tmp%/}/ztransformer-mutation.XXXXXX") || exit 2
 wt=$scratch/tree
 log=$scratch/run.log
 mutate_bin=$scratch/mutate
 
-# One trap, one job: the worktree goes, and the evidence is printed. `git
-# worktree remove` is the documented way to undo `git worktree add`; the `rm -rf`
-# behind it is for the case where the removal itself fails, which is the case
-# where a stale worktree would otherwise be registered in this repository's
-# admin data and outlive the run. A survivor of the trap is a scratch directory
-# on disk and nothing more: the working tree was never written to.
+# SIGKILL cannot be trapped, so nothing runs when it lands. What is left is this
+# directory, and it has to identify itself to whoever trips over it weeks later.
+# Two lines, because the name alone says "some mutation run happened here" and
+# not which repository the worktree inside it belongs to — which is the one
+# thing the reader needs in order to run `git worktree remove` and be done.
+{
+    echo "ztransformer mutation scratch, left by a run that was killed."
+    echo "repository: $root"
+    echo "worktree:   $wt"
+    echo "clean up:   git -C '$root' worktree remove --force '$wt'; rm -rf '$scratch'"
+} >"$scratch/owner.txt"
+
+# One trap, one job: the worktree goes, the evidence is printed, and a failed
+# check sets the exit status. `git worktree remove` is the documented way to
+# undo `git worktree add`; the `rm -rf` behind it is for the case where the
+# removal itself fails, which is the case where a stale worktree would
+# otherwise be registered in this repository's admin data and outlive the run.
+# A survivor of the trap is a scratch directory on disk and nothing more: the
+# working tree was never written to.
 cleanup() {
     status=$?
-    after=$(src_digest)
+    restore=0
+    # stdout is discarded, stderr is not. A removal that fails is the single
+    # most useful thing this script can tell you and `2>&1` was throwing it
+    # away, which is how the one real failure of this check seen while building
+    # it cost a second run to diagnose: git's own "fatal:" line is the
+    # diagnosis, and the registry comparison below only says something survived.
     if [ -d "$wt" ]; then
-        git -C "$root" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
+        git -C "$root" worktree remove --force "$wt" 2>&1 >/dev/null | sed 's/^/          git: /'
     fi
-    git -C "$root" worktree prune >/dev/null 2>&1 || true
+    if [ -d "$wt" ]; then
+        rm -rf "$wt"
+    fi
+    git -C "$root" worktree prune 2>&1 >/dev/null | sed 's/^/          git: /'
     echo
     echo "restoration"
-    if git -C "$root" worktree list | grep -qF "$wt"; then
-        echo "  FAIL    $wt is still a registered worktree"
-    else
-        echo "  ok      $wt is no longer a registered worktree"
-    fi
+    # One check, not two. The first draft of this asked git to search its
+    # registry for the worktree path and reported ok when it did not find it —
+    # which it never does on macOS, where `mktemp -d` hands back `/var/...` and
+    # git reports the resolved `/private/var/...`, so a `grep -F` on the literal
+    # string is a check that cannot fail. Comparing the whole registry against
+    # the whole registry taken at start needs no path string to match, catches
+    # the same worktree, and catches a second one besides.
+    after=$(wt_list)
     if [ "$after" = "$before" ]; then
-        echo "  ok      src/ in the checkout this ran from is byte for byte as it was at start"
+        echo "  ok      $wt is gone, and the set of registered worktrees is the one this run started with"
     else
-        echo "  FAIL    src/ in the checkout this ran from changed: ${before} -> ${after}"
+        # The only thing that can differ here is a worktree this run added and
+        # did not remove, so name it rather than printing two lists and asking
+        # the reader to diff them.
+        echo "  FAIL    these worktrees are registered now and were not at start:"
+        printf '%s\n' "$after" | while IFS= read -r line; do
+            printf '%s\n' "$before" | grep -qxF "$line" || echo "            $line"
+        done
+        echo "          run: git -C '$root' worktree prune  (then remove anything left over by hand)"
+        restore=1
     fi
     rm -rf "$scratch"
     if [ -e "$scratch" ]; then
-        echo "  FAIL    the scratch directory survived"
+        echo "  FAIL    the scratch directory survived: $scratch"
+        echo "          it holds only the mutator, its build cache and the log; rm -rf it"
+        restore=1
     else
         echo "  ok      the mutator binary, its build cache and the logs were scratch, and are gone"
+    fi
+    # The one line the whole trap exists for. `status` is the run's own verdict
+    # and is preserved unless a check failed, so a clean run over a messy result
+    # still reports the mess, and a clean result over a failed restoration
+    # reports the restoration.
+    if [ "$restore" -ne 0 ]; then
+        if [ "$status" -eq 0 ]; then
+            status=1
+        fi
+        echo "  exit 1  the run left something of itself behind; the output above is not a clean measurement"
     fi
     exit $status
 }
@@ -148,8 +210,13 @@ fi
 
 # The selection. Empty means every mutation, which is the set a reviewer should
 # run: the twelve that guard a load-bearing claim and the four that probe the
-# edges. Names are comma separated and may be globs, because the point of a
-# subset is to re-check one area in another mode without re-running the world.
+# edges. Names are comma separated, and each one is a substring match, so
+# `matmul,rope` is the two families rather than zero mutations and a puzzled
+# reader: `case` patterns match the whole word, and every name in the table
+# carries a suffix, so an undecorated pattern is a name that does not exist.
+# Wrapping the pattern in `*` costs two characters and is the difference between
+# the subset selector working and the one command a developer would reach for
+# during a run failing with exit 2.
 all=$("$mutate_bin" list) || exit 2
 if [ "$#" -eq 0 ]; then
     selected=$all
@@ -157,8 +224,9 @@ else
     selected=""
     for pattern in $(printf '%s' "$1" | tr ',' ' '); do
         for name in $all; do
-            # shellcheck disable=SC2254  # the pattern is meant to glob.
-            case $name in $pattern) case " $selected " in *" $name "*) ;; *) selected="$selected $name" ;; esac ;; esac
+            case $name in
+                *$pattern*) case " $selected " in *" $name "*) ;; *) selected="$selected $name" ;; esac ;;
+            esac
         done
     done
     selected=$(printf '%s' "$selected" | sed 's/^ *//')
@@ -268,6 +336,11 @@ fi
 if [ -n "$survivors" ]; then
     echo
     echo "survivors"
+    # Reached only for names whose verdict was `survived`, which is the one
+    # branch that appends to `$survivors`. A class is unreachable for a caught
+    # mutation by construction, and any survivor without one lands on
+    # UNCLASSIFIED rather than being described in language the run no longer
+    # supports.
     for name in $survivors; do
         "$mutate_bin" show "$name" | sed 's/^/  /'
         case $name in
@@ -276,22 +349,6 @@ if [ -n "$survivors" ]; then
                 echo "          every assertion here is looser than that rounding. This is not a hole"
                 echo "          in the suite. Catching it means a test that pins the exact order, which"
                 echo "          pins one f32 rounding rather than the function."
-                ;;
-            matmul-f64-acc)
-                echo "  class   HOLE, and a measured one. The two reductions are not equivalent."
-                echo "          Reducing k weights drawn at the init scale in f32 rather than f64"
-                echo "          diverges by 5.1e-6 relative at k=64, 2.7e-5 at the ffn width of 256,"
-                echo "          and 1.2e-4 at k=4096, worst case over 200 draws at seed 7. The suite's"
-                echo "          matmul tests assert a relative bound tighter than that and still pass,"
-                echo "          because no test here multiplies a tall and wide matrix. So the f32"
-                echo "          accumulator in tensor.zig is an unverified choice, not a tested one,"
-                echo "          and the honest fix is a matmul test that reduces in f64 at a wide k."
-                ;;
-            norm-f32-acc)
-                echo "  class   below-gate at the tested widths: d_model 64 to 4096 is 4096 f32"
-                echo "          squares at most, a drift under 1e-6, under the 2e-6 gate. The f64"
-                echo "          accumulator is right; this suite does not prove it, and the parity"
-                echo "          sweep at d_model 64 does not either. tools/README.md says the same."
                 ;;
             clip-ge)
                 echo "  class   EQUIVALENT, and provably so rather than hopefully. The mutant differs"

@@ -16,14 +16,27 @@ three are separate on purpose: a machine without torch has not failed a parity c
 | Sweep | sequence lengths 1, 8 and 257, at seeds 7 and 8. Six runs, 156 tensor rows, 532 argmax comparisons |
 | Last verdict | OK. 14 tensor kinds inside their gates, worst 2.1e-06 against a 2.0e-05 gate |
 | Argmax | 532 of 532 rows pick the same token |
-| Record | `report.csv` in this directory, one row per tensor per run |
+| Record | `report.csv` in this directory, one row per tensor per run. `check.sh` checks the report it just wrote against the digest `build.zig` holds, so the two rows above are checked on every run rather than true once. |
 
-The pinned versions are not decoration. `reference-library` v5 moved `rope_theta` into
-`rope_parameters`, so an unpinned oracle silently builds the reference with theta 10000 and
-disagrees with this model's 500000 on RoPE while looking like a numerics bug. `_attn_implementation`
-defaults to `sdpa` in 4.57, which is a different kernel and a different reduction order, so `eager`
-is forced and the resolved value is printed in the header. Both traps turn a setup error into a
-plausible-looking numerical one, which is the failure mode this harness exists to remove.
+All three are pinned, to the versions the committed `report.csv` records in every one of its 156
+rows, and each pin earns its place.
+
+`reference-library` is the one that changes the answer. v5 moved `rope_theta` into `rope_parameters`, so
+an unpinned oracle silently builds the reference with theta 10000 and disagrees with this model's
+500000 on RoPE while looking like a numerics bug. `oracle.txt` does not rely on the pin alone: it
+reads the theta the reference actually resolved and refuses to run if it is not the one this
+repository's config states, so that trap is caught as a setup error whatever the version is.
+
+`torch` and `numpy` do not change the answer; they change whether the run reproduces. Their pins are
+what turn a different build into a `pip` message instead of a digest mismatch against
+`report.csv`, which is the failure that looks like a numerics change and is not one. They are also
+what makes the `torch` version the `Reference` row above prints the one `pip` was told to install
+rather than the one that happened to be on the machine.
+
+`_attn_implementation` defaults to `sdpa` in 4.57, which is a different kernel and a different
+reduction order, so `eager` is forced and the resolved value is printed in the header. That trap
+turns a setup error into a plausible-looking numerical one, which is the failure mode this harness
+exists to remove.
 
 Set up once, into a virtualenv inside the repository:
 
@@ -49,7 +62,17 @@ one when both exist, so the pin is what actually runs.
 `oracle.txt` is the whole oracle: it reads the export, builds the reference, and writes
 `report.csv`. It is never imported by the shipped binary and nothing in `src/` imports it.
 
-`check.sh` is the entry point, and the only place the two halves meet.
+`check.sh` is the entry point, and the only place the two halves meet. It also runs
+`zig build removed-digest` over the report the oracle just wrote, which is the only thing that checks
+that report against its committed digest.
+
+`zig build verify` cannot do it, and the boundary is worth stating once: the report is a product of
+the Python oracle, and AGENTS.md keeps Python out of the build graph. So the split is by what each
+side can reach. `verify` checks everything reproducible from Zig alone — the corpus digest and the
+committed loss curve. The parity digest is asserted at the moment the report exists, by the command
+that produced it, on a machine that already has the virtualenv. A hash check sitting in `verify`
+would prove only that some bytes are committed, not that a comparison reproduces them, which is the
+claim the record is for.
 
 `report.csv` is the committed record, and it lives beside the file that writes it so the two cannot
 drift apart. The export it describes is scratch, under `outputs/parity/`, and is not committed.
@@ -99,8 +122,13 @@ top1-top2 margin is printed, so a near-tie is visibly a near-tie.
 How good is the test suite, as a number somebody can check.
 
     sh tools/mutation/run.sh                      # 16 mutations, 8 minutes
-    sh tools/mutation/run.sh matmul,rope          # a subset, by name or glob
+    sh tools/mutation/run.sh matmul,rope          # a subset, matched as substrings
     MUTATION_MODE=debug sh tools/mutation/run.sh  # the same set in Debug, 39 minutes
+
+Each argument is matched as a substring, so `matmul` is the whole matmul family and `rope` is the
+rope mutation. That is the command a developer reaches for mid-run, and it used to exit 2: a `case`
+pattern matches the whole word, every name in the table carries a suffix, and a name that does not
+exist is not a useful thing for a selector to report.
 
 It applies a deliberate defect to the source, runs the suite, and reports which tests caught it.
 Every quality claim this repository makes about its own tests is a version of that question, and
@@ -110,17 +138,31 @@ parity gates; this asks it of the suite.
 Exit 0 whenever the run completed and every mutation got a verdict, survivors included. A coverage
 number is a measurement, not a pass/fail gate: a suite is not imperfect, it is measured, and a
 command that went red the first time anyone ran it would be deleted rather than fixed. Exit 1 means
-the measurement is untrustworthy — a mutation whose pattern stopped matching, or one that does not
-compile, so a number was reported for code that never ran. Exit 2 means the harness could not run.
+something makes the output untrustworthy — a mutation whose pattern stopped matching, one that does
+not compile so a number was reported for code that never ran, or a restoration check that failed,
+which means the run left something of itself behind. Exit 2 means the harness could not run.
 
 ### The two traps a hand-run falls into
 
-**It never mutates this tree.** The mutants go into a `git worktree` pinned to HEAD, removed by a
-trap on every exit path including SIGINT. The run ends by printing its own evidence: the worktree is
-no longer registered, and a SHA-256 of all of `src/` matches the one taken before the first
-mutation. A harness that edits the checkout it runs from leaves a mutant behind when it crashes, and
-a repository with a mutant in it is worse than one with no harness — the next `zig build` reports a
-failure nobody caused, on a line nobody wrote.
+**It never mutates this tree, and it says so in a way you can check.** The mutants go into a
+`git worktree` pinned to HEAD, removed by a trap on every exit path including SIGINT. The run ends
+by comparing the whole of `git worktree list` against the copy it took before the first mutation and
+printing the outcome. A harness that edits the checkout it runs from leaves a mutant behind when it
+crashes, and a repository with a mutant in it is worse than one with no harness — the next
+`zig build` reports a failure nobody caused, on a line nobody wrote.
+
+The check is scoped to the two places the harness writes, both of which it owns and destroys: the
+worktree, compared through git's registry rather than by looking for a directory, because a directory
+that is gone but still registered is what outlives a run; and the scratch directory holding the
+mutator, its build cache and the log. An earlier version digested all of `src/` instead, and that
+check could not tell the two things it was watching for apart: this harness writing to your
+checkout, and a colleague editing it at the same time. It never did the first, and in a shared tree
+it reported the second as a failure often enough to be worth deleting. A check that cannot separate
+its causes is not a check, so it is gone rather than tuned.
+
+SIGKILL cannot be trapped, so a killed run does not clean up. What it leaves behind is a scratch
+directory whose `owner.txt` names the repository and the one command that clears it, which is the
+only thing worth writing down for a signal that leaves no chance to write anything else.
 
 **It runs `zig fmt` on the mutant before the suite.** `verify` gates both of its test binaries on
 `zig fmt --check`, so an unformatted mutant is rejected by the formatter before a single test
@@ -129,14 +171,19 @@ and every such mutation reads as coverage that does not exist.
 
 ### ReleaseFast, and what that costs
 
-The Debug suite takes 145 s and ReleaseFast 33 s on this machine. The difference is the suite
-executing, not compiling: a mutation invalidates one file either way. A Debug-only default is 39
-minutes for 16 mutations, which is a number nobody runs, and a default nobody runs measures nothing.
-ReleaseFast is also the mode the `train` binary ships in.
+The Debug suite and the ReleaseFast one are both timed by the two commands below, on this host
+with a warm build cache; a cold cache adds compilation to both and moves neither ratio.
+
+    zig build test                              # Debug: 161 s here
+    zig build test -Doptimize=ReleaseFast        # ReleaseFast: 7 s here
+
+The difference is the suite executing, not compiling: a mutation invalidates one file either way. A
+Debug-only default is 39 minutes for 16 mutations, which is a number nobody runs, and a default
+nobody runs measures nothing. ReleaseFast is also the mode the `train` binary ships in.
 
 The cost is real and is stated rather than hidden: a defect only Debug's safety checks trip is
-invisible to the default run, so Debug-only catches are not counted. All three survivors below were
-re-run through this same script with `MUTATION_MODE=debug` and all three survive Debug too, so on
+invisible to the default run, so Debug-only catches are not counted. Both survivors below were
+re-run through this same script with `MUTATION_MODE=debug` and both survive Debug too, so on
 this set the choice cost nothing measured. `MUTATION_MODE=verify` runs both configurations.
 
 ### Three verdicts, and a class for every survivor
@@ -145,13 +192,17 @@ this set the choice cost nothing measured. `MUTATION_MODE=verify` runs both conf
 badly written and nothing about the suite, so it is reported separately and never folded into the
 headline. `SURVIVED` is the rest, and each survivor is classified in the output rather than counted,
 because a survivor that is behaviourally identical is not a hole in the suite and one that moves the
-numbers is. At HEAD, 13 of 16 caught, by between 1 and 17 tests each:
+numbers is. At HEAD, 14 of 16 caught, by between 1 and 18 tests each:
 
 | Mutation | Class | What it means |
 |---|---|---|
-| `matmul-f64-acc` | **hole** | Not equivalent, and the divergence is measured rather than argued: reducing k weights at the init scale in f32 rather than f64 diverges by 5.1e-6 relative at k=64, 2.7e-5 at the ffn width of 256, and 1.2e-4 at k=4096. No matmul test here multiplies a tall and wide matrix, so the f32 accumulator in `tensor.zig` is an unverified choice rather than a tested one. |
 | `clip-ge` | **equivalent, provably** | The two differ only when the norm equals the limit exactly, where the scale is `max / norm = 1` exactly and every element is multiplied by `1.0`. A bit-for-bit identical run, not a close one. No test can ever catch it, and one that tried would assert nothing. |
 | `norm-reassociate` | **below the gates** | `v / rms * w` and `v * w / rms` differ only in rounding, and every assertion in the suite is looser than that rounding. Catching it means pinning one f32 rounding rather than the function. |
+
+`matmul-f64-acc` and `norm-f32-acc` were on that list and are not any more. Both are caught now, by
+one test each, so neither is a hole and neither is described here. A survivor table is a claim about
+the suite at one commit, and it is wrong the moment a test lands, which is why the numbers above are
+copied out of the harness's own output rather than kept in step by hand.
 
 ### Why it is a Zig program and not a sed line
 

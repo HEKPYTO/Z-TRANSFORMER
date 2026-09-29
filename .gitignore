@@ -3,11 +3,18 @@ zig-out/
 .worktrees/
 outputs/*.bin
 outputs/parity/
+outputs/loss.pending.csv
 venv-removed/
 __pycache__/
 samples/
 *.o
 *.obj
+
+# Binaries built ad hoc into the repo root by a debug recipe, rather than by
+# `zig build` which puts them under zig-out/. A tool that needs a Debug build of
+# `train` should add a `dbg-train` step instead of writing one here.
+zt-debug-train
+/ztransformer-*
 
 # AGENTS.md allows only README.md, LICENSE and CHANGELOG.md in the commit tree.
 docs/

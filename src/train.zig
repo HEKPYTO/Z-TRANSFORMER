@@ -166,7 +166,13 @@ pub fn run(
             var batch = (try batcher.next()) orelse break;
             defer batch.deinit();
 
-            var logits = try model.forward(allocator, params, cfg.model, batch.inputs);
+            // The one forward pass, handing its intermediates to the backward
+            // pass as they are produced. `model.forward` plus a backward that
+            // rebuilt the same tensors was two forwards per step, and the
+            // rebuild was the larger half of the step.
+            var cache = try autograd.Cache.init(allocator, params, cfg.model, batch.inputs);
+            defer cache.deinit();
+            var logits = try model.forwardWith(allocator, params, cfg.model, batch.inputs, &cache.sink);
             defer logits.deinit();
             const batch_loss = try loss.forward(logits, batch.targets);
             // Checked before the loss is used, not after. A non-finite loss is
@@ -179,7 +185,7 @@ pub fn run(
             epoch_loss_sum += batch_loss;
             var dlogits = try autograd.dLossDLogits(allocator, logits, batch.targets);
             defer dlogits.deinit();
-            try autograd.backward(allocator, params, &grads, cfg.model, batch.inputs, dlogits);
+            try autograd.backwardFrom(allocator, params, &grads, cfg.model, batch.inputs, dlogits, &cache);
 
             // One global norm over every tensor, so the cap is the whole model's
             // and not a per-tensor budget. The norm is checked but not logged:

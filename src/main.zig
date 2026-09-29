@@ -23,6 +23,17 @@ const scale = @import("scale.zig");
 
 const corpus_path = "data/tinyshakespeare.txt";
 const csv_path = "outputs/loss.csv";
+/// Where a run writes the curve before anyone knows whether it is the committed
+/// one. The digest this repository claims is checked by `zig build verify`, and a
+/// reader who cannot produce those bytes has found out something; whether the
+/// committed file survives that finding is the difference between a report and a
+/// lost artifact, so the run reports first and replaces second. Never committed,
+/// and `.gitignore` covers it: see `outputs/README.md`.
+const csv_pending_path = "outputs/loss.pending.csv";
+/// The digest the committed curve is claimed to have, from `build.zig`. Named
+/// here rather than only there so the message below can print the two sides of a
+/// mismatch without the reader leaving the terminal to run `shasum`.
+const csv_sha256 = "f1dd54445064810c28002dcacaf23b4bc82bb1e6ecfa28f5ed91e7fa4518f792";
 /// The 95/5 split `data/README.md` fixes, applied here because this is the only
 /// shipped caller of `data.split`.
 const val_fraction = 0.05;
@@ -126,17 +137,75 @@ fn runTrain(gpa: std.mem.Allocator, io: Io) !void {
     var res = try train.run(gpa, cfg, corpus.train, corpus.val);
     defer res.deinit();
 
-    try train.writeCsv(csv_path, res.rows);
+    // Written beside the committed curve and moved onto it only on a match. A
+    // run truncates its output, so writing `csv_path` directly replaced the
+    // committed artifact before anything had compared it, and a reader on a
+    // different libm or a different optimization level found a diff they could
+    // no longer tell from a change the repository had made.
+    try train.writeCsv(csv_pending_path, res.rows);
     var buffer: [256]u8 = undefined;
     var stdout: Io.File.Writer = .init(.stdout(), io, &buffer);
     const w = &stdout.interface;
-    try w.print("steps {d}\ntrain_loss {d:.4}\nval_loss {d:.4}\nwrote {s}\n", .{
+    // The three numbers, and nothing about the file. Whether the run's curve
+    // became the committed one is `settleCsv`'s to say, and a summary that
+    // claimed a file was written before that question was answered is how a
+    // mismatch ends up announced as a success.
+    try w.print("steps {d}\ntrain_loss {d:.4}\nval_loss {d:.4}\n", .{
         res.steps,
         res.train_loss,
         res.val_loss,
-        csv_path,
     });
     try w.flush();
+    try settleCsv(io);
+}
+
+/// Compares the curve just written against the digest the repository claims for
+/// it, and on a match renames it onto `csv_path`. The rename is unconditional
+/// rather than skipped, and it is the whole of the success path: the bytes are
+/// already the committed bytes, so this leaves the content identical and the
+/// pending file gone, which is what makes a reproducing run leave the tree as
+/// clean as it found it.
+///
+/// On a mismatch it does not replace anything and it does not fail. The run
+/// itself is what it is either way; only the question of which bytes are the
+/// committed ones is open, and a different answer there is not a broken build.
+/// `@exp`, `@sqrt` and `@cos` resolve to the platform libm, and Debug differs
+/// from release by about one f32 ulp per step, so a host or a build
+/// configuration that disagrees here has produced a legitimate run of its own.
+/// The pending file is kept so the reader can diff the two curves, and the
+/// message says which is which instead of printing a bare mismatch: the exit
+/// status stays 0, because failing it would report a host difference as a
+/// defect, and a gate that cries wolf is worse than no gate.
+fn settleCsv(io: Io) !void {
+    const dir = Io.Dir.cwd();
+    const fresh = try dir.readFileAlloc(io, csv_pending_path, std.heap.page_allocator, .unlimited);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(fresh, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+
+    if (std.mem.eql(u8, &hex, csv_sha256)) {
+        try dir.rename(csv_pending_path, dir, csv_path, io);
+        return;
+    }
+
+    std.debug.print(
+        \\
+        \\zig build train: this run did not reproduce the committed {s}.
+        \\  committed  {s}  sha256 {s}
+        \\  this run   {s}  sha256 {s}
+        \\
+        \\  Both files are intact and the run exited 0. They differ because the
+        \\  arithmetic is host- and configuration-dependent, not because anything
+        \\  here is wrong: @exp, @sqrt and @cos resolve to the platform libm, and
+        \\  Debug differs from release by about one f32 ulp per step. The
+        \\  criterion is one seed, one build configuration, one host; see the
+        \\  Reproducibility section of src/README.md.
+        \\
+        \\  To see whether the run itself is sound, diff the two curves. To accept
+        \\  this run as the new committed one, copy it over {s} and put its digest
+        \\  in build.zig; that is a change to the claim, so it is yours to make.
+        \\
+    , .{ csv_path, csv_path, csv_sha256, csv_pending_path, hex, csv_path });
 }
 
 /// `zig build scale-profile`. Projects what the code's own formulas imply at

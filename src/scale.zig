@@ -141,7 +141,7 @@ pub const Projection = struct {
 /// Projects one shape. Rejects a config `model.validate` would reject, so a row
 /// of the sweep cannot print a number for a model that would not build.
 pub fn project(shape: Shape) !Projection {
-    try validate(shape.cfg);
+    try model.validate(shape.cfg);
     const cfg = shape.cfg;
     const d: u64 = model.dModel(cfg);
     const h: u64 = model.ffnDim(cfg);
@@ -212,35 +212,24 @@ fn activationElems(cfg: model.Config) u64 {
 
     // logits and dlogits (train.zig:169,180), both [T, vocab]: 4.2 GB of f32
     // for one of them at T=8192, vocab=128256. At 32 layers that is 9% of this
-    // total, and the per-layer blocks below are 85%, so the number a reader
+    // total, and the per-layer blocks below are 90%, so the number a reader
     // arrives with is not the one that fills the machine.
     const head = 2 * t * cfg.vocab_size;
-    // The replay's block inputs and outputs (autograd.zig:147-171): the `xs`
-    // slice holds one [T, d] per layer boundary, so L + 1 of them.
-    const stream = (l + 1) * t * d;
-    // One `Block` per layer (autograd.zig:241): six [T, d] (`attn_in`, `q_pos`,
-    // `ctx`, `x_mid`, `mlp_in`, `ff`), two [T, kv] (`k_pos`, `v`) and three
+    // The cache's block input (autograd.zig, `Cache.init`): one [T, d]. It used
+    // to be a slice of L + 1 of them, one per layer boundary, but the stream a
+    // block starts from is now the previous block's `out` and is not held twice.
+    const stream = t * d;
+    // One `Block` per layer (`autograd.Cache`): six [T, d] (`attn_in`, `q_pos`,
+    // `ctx`, `x_mid`, `mlp_in`, `out`), two [T, kv] (`k_pos`, `v`) and three
     // [T, h] (`gate`, `up`, `a`).
     const blocks = l * t * (6 * d + 2 * kv + 3 * h);
     // `final_h`, `d_final_h`, `d_x` and the layer loop's `d_next`
-    // (autograd.zig:174,188,206,219), all [T, d], one `d_next` alive at a time.
+    // (autograd.zig, `backwardFrom`), all [T, d], one `d_next` alive at a time.
     const grads = 4 * t * d;
-    // `attentionBackward`'s dq, dk and dv (autograd.zig:501-505) plus its two
-    // f64 row buffers (autograd.zig:511-514), which are f32 elements' worth
-    // twice over.
+    // `attentionBackward`'s dq, dk and dv plus its two f64 row buffers, which
+    // are f32 elements' worth twice over.
     const attn_back = t * (d + 2 * kv) + 4 * t;
     return head + stream + blocks + grads + attn_back;
-}
-
-/// `model.validate` is private, so the checks the projections depend on are
-/// written out here rather than reaching for it. Only the ones a projection
-/// divides by or indexes are kept, and each is one line of `model.validate`.
-fn validate(cfg: model.Config) !void {
-    if (cfg.n_layers == 0) return error.InvalidConfig;
-    if (cfg.n_kv_heads == 0 or cfg.n_heads == 0 or cfg.head_dim == 0) return error.InvalidConfig;
-    if (cfg.n_heads % cfg.n_kv_heads != 0) return error.InvalidConfig;
-    if (cfg.head_dim % 2 != 0) return error.InvalidConfig;
-    if (cfg.n_ctx == 0 or cfg.vocab_size == 0 or cfg.ffn_mult == 0) return error.InvalidConfig;
 }
 
 /// Attention core over one layer's MLP. The two the deferral note compares.
@@ -399,9 +388,9 @@ pub fn print(w: *std.Io.Writer) std.Io.Writer.Error!void {
         \\
         \\params, grads and adam are the parameter, the gradient and the two
         \\AdamW moments, one f32 each per element. act is the peak of one
-        \\backward. At depth it is NOT the logits: autograd.backward's replay
-        \\keeps one eleven-tensor Block per layer, and that is 85% of the total
-        \\at 32 layers. The logits and dlogits are 9%.
+        \\backward. At depth it is NOT the logits: autograd's cache keeps one
+        \\eleven-tensor Block per layer, and that is 90% of the total at 32
+        \\layers. The logits and dlogits are 9%.
         \\scores is n_layers * n_heads * T * T * 4: the score matrix a DENSE
         \\attention would materialize. This one does not materialize it, it walks
         \\one f64 row of T at a time (n_heads * T * 8, under a megabyte in this
@@ -471,15 +460,15 @@ pub fn print(w: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  Dense score matrix over {d:.0} GiB of host: T = {d:.0} at the shipped
         \\  shape's heads and layers, T = {d:.0} at the 32-head 32-layer ones.
         \\
-        \\  The 116 s in README.md for ONE layer of the tied head at T=64, d=4096,
-        \\  vocab=128256 is a measurement this tool did not make. What is derived
-        \\  here is the {d:.1} GB it has to move and the {d:.2} GB/s that implies,
-        \\  and the reason it is slow is arithmetic intensity and not arithmetic:
-        \\  tiedHead (model.zig:339) does 2 * T * vocab * d operations over
-        \\  4 * T * vocab * d bytes, which is {d:.2} flop per byte with no reuse
-        \\  to find, while one MLP layer re-reads its 3 * d * h weights once for
-        \\  all T rows and so gets T / 2 = {d:.0} flop per byte. At T=64 that is
-        \\  {d:.0}x, which is the whole of the 116 s.
+        \\  Why the tied head is the expensive one is arithmetic intensity and
+        \\  not arithmetic, and it is readable from the two loops rather than
+        \\  from a stopwatch. tiedHead (model.zig:339) does 2 * T * vocab * d
+        \\  operations over 4 * T * vocab * d bytes, which is {d:.2} flop per
+        \\  byte with no reuse to find, while one MLP layer re-reads its
+        \\  3 * d * h weights once for all T rows and so gets T / 2 = {d:.0}
+        \\  flop per byte. At T=64 that is {d:.0}x. The {d:.1} GB it has to move
+        \\  at that shape, and the {d:.2} GB/s that implies, are derived here;
+        \\  no wall time is, because this tool projects rather than measures.
         \\
     , .{
         crossoverT(any.h, attention_bar),

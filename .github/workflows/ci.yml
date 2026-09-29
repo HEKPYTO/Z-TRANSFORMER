@@ -22,3 +22,31 @@ jobs:
           log=$(mktemp)
           zig build verify >"$log" 2>&1 || { cat "$log"; exit 1; }
           test ! -s "$log" || { echo "::error::zig build verify wrote $(wc -c <"$log") bytes on a passing run"; cat "$log"; exit 1; }
+
+  # The parity check is this repository's central claim and `verify` cannot
+  # reach it: the oracle is Python, and AGENTS.md forbids Python in the build
+  # graph. It is its own job because a headline claim checked only on one
+  # person's laptop is not a checked claim.
+  #
+  # The pins in tools/removed/requirements.txt are load-bearing: reference-library v5
+  # moved rope_theta into rope_parameters, so an unpinned install silently
+  # compares against theta=10000 and fails on RoPE while looking like a
+  # numerics bug. The oracle asserts the resolved theta independently.
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m venv venv-removed
+      - run: venv-removed/bin/pip install -r tools/removed/requirements.txt
+      - run: sh tools/removed/check.sh
+      # That the gates CAN fail is a different claim from that they pass, and it
+      # is the one that makes report.csv mean anything. A silent gate exits 0
+      # here, so a red run is a harness that has stopped checking.
+      - name: the parity gates can fail
+        run: sh tools/removed/sensitivity.sh

@@ -1,10 +1,10 @@
 # src
 
-Fourteen modules, plus the `main.zig` binary, `lib.zig` and the `tests.zig` root. 31 `.zig` files:
-3,316 lines outside the 16 `*_test.zig` files, 5,228 inside them.
+Fifteen modules, plus the `main.zig` binary, `lib.zig` and the `tests.zig` root. 33 `.zig` files:
+4,136 lines outside the 15 `*_test.zig` files, 6,062 inside them.
 
-    cat $(ls src/*.zig | grep -v _test) | wc -l    # 3316
-    cat src/*_test.zig | wc -l                    # 5228
+    cat $(ls src/*.zig | grep -v _test) | wc -l    # 4136
+    cat src/*_test.zig | wc -l                    # 6062
 
 Those two commands are the source of the two numbers, and they are the `cat` form on purpose.
 `wc -l src/*.zig | grep -v _test.zig | tail -1` looks equivalent and is not: `grep -v` filters
@@ -26,8 +26,8 @@ imported directly puts one file in two Zig modules, which the build refuses.
 One directory here is not Zig. `src/cuda/` holds the CUDA source and the container recipe that
 compiles and runs it, because `nvcc` cannot be installed on a GPU host without root, and the CUDA
 the distribution's NVIDIA repository ships is version-skewed against the one this repository targets.
-No `src/*.zig` file imports it and `build.zig` does not reference it yet, so the other 30 `.zig`
-files above are still the whole compiled surface, and their line counts have not moved. `sh
+No `src/*.zig` file imports it and `build.zig` does not reference it yet, so the 33 `.zig`
+files above are still the whole compiled surface. `sh
 src/cuda/run-probe.sh` compiles the probe and runs it on the local GPU; `src/cuda/README.md` says
 what that does and does not establish.
 
@@ -48,6 +48,7 @@ what that does and does not establish.
 | `norm.eps` | `pub const eps: f64 = 1e-5` | The additive epsilon, public because the gradient and the parity export are the same constant. `autograd.normBackward` differentiating a private copy of it would differentiate a different function than the forward pass evaluates, and no finite difference would catch it. |
 | `rope.forward` | `forward(allocator, x, pos, theta, head_dim) !Tensor` | Rotary embedding, Llama-3 half-split. Row `r` sits at `pos + r`. |
 | `mlp.forward` | `forward(allocator, x, w_gate, w_up, w_down) !Tensor` | SwiGLU feed-forward. |
+| `mlp.forwardWith` | `forwardWith(allocator, x, w_gate, w_up, w_down, ?*Sink, layer) !Tensor` | The same, handing `gate`, `up` and the gated activation to the sink. `forward` is this with a null sink. |
 | `mlp.silu` | `silu(z: f32) f32` | `z * sigmoid(z)`, safe in the negative tail. |
 | `attention.Config` | `{ n_heads, n_kv_heads, head_dim }` | Grouped-query shape. |
 | `attention.forward` | `forward(allocator, q, k, v, cfg) !Tensor` | Causal GQA, two passes over the scores. |
@@ -139,7 +140,7 @@ optimizer call.
 | `model.initParams` | `initParams(allocator, cfg, seed) !Params` | Deterministic from `seed`. |
 | `model.forward` | `forward(allocator, p, cfg, tokens) !Tensor` | Returns logits `[T, vocab]`. |
 | `model.forwardWith` | `forwardWith(allocator, p, cfg, tokens, ?*Sink) !Tensor` | The same pass, handing each intermediate to a `Sink`. `forward` is this with a null sink. |
-| `model.Name` | 14 values | Which intermediate a `Sink.put` call is about. |
+| `model.Name` | 17 values | Which intermediate a `Sink.put` call is about. |
 | `model.Sink` | `{ put }` | A callback, not a bag of pointers: the intermediates live in buffers the pass frees before it returns. |
 | `parity.run` | `run(allocator, io, s: Sweep) !Summary` | Writes the weights, intermediates, token ids and shape to `outputs/parity/`. |
 | `parity.runInto` | `runInto(allocator, io, out_dir, s: Sweep) !Summary` | `run` with the output directory as an argument. One caller overrides it: `removed_test.zig`, which would otherwise overwrite the sweep the Python oracle reads with a one-layer fixture. |
@@ -152,14 +153,14 @@ so no gradient reaches any of the 28 projection tensors or the embedding, and on
 move. Both PRNGs name `Xoshiro256` explicitly rather than reaching for `DefaultPrng`, whose stream
 Zig documents as an implementation choice rather than a guarantee.
 
-`model.Sink` exists for one caller, `parity.run`, and changes no arithmetic: the callback is the
-only thing the pass does that the arithmetic does not already do, so a null sink walks the same
-statements in the same order. It is a function pointer rather than a set of tensor pointers because
-the intermediates live in buffers the pass frees before it returns, and a pointer recorded during the
-pass would dangle by the time a reader got to it. The two tensors the design names and this cannot
-reach are the attention probabilities and the SwiGLU hidden state: `attention.forward` and
-`mlp.forward` reduce them internally and return only the result, so reaching either means changing
-those two files. `parity.run` writes raw little-endian f32 with a text index rather than
+`model.Sink` has two callers, `parity.run` and `autograd.Cache`, and changes no arithmetic: the
+callback is the only thing the pass does that the arithmetic does not already do, so a null sink walks
+the same statements in the same order, which `model_test.zig` asserts bit for bit. It is a function
+pointer rather than a set of tensor pointers because the intermediates live in buffers the pass frees
+before it returns, and a pointer recorded during the pass would dangle by the time a reader got to it.
+The one tensor the design names and this cannot reach is the attention probabilities:
+`attention.forward` reduces them internally and returns only the result, so reaching them means
+changing that file. `parity.run` writes raw little-endian f32 with a text index rather than
 safetensors, because the oracle never calls `from_pretrained` and there is one dtype and no mmap on
 either side. `tools/README.md` says what the harness checks and what it does not.
 
@@ -171,9 +172,11 @@ either side. `tools/README.md` says what the harness checks and what it does not
 | `autograd.Grads` | `{ tok_embed, layers, final_norm }` | Mirrors `model.Params`. Accumulates. |
 | `autograd.zeroGrads` | `zeroGrads(allocator, like: Params) !Grads` | Exact zeros, shaped like the parameters. |
 | `autograd.dLossDLogits` | `dLossDLogits(allocator, logits, targets) !Tensor` | `(softmax - onehot) / T`. |
-| `autograd.backward` | `backward(allocator, p, g, cfg, tokens, dlogits) !void` | Accumulates into `g`. Never zeroes it. |
+| `autograd.backward` | `backward(allocator, p, g, cfg, tokens, dlogits) !void` | Accumulates into `g`. Never zeroes it. Runs the forward pass itself. |
+| `autograd.backwardFrom` | `backwardFrom(allocator, p, g, cfg, tokens, dlogits, c: *const Cache) !void` | The same walk, over a forward pass that has already run. |
+| `autograd.Cache` | `{ init(allocator, p, cfg, tokens), deinit }`, holding a `model.Sink` | The eleven tensors per block the backward reads, plus the block input, copied out as the forward produces them. |
 | `gradcheck.Mismatch` | `{ layer: ?usize, field, index, analytic, numeric, diff, budget }` | One failing parameter element. |
-| `gradcheck.Report` | `{ allocator, groups, floor, mismatch }`, with `deinit` | The whole sweep, as data. |
+| `gradcheck.Report` | `{ allocator, groups, floor, headroom, mismatch }`, with `deinit` | The whole sweep, as data. `headroom` is `1 / max(diff / budget)`: the factor the budget could be multiplied by before the check would begin to fail. |
 | `gradcheck.compare` | `compare(allocator, cfg, p, tokens, targets, g) !Report` | Central differences, no printing, no tolerance argument. |
 | `gradcheck.line` | `line(allocator, m) ![]u8` | One diagnostic line for one mismatch. |
 | `gradcheck.report` | `report(w: *std.Io.Writer, r: Report) std.Io.Writer.Error!void` | Writes the table to the writer it is given. |
@@ -183,6 +186,19 @@ Gradients are hand-written per module, not produced by a tape. A tape would need
 become a graph node, which rewrites every numerics module and changes every signature they expose.
 Hand-written backward leaves those untouched and makes each gradient independently checkable. The
 cost is one backward function per forward function, and that cost is smaller than the rewrite.
+
+What a hand-written backward has instead of a tape is the question of where the forward's
+intermediates come from. They used to be rebuilt: `backward` replayed the whole forward a second time,
+layer by layer, which made a training step two forward passes and the larger of the two the one nobody
+counted. The sink was already there and already handed every intermediate over as it was produced, so
+`Cache` keeps them instead of recomputing them: `train.run` collects during the forward it was going to
+run anyway, and `backwardFrom` reads what it collected. The walk that is gone is one forward pass,
+which is a quarter of what the step runs: `zig build scale-profile` counts a layer's step as
+`3 * (attn_core + attn_proj + mlp)`, the forward once and each of the two backward products once
+more, so a backward that replays the forward runs four of those passes and the cached one runs three.
+`backward` is the same walk with the forward inlined, which is the shape a standalone gradient
+check wants, and the two are held to bit-identical gradients by a test — a tolerance would let a
+tensor one of them never filled read as agreeing.
 
 `checkAll` is silent when every parameter matches, and prints the full table plus a diagnostic line
 naming the parameter, index, analytic value, numeric value, difference and budget when one does not.
@@ -198,31 +214,82 @@ the real stderr.
 
     |analytic - numeric| <= budget
 
-where `budget` comes from `floorOf`, and nothing in it was picked:
+where `budget` comes from `floorOf`:
 
-- the loss is `(1 / T) * sum_t (logsumexp z[t] - z[t][target])`, so every `f32` logit carries a
-  representation error of at most `f32_epsilon` (2^-24) of itself, and the largest logit of the
-  three evaluations that element is differenced over bounds all of them;
-- the `T * vocab` of those roundings are independent, so they compose in quadrature as
-  `sqrt(T * vocab)` and not as a worst-case sum `T * vocab`. Summing is the case where every error
-  is maximal and in the same direction, and it overstates the resolvable precision by `sqrt(vocab)`;
-- the mean divides by `T`;
-- the difference of two losses carries that error, and the difference divides it by `2 * step`.
+    budget = sqrt(2) * k * f32_epsilon * logit_scale / (2 * step * sqrt(T)),   k = 12
 
-so `budget = sqrt(vocab / T) * f32_epsilon * logit_scale / (2 * step)`. It is read per element, off
-the largest of the three evaluations that element is differenced over, because a base point whose
-logits vanish still has a gradient and reading the scale off the base point alone would report a
-floor of zero there, which is not a resolution but a claim that `f32` resolved something it did not.
+The loss is `(1 / T) * sum_t (logsumexp z[t] - z[t][target])`, so every `f32` logit carries a
+representation error of at most `f32_epsilon` (2^-24) of itself, and the largest logit of the three
+evaluations that element is differenced over bounds all of them. Cauchy-Schwarz over those independent
+per-logit errors bounds the loss error at `eps * scale * sqrt(sum ((p_v - 1[v=tgt]) / T)^2) / T`, and
+the sum under that root is `T * vocab * E_v[(p - onehot)^2]`. For a near-uniform softmax `p_v ~
+1 / vocab`, so the per-token sum is `1 / vocab + (1 - 1 / vocab)^2 * (vocab - 1)`, which is
+independent of `vocab`, and the whole thing collapses to `eps * scale / sqrt(T)`. The two losses a
+difference is made of are separate evaluations, so their roundoffs add in quadrature: the `sqrt(2)`.
 
-Two limits are worth stating plainly. The derivation bounds the logit-representation term only, not
-the forward pass's own `f32` roundings, so the floor overstates the disagreement a correct gradient
-can have, by a wide margin rather than a close one: on the suite's one-layer fixture a clean sweep's
-largest gap comes in under a thousandth of the scale it is read against. And an element whose true
-gradient is far below the floor cannot be checked elementwise in `f32` at all; no derived budget can
-see it, and a chosen one that could would be a chosen one. The suite pins the floor's useful scale
-rather than a tolerance: it is under a tenth of one percent of the largest gradient in the model, so
-a one-percent error on that element is more than ten floors past the budget and a wrong gradient is
-named rather than absorbed.
+**There is no `sqrt(vocab)`.** An earlier version of this section had one, and it was wrong in both
+directions at once. The derivative `dL/dz_v = (p_v - 1[v=tgt]) / T` already carries the
+`1 / sqrt(vocab)` a near-uniform softmax imposes, so multiplying by `sqrt(vocab)` out here counts it
+twice. That single term made the budget roughly a thousand times looser than the discrepancy it was
+describing at `vocab 16` and 5.6% too tight at `vocab 256`, where a correct gradient on a
+grouped-query fixture was reported as a mismatch. A check that cries wolf on a correct gradient is
+worse than no check, because a maintainer learns to ignore the only instrument there is.
+
+`k` is where the derivation ends and measurement begins, and it is measured rather than chosen. Over
+550 sweeps (110 configs × 5 seeds, 2.2M elements) the largest per-element discrepancy ran 3.8 to 8.4
+sigma, and at one fixed config sigma itself swung 500 to 1000 across seeds. No config-only formula can
+be tight against a spread that depends on the weights, so `k` absorbs all of it. At `k = 12` the worst
+of those 550 sweeps sat at **0.651 of budget**, which bounds the observed worst case with 35% to
+spare; the same formula under the old one measured 2.02, failing 62 of the 550 sweeps outright.
+
+Three terms the derivation omits, and why:
+
+| Omitted | Why |
+|---|---|
+| Truncation, `h^2 / 6 * f'''` | Richardson on the real `f32` forward measures it near `1e-6` at `h = 1e-3`, three orders below the roundoff term. If a future shape makes the two comparable, add a term for truncation rather than widening `k`; `k` measures weight spread and widening it to cover a different error hides both. |
+| Gradient-path accumulation depth | Needs no term. At `d_model 32`, sweeping kv-group 1 to 4 over five draws, per-element sigma was flat with no trend. |
+| FMA contraction | Was carried until measured, and is not real. An earlier claim that Debug and Release differ by about one ulp from contraction was wrong: `ReleaseFast` and `ReleaseSafe` are bit-identical, so Zig is not contracting these loops and there is nothing to carry. The `Debug` vs release difference is real and its mechanism remains unestablished; see [Reproducibility](#reproducibility). |
+
+The budget is read per element, off the largest of the three evaluations that element is differenced
+over, because a base point whose logits vanish still has a gradient and reading the scale off the base
+point alone would report a budget of zero there, which is not a resolution but a claim that `f32`
+resolved something it did not.
+
+Two limits are worth stating plainly. An element whose true gradient is far below the budget cannot
+be checked elementwise in `f32` at all; no derived budget can see it, and a chosen one that could
+would be a chosen one. And a budget has to be bounded in both directions, which is what
+`Report.headroom` (`1 / max(diff / budget)`, the factor the whole budget could be multiplied by
+before the check would begin to fail) exists to make assertable: a wrong constant shows up as a
+`headroom` near 1, and a budget inflated to absurdity shows up as a `headroom` in the hundreds while
+`floor < gmax * 0.001` keeps failing. The suite pins both bounds rather than a tolerance, on a
+grouped-query fixture where the grouped path sums four `dk` terms per kv head, so a one-percent
+gradient error is named rather than absorbed.
+
+The `headroom` is asserted as a **band** around a measured value, `2.62 ± 0.35`, and the band is the
+fix rather than a retuned threshold. The assertion was a one-sided floor, `headroom > 1.5`, and a floor
+cannot catch a budget that has been loosened: weakening multiplies the budget, which divides
+`diff / budget`, which **raises** the headroom. The sweep at `k = 12` measures 2.6184, so a 1.5x
+weakening reports 3.93 and passes a 1.5 floor with room to spare — while raising the floor to 3.93 to
+catch it would report every correct gradient as a failure. The gate was pointed the wrong way, and
+could only ever have caught a budget that had been *tightened*.
+
+Both sides are now asserted against a measurement rather than a preference. The fixture is pinned —
+`liveParams` draws from the literal `0xbeef` — so the sweep is the same sweep every run, reading 2.6184
+in ReleaseFast and 2.6442 in Debug. The 0.35 tolerance is about 13%: an order of magnitude above the 1%
+spread between the two configurations, and an order of magnitude below the 51% a 1.5x weakening moves
+it by. A budget multiplied by `f` reports `2.6184 * f`, so the band catches any change beyond roughly
+0.87x to 1.13x in either direction.
+
+The 4000-draw study of the headroom under **redrawn** seeds, which runs 0.46 to 10.2, still governs
+`k` and is unaffected: `checkAll` runs on trained weights, which are arbitrary draws, and the 0.46 end
+is a correct gradient reported as a mismatch, so `k` is set from the worst draw rather than the median.
+What that distribution must not do is size an *assertion* about a pinned draw, because a bound loose
+enough to cover draws the test never takes is a bound that can no longer see `k` being changed at all.
+Deriving the budget so this spread does not reach a false mismatch would be a real improvement to
+`floorOf`; it is not what this is, and the two questions are now kept apart.
+
+The broken `sqrt(vocab / T)` budget that the original assertion was written against still fails: 0.88
+at this vocab and 0.62 at `vocab 16`, both outside the band.
 
 `compare` returns the table as data and takes the gradient tensor as a parameter, so a test can
 corrupt one element and assert on the returned `Mismatch` rather than scraping stderr. It also
@@ -244,7 +311,7 @@ README can quote it.
 | `scale.Shape` | `{ name, cfg }` | One row of the sweep. A real `model.Config`, so a row cannot claim a shape the model would refuse to build. |
 | `scale.sweep` | 7 rows | The shipped shape, then the same width at 1k and 4k context, then a 32-layer `d_model 4096` at 4k, 8k and 32k, then the row that sits on the crossover. |
 | `scale.project` | `project(Shape) !Projection` | Every term for one shape. Rejects a config `model.validate` rejects. |
-| `scale.Projection` | 20 fields | FLOPs per term, element counts for parameters, gradients, AdamW state and activations, and the four byte counts. |
+| `scale.Projection` | 18 fields | FLOPs per term, element counts for parameters, gradients, AdamW state and activations, and the four byte counts. |
 | `scale.coreOverMlp` | `coreOverMlp(Projection) f64` | The attention core against one layer's MLP. The number the fused-kernel deferral rests on. |
 | `scale.layerStep` | `layerStep(Projection) f64` | One layer's whole step: forward plus `weightGrad` and `inputGrad`, so three times the forward. |
 | `scale.tiedOverStep` | `tiedOverStep(Projection) f64` | The tied head against every layer's step plus itself. |
@@ -259,8 +326,14 @@ README can quote it.
 Three items were deferred on arithmetic asserted in prose. This is the arithmetic, and one of the
 three claims does not survive it.
 
-The tables below are copied from `zig build scale-profile`, not written here.
+The three tables below are quoted from `zig build scale-profile`, not written here, and the block
+between the two markers is checked against the tool's own output by `zig build verify`. The check is
+what makes the claim worth reading: a table that says it came from a tool and can drift from it is
+worse than no table, because the drift is invisible until a reader believes it. Re-copy the block
+from the tool when a `model.Config`, a tensor shape or the cache changes, and the gate fails until
+you do.
 
+<!-- scale-profile:begin -->
 ```
 ARITHMETIC, PROJECTED, GFLOP
 name              attn_core   attn_proj         mlp   tied_head weight_grad  core/mlp   core%   tied%
@@ -275,12 +348,12 @@ at-parity-12d      19791.61     4123.17    19791.21   154928.06    23914.38     
 BYTES, PROJECTED, GiB
 name               params     grads      adam       act      peak    scores   tied_GB  kv_cache
 shipped             0.001     0.001     0.002     0.003     0.007     0.004     0.125     0.000
-ctx-1k              0.001     0.001     0.002     0.013     0.017     0.063     0.500     0.002
-ctx-4k              0.001     0.001     0.002     0.050     0.054     1.000     2.000     0.008
-d4096-ctx4k         7.740     7.740    15.479    10.830    41.788    64.000  8016.000     1.000
-llama3-8b           7.740     7.740    15.479    21.660    52.618   256.000 16032.000     2.000
-llama3-8b-32k       7.740     7.740    15.479    86.641   117.599  4096.000 64128.000     8.000
-at-parity-12d       7.740     7.740    15.479   129.961   160.919  9216.000 96192.000    12.000
+ctx-1k              0.001     0.001     0.002     0.012     0.016     0.063     0.500     0.002
+ctx-4k              0.001     0.001     0.002     0.048     0.053     1.000     2.000     0.008
+d4096-ctx4k         7.740     7.740    15.479    10.330    41.288    64.000  8016.000     1.000
+llama3-8b           7.740     7.740    15.479    20.660    51.618   256.000 16032.000     2.000
+llama3-8b-32k       7.740     7.740    15.479    82.641   113.599  4096.000 64128.000     8.000
+at-parity-12d       7.740     7.740    15.479   123.961   154.919  9216.000 96192.000    12.000
 
 VERDICTS, one line per deferred item, at 32 GiB of host memory
 shape             fused_attn     kv_cache    tied_head   wgrad_swap  dense_scores
@@ -292,6 +365,7 @@ llama3-8b                 no           no          yes           no     over hos
 llama3-8b-32k            yes          yes          yes           no     over host
 at-parity-12d            yes          yes          yes           no     over host
 ```
+<!-- scale-profile:end -->
 
 **The `T > 6 * d` claim is wrong by a factor of two, and it is the deferral's own arithmetic.**
 `attention.forward` walks `0..t + 1` (attention.zig:54), so it computes half of a dense score
@@ -309,14 +383,33 @@ The three thresholds, as the tool prints them:
 |---|---|---|
 | Fused IO-aware attention | `T >= 3 * d` | `core/mlp >= 0.25`. No at the shipped shape (0.167) and no at 8B (0.167), yes at 32k (0.667). |
 | KV cache | `T >= 3 * d` | The same term, because the only thing a cache removes is the recompute of the quadratic part. It also costs 2 GiB at 8B and 12 GiB at the parity row. |
-| Tied-head restructure | `vocab >= 3 * d` | `tied / (3 * mlp) >= 0.25`. Yes at every row here, including the shipped one at 10.5% of the step. |
+| Tied-head restructure | `vocab >= 3 * d` | Landed, see below. `tied / (3 * mlp) >= 0.25` at every row here, including the shipped one at 10.5% of the step. |
 | `weightGrad` loop-order swap | never | Not a ratio. It reorders a fixed multiply-add count, so no shape improves it, and `matmul`, `weightGrad` and `inputGrad` already stream contiguous rows. |
 
-The tied head is the one that should not have waited. It is 10.5% of a step at the shipped shape
-and 5.6% at 8B, and the 116 s figure is not an arithmetic problem at all: `tiedHead` does
-`2 * T * vocab * d` operations over `4 * T * vocab * d` bytes, which is 0.5 flop per byte with no
-reuse in it, where one MLP layer re-reads its weights once for all `T` rows and gets `T / 2 = 32` at
-`T = 64`. That is a 64x gap and it is the whole of the 116 s.
+The tied head was the one that should not have waited, and it is the one that did not. It is 10.5% of a
+step at the shipped shape and 5.6% at 8B, and the reason is arithmetic intensity rather than an
+arithmetic count: `tiedHead` does `2 * T * vocab * d` operations over `4 * T * vocab * d` bytes,
+which is 0.5 flop per byte with no reuse in it, where one MLP layer re-reads its weights once for
+all `T` rows and gets `T / 2 = 32` at `T = 64`. That is a 64x gap, and it is arithmetic a reader can
+do off `model.zig:339` and `model.zig:376`; no timing is claimed for it here, because no command in
+this repository measures one and a wall time would outlive the shape it was taken at.
+
+Low intensity cannot be fixed by reducing traffic when there is no reuse to recover, so the lever
+is the other one: how fast the adds issue. One f64 accumulator per logit is a serial chain of `d`
+adds that cannot retire faster than the adder's latency. The vocab loop now runs eight rows at a
+time into eight accumulators. Eight is a choice and named as one: twelve and sixteen lanes were no
+better on this host, and the benchmark that says so is not one this repository ships, so the width
+is recorded as the plateau rather than as a measurement. Tiling the vocab loop and blocking over
+`d` are both absent, and the reason recorded at the time was the size of the table rather than its
+access pattern: at `vocab = 1024` the embedding table is 512 KiB.
+
+The output is unchanged, which is the whole reason this is a refactor and not a numeric change.
+Each accumulator sums a disjoint set of vocab rows and, within a row, still walks `i` ascending,
+so every logit is the same f32 narrowing of the same f64 sum. `outputs/loss.csv` still hashes to
+`f1dd5444...`. Reassociating the sum would be a different project with a different answer, and the
+f64 accumulator is not negotiable here: it is the tied head that the softmax in `loss.forward` then
+exponentiates. The tied-head *backward* in `autograd` is a separate loop, and was left alone for
+the same reason this section's first paragraph gives for the shape: it is intensity, not count.
 
 ## Tokenizer
 
@@ -336,7 +429,7 @@ memory on every run, so there is nothing to persist and nothing to keep in step 
 
 One test file per module, collected by `comptime` blocks in `tests.zig`. Zig has no test globbing,
 so a new test file is inert until it is named there, and nothing fails when a name goes missing.
-`tests.zig` is 72 lines and holds 3 tests of its own, the third being the guard that closes that gap:
+`tests.zig` is 73 lines and holds 3 tests of its own, the third being the guard that closes that gap:
 Zig 0.16 has no comptime filesystem, so it walks `src/` at test time against its own source embedded
 with `@embedFile`, and fails with `error.TestUnreferencedTestFile` on any `*_test.zig` the blocks
 above do not name. It is a test rather than a compile error, which means a cached run can skip it, so
@@ -389,7 +482,9 @@ harmless over a hundred steps and unbounded over ten thousand, so the training c
 per build configuration.
 
 The mechanism was attributed to fused multiply-add in the element-wise accumulation loops, and that
-attribution was wrong. Each of those loops was extracted and compiled both ways at a size that
+attribution was wrong on a second count too: `ReleaseFast` and `ReleaseSafe` are bit-identical, so
+Zig is not contracting `a * b + c` in these loops at all, and there is no contraction term for the
+gradcheck budget to carry. Each of those loops was extracted and compiled both ways at a size that
 shows the difference: `matmul`, `weightGrad` and `inputGrad` are bit-identical between Debug and
 ReleaseFast. At full model scale the only tensors that move at all are `w_gate` and `w_down` in
 layer 0; the forward pass, `tok_embed`, `wq`, `wk`, `attn_norm` and `final_norm` are all

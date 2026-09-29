@@ -1,4 +1,20 @@
 const std = @import("std");
+
+/// Tolerance for a value that came out of `@log`.
+///
+/// `loss.forward` reaches the natural log through `std.math.log(f64, e, x)`,
+/// which resolves to `@log` and therefore to the platform libm. Bit-exact
+/// comparison against a literal ln(V) passes on the machine that wrote the
+/// literal and fails on any machine whose libm differs in the last ulp -- a
+/// green run on a Linux CI, a red suite on the maintainer's Mac, and an error
+/// message that names a number rather than a libm. `src/README.md` states this
+/// hazard for the whole repository, and these three assertions were it.
+///
+/// The bound is 8 ulp of f64, which is far below the f32 epsilon the loss is
+/// stored at and so cannot weaken what the test is actually checking: that the
+/// mean cross entropy of a uniform row is the natural log of the vocabulary.
+/// Change the base and it still fails by orders of magnitude more.
+const ln_ulp: f64 = 8 * std.math.floatEps(f64);
 const loss = @import("loss.zig");
 const Tensor = @import("tensor.zig").Tensor;
 
@@ -13,7 +29,7 @@ test "cross entropy of uniform logits is exactly ln of the vocabulary" {
 
     const got = try loss.forward(logits, &targets);
 
-    try std.testing.expectEqual(1.3862943611198906, got);
+    try std.testing.expectApproxEqAbs(1.3862943611198906, got, ln_ulp);
 }
 
 test "cross entropy is logsumexp minus the target logit" {
@@ -51,7 +67,7 @@ test "cross entropy averages over rows instead of summing them" {
 
     const got = try loss.forward(logits, &targets);
 
-    try std.testing.expectEqual(0.6931471805599453, got);
+    try std.testing.expectApproxEqAbs(0.6931471805599453, got, ln_ulp);
 }
 
 test "cross entropy rejects a target count that disagrees with the row count" {
@@ -92,7 +108,7 @@ test "raising the target logit lowers the loss" {
     const targets = [_]u32{0};
 
     const before = try loss.forward(logits, &targets);
-    try std.testing.expectEqual(1.0986122886681098, before); // ln(3), all logits zero
+    try std.testing.expectApproxEqAbs(1.0986122886681098, before, ln_ulp); // ln(3), all logits zero
     logits.set(0, 0, 1);
     const after = try loss.forward(logits, &targets);
 

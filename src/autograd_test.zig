@@ -30,10 +30,14 @@ pub const tiny = model.Config{
 /// obvious way to cover grouped-query attention in this fixture and it was
 /// tried: at this size the derived budget cannot pay for it. A shared kv head
 /// doubles the terms behind every `dk` and `dv`, the finite difference carries
-/// that as noise, and `tok_embed[30]` came out 4.6% over budget in ReleaseFast
-/// — a CORRECT gradient reported as a mismatch, which is worse than no coverage
-/// because it teaches a maintainer to ignore the suite. The grouped path is
-/// covered by its own test at a size where the budget has headroom.
+/// that as noise, and a correct gradient came out over budget in ReleaseFast —
+/// a CORRECT gradient reported as a mismatch, which is worse than no coverage
+/// because it teaches a maintainer to ignore the suite. Two things have changed
+/// since: `gradcheck` now derives its budget from the loss roundoff instead of
+/// counting a `sqrt(vocab)` the softmax already carries, and the grouped path is
+/// covered by its own test at a shape with headroom. The reason this fixture
+/// still avoids grouping is unchanged: a shared fixture is used by tests tuned
+/// around it, and changing it under them is a worse trade than a dedicated one.
 const two_layers = model.Config{
     .n_layers = 2,
     .n_heads = 2,
@@ -132,6 +136,37 @@ fn expectDiffers(a: []const f32, b: []const f32) !void {
     }
     std.debug.print("\nall {d} elements were bit identical, expected a difference\n", .{a.len});
     return error.TestUnexpectedResult;
+}
+
+/// Every gradient buffer in a fixed order, compared as bits.
+///
+/// A tolerance would be the wrong instrument here. Two backward passes that
+/// each dropped a different tensor would still agree on every element they
+/// both wrote, and a tensor one of them never wrote at all reads as agreeing,
+/// so the only way this catches a lost term is to demand the same bits
+/// everywhere.
+fn expectSameGrads(want: autograd.Grads, got: autograd.Grads) !void {
+    try expectSameTensors(
+        &.{ want.tok_embed, want.final_norm },
+        &.{ got.tok_embed, got.final_norm },
+    );
+    try std.testing.expectEqual(want.layers.len, got.layers.len);
+    for (want.layers, got.layers) |x, y| {
+        try expectSameTensors(
+            &.{ x.attn_norm, x.wq, x.wk, x.wv, x.wo, x.mlp_norm, x.w_gate, x.w_up, x.w_down },
+            &.{ y.attn_norm, y.wq, y.wk, y.wv, y.wo, y.mlp_norm, y.w_gate, y.w_up, y.w_down },
+        );
+    }
+}
+
+fn expectSameTensors(want: []const Tensor, got: []const Tensor) !void {
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |x, y| {
+        try std.testing.expectEqual(x.data.len, y.data.len);
+        for (x.data, y.data) |a, b| {
+            try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
+        }
+    }
 }
 
 test "autograd: gradcheck every parameter element on the tiny config" {
@@ -598,9 +633,37 @@ test "autograd: a full forward, backward and deinit leaks nothing" {
     try std.testing.expectError(error.TokenOutOfRange, lossAndGrads(std.testing.allocator, two_layers, p, &.{ 0, 1, tiny.vocab_size }, tgt, &g));
 }
 
+test "autograd: the collected forward and the self-contained one give the same gradient" {
+    // The two entry points exist so a training step runs its forward once and a
+    // gradient check runs its own. They must not be two backward passes: this
+    // is what says the refactor moved work rather than changing arithmetic, and
+    // what a missing tensor out of the collector would break.
+    var p = try liveParams(std.testing.allocator, two_layers);
+    defer p.deinit();
+    var standalone = try autograd.zeroGrads(std.testing.allocator, p);
+    defer standalone.deinit();
+    var collected = try autograd.zeroGrads(std.testing.allocator, p);
+    defer collected.deinit();
+    var dl = try dlogitsOf(std.testing.allocator, two_layers, p, tok, tgt);
+    defer dl.deinit();
+
+    // The path `train.run` takes: one forward, its intermediates copied out as
+    // they are produced, and no second pass.
+    var cache = try autograd.Cache.init(std.testing.allocator, p, two_layers, tok);
+    defer cache.deinit();
+    var logits = try model.forwardWith(std.testing.allocator, p, two_layers, tok, &cache.sink);
+    defer logits.deinit();
+    try autograd.backwardFrom(std.testing.allocator, p, &collected, two_layers, tok, dl, &cache);
+
+    // The path `gradcheck` takes: a forward the caller never sees.
+    try autograd.backward(std.testing.allocator, p, &standalone, two_layers, tok, dl);
+
+    try expectSameGrads(standalone, collected);
+}
+
 test "autograd: every allocation point on the loss to gradient path unwinds to nothing" {
-    // backward allocates the layer inputs it replays, a block of eleven tensors
-    // per layer twice over, and a scratch tensor per gradient. An unwind that
+    // The cache allocates a block of eleven tensors per layer plus the
+    // embedding, and the backward a scratch tensor per gradient. An unwind that
     // misses one of them leaks on every failing path, and only testing.allocator
     // can see it, so every allocation point is induced to fail in turn.
     var p = try liveParams(std.testing.allocator, two_layers);
@@ -608,6 +671,44 @@ test "autograd: every allocation point on the loss to gradient path unwinds to n
     var g = try autograd.zeroGrads(std.testing.allocator, p);
     defer g.deinit();
     try std.testing.checkAllAllocationFailures(std.testing.allocator, lossAndGradsVoid, .{ two_layers, p, tok, tgt, &g });
+    // And the same for the path `train.run` takes, which allocates the cache
+    // before the forward rather than inside the backward.
+    var cache = try autograd.Cache.init(std.testing.allocator, p, two_layers, tok);
+    defer cache.deinit();
+    var logits = try model.forwardWith(std.testing.allocator, p, two_layers, tok, &cache.sink);
+    defer logits.deinit();
+    var dl = try autograd.dLossDLogits(std.testing.allocator, logits, tgt);
+    defer dl.deinit();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, backwardFromVoid, .{ p, two_layers, tok, dl, &cache, &g });
+    // The cache itself, which is built before the forward pass has looked at
+    // anything: a sweep over its own allocation sites, and the corrupt id that
+    // `embed` would otherwise read tok_embed with unchecked.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cacheInitVoid, .{ p, two_layers, tok });
+    try std.testing.expectError(error.TokenOutOfRange, cacheInitVoid(std.testing.allocator, p, two_layers, &.{ 0, 1, two_layers.vocab_size }));
+}
+
+fn backwardFromVoid(
+    allocator: std.mem.Allocator,
+    p: model.Params,
+    cfg: model.Config,
+    tokens: []const u32,
+    dl: Tensor,
+    cache: *const autograd.Cache,
+    g: *autograd.Grads,
+) !void {
+    try autograd.backwardFrom(allocator, p, g, cfg, tokens, dl, cache);
+}
+
+/// Forward, collect, backward: the path `train.run` takes, and the one whose
+/// allocation sites the `Cache` unwind owns.
+fn cacheInitVoid(allocator: std.mem.Allocator, p: model.Params, cfg: model.Config, tokens: []const u32) !void {
+    var cache = try autograd.Cache.init(allocator, p, cfg, tokens);
+    defer cache.deinit();
+    // Named rather than discarded: the pass returns an owned tensor, and on the
+    // one sweep that is allowed to succeed an un-freed logits is a leak this
+    // test would otherwise be reporting on itself.
+    var logits = try model.forwardWith(allocator, p, cfg, tokens, &cache.sink);
+    defer logits.deinit();
 }
 
 fn lossAndGradsVoid(
@@ -630,7 +731,7 @@ test "autograd: gradcheck covers grouped-query attention" {
     // The shape is larger than `two_layers` on purpose. Grouping adds a second
     // term to every dk and dv, and the gradcheck budget is derived from f32 logit
     // representation error, which does not grow with it. On the tiny fixture that
-    // imbalance is fatal — a correct gradient read 4.6% over budget in
+    // imbalance is fatal — a correct gradient read as a mismatch,
     // ReleaseFast. Widening the model moves the signal away from the roundoff the
     // budget describes, so the same comparison has headroom to be meaningful.
     const gqa = model.Config{

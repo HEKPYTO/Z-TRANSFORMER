@@ -115,6 +115,12 @@ pub fn dLossDLogits(allocator: std.mem.Allocator, logits: Tensor, targets: []con
 /// The walk is the forward pass in reverse:
 ///     tied head, final norm, then each block from the last layer to the first,
 ///     and finally the scatter into the embedding table.
+///
+/// This runs the forward pass itself and throws the logits away. A caller that
+/// already has them, which is every training step, wants `backwardFrom` and a
+/// `Cache` instead: the two then share the whole of `backwardFrom`, and the
+/// only thing this adds is the one forward a standalone gradient check has to
+/// run anyway.
 pub fn backward(
     allocator: std.mem.Allocator,
     p: model.Params,
@@ -123,53 +129,36 @@ pub fn backward(
     tokens: []const u32,
     dlogits: Tensor,
 ) !void {
+    try check(p, g, cfg, tokens, dlogits);
+    var cache = try Cache.init(allocator, p, cfg, tokens);
+    defer cache.deinit();
+    var logits = try model.forwardWith(allocator, p, cfg, tokens, &cache.sink);
+    defer logits.deinit();
+    try backwardFrom(allocator, p, g, cfg, tokens, dlogits, &cache);
+}
+
+/// `backward`, over a forward pass that has already run and been collected into
+/// `c` by its caller.
+///
+/// The signature is the honest cost of not running the forward twice: a
+/// training step computes the logits for the loss and the intermediates for the
+/// gradients in one pass, and there is no way to hand the second set to
+/// `backward` without either recomputing them or passing them in. Everything
+/// after the validation is the same code the six-argument form runs.
+pub fn backwardFrom(
+    allocator: std.mem.Allocator,
+    p: model.Params,
+    g: *Grads,
+    cfg: model.Config,
+    tokens: []const u32,
+    dlogits: Tensor,
+    c: *const Cache,
+) !void {
+    try check(p, g, cfg, tokens, dlogits);
     const t_count = tokens.len;
-    if (t_count == 0) return error.EmptyBatch;
-    if (t_count > cfg.n_ctx) return error.SequenceTooLong;
-    if (dlogits.rows != t_count or dlogits.cols != cfg.vocab_size) return error.DimensionMismatch;
-    if (g.layers.len != p.layers.len) return error.DimensionMismatch;
-    // The token index is a trust boundary: the embedding scatter at the bottom
-    // of this function reads it with no bounds check of its own.
-    for (tokens) |tok| {
-        if (@as(usize, tok) >= cfg.vocab_size) return error.TokenOutOfRange;
-    }
-
     const d = model.dModel(cfg);
-    if (p.tok_embed.rows != cfg.vocab_size or p.tok_embed.cols != d) return error.DimensionMismatch;
-
-    // Replay the forward, keeping every block's intermediates. A tape would keep
-    // each op's output separately, which is a wider set than the eleven tensors
-    // `blockBackward` actually reads, so the replay keeps a `Block` per layer
-    // instead. They are built once and the second loop below consumes them, so
-    // the values the loss was built from are the values the gradients are
-    // differentiated from. At the shipped shape that is 9.5 MiB, which is the
-    // one place the hand-written decision shows up in the memory profile.
-    var xs = try allocator.alloc(Tensor, p.layers.len + 1);
-    defer allocator.free(xs);
-    var kept: usize = 0;
-    defer {
-        for (xs[0..kept]) |*one| one.deinit();
-    }
-    var blocks = try allocator.alloc(Block, p.layers.len);
-    defer allocator.free(blocks);
-    var built: usize = 0;
-    defer {
-        for (blocks[0..built]) |*one| one.deinit();
-    }
-    xs[0] = try embed(allocator, p, tokens, d);
-    kept = 1;
-    for (p.layers) |l| {
-        // Stored before the residual add, so a failed add unwinds the block that
-        // exists rather than leaking it or half-freeing it.
-        blocks[built] = try blockForward(allocator, l, xs[kept - 1], cfg);
-        built += 1;
-        // x_out = x_mid + ff, and x_mid already carries the attention branch.
-        // Adding ff to the block input instead would drop that branch from the
-        // stream every layer after the first.
-        xs[kept] = try residual(allocator, blocks[built - 1].x_mid, blocks[built - 1].ff);
-        kept += 1;
-    }
-    const stream = xs[kept - 1];
+    if (c.blocks.len != p.layers.len) return error.DimensionMismatch;
+    const stream = c.blocks[c.blocks.len - 1].out;
 
     var d_final_h = try Tensor.init(allocator, t_count, d);
     defer d_final_h.deinit();
@@ -207,9 +196,7 @@ pub fn backward(
     defer d_x.deinit();
     normBackward(stream, p.final_norm, d_final_h, &g.final_norm, &d_x);
 
-    // Each block, last to first, on the intermediates the replay above already
-    // built. Recomputing them here would be a second forward per block and a
-    // backward that costs more than the forward it differentiates.
+    // Each block, last to first, on the intermediates the forward already built.
     var layer = p.layers.len;
     while (layer > 0) {
         layer -= 1;
@@ -218,7 +205,7 @@ pub fn backward(
         // the scatter at the bottom of this function.
         var d_next = try Tensor.init(allocator, t_count, d);
         defer d_next.deinit();
-        try blockBackward(&d_next, p.layers[layer], &g.layers[layer], blocks[layer], xs[layer], d_x, cfg);
+        try blockBackward(&d_next, p.layers[layer], &g.layers[layer], c.blocks[layer], c.xIn(layer), d_x, cfg);
         const spare = d_x;
         d_x = d_next;
         d_next = spare;
@@ -233,11 +220,14 @@ pub fn backward(
     }
 }
 
-/// The eleven tensors one block's backward pass reads. `model.forward` builds
-/// the same values in the same order and frees them again; this struct exists
-/// because a hand-written backward has no tape to hang them on, so it rebuilds
-/// them from the block input and keeps them, one per layer, for the second loop
-/// in `backward` to read.
+/// Everything `backwardFrom` needs that only the forward pass knows.
+///
+/// The eleven tensors one block's backward pass reads, plus the block's output.
+/// A tape would keep each op's output separately, which is a wider set than
+/// these twelve, so this holds one `Block` per layer instead. They are the
+/// values the loss was built from, which is the point: the backward
+/// differentiates the forward that actually ran rather than a second one built
+/// to look like it.
 const Block = struct {
     attn_in: Tensor, // norm(x_in, attn_norm)          [T, d]
     q_pos: Tensor, // rope(x_in @ wq)                   [T, d]
@@ -249,7 +239,7 @@ const Block = struct {
     gate: Tensor, // mlp_in @ w_gate                    [T, h]
     up: Tensor, // mlp_in @ w_up                        [T, h]
     a: Tensor, // silu(gate) * up                       [T, h]
-    ff: Tensor, // a @ w_down                           [T, d]
+    out: Tensor, // x_mid + a @ w_down                   [T, d]
 
     pub fn deinit(self: *Block) void {
         self.attn_in.deinit();
@@ -262,25 +252,169 @@ const Block = struct {
         self.gate.deinit();
         self.up.deinit();
         self.a.deinit();
-        self.ff.deinit();
+        self.out.deinit();
     }
 };
 
-/// The forward half of one pre-norm block, in the order `model.forward` runs
-/// it, so the backward below reads the same values the loss was built from.
-fn blockForward(allocator: std.mem.Allocator, l: model.Layer, x: Tensor, cfg: model.Config) !Block {
-    const t: [11]Tensor = blk: {
-        var built: [11]Tensor = undefined;
-        // A struct literal that fails part way through is never assigned, so an
-        // errdefer on the result would never fire. The unwind walks the prefix
-        // that exists instead.
-        var n: usize = 0;
-        errdefer for (built[0..n]) |*one| one.deinit();
-        while (n < built.len) : (n += 1) {
-            built[n] = try buildStep(allocator, l, x, cfg, built[0..n], n);
+/// The twelve tensors one block's forward produced, copied out as it produces
+/// them, and the first block's input.
+///
+/// Every buffer is allocated up front, in `init`, and `put` only copies into
+/// them. That is what lets `model.Sink.put` return `void`: an allocation inside
+/// the callback would have to be parked in an error field and checked by the
+/// caller, which is the shape `src/removed.zig` needs because it is writing to
+/// an append-only list and this is not because the shapes are all known before
+/// the pass starts.
+///
+/// The pass frees its own buffers as it goes, so the copy is not optional:
+/// `residual1` of one layer and the next layer's input are the same two
+/// ping-ponged buffers, and `gate` dies before `mlp_out` is even written.
+pub const Cache = struct {
+    /// x[t] = tok_embed[tokens[t]], the first block's input. Copied rather than
+    /// emitted, because the embedding is one row memcpy per token and the sink
+    /// names are there for tensors only a block can produce.
+    embed: Tensor,
+    blocks: []Block,
+    sink: model.Sink = .{ .put = put },
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        p: model.Params,
+        cfg: model.Config,
+        tokens: []const u32,
+    ) !Cache {
+        if (tokens.len == 0) return error.EmptyBatch;
+        // `embed` below reads tok_embed by token id with no bounds check of its
+        // own, and a training step builds the cache before anything has looked
+        // at the ids. The check has to live here, at the boundary the untrusted
+        // slice first reaches, rather than in the backward pass that used to
+        // make it before doing anything else.
+        for (tokens) |tok| {
+            if (@as(usize, tok) >= cfg.vocab_size) return error.TokenOutOfRange;
         }
-        break :blk built;
+        const blocks = try allocator.alloc(Block, p.layers.len);
+        var built: usize = 0;
+        errdefer {
+            for (blocks[0..built]) |*one| one.deinit();
+            allocator.free(blocks);
+        }
+        while (built < blocks.len) : (built += 1) {
+            blocks[built] = try initBlock(allocator, cfg, tokens.len);
+        }
+        return .{
+            .embed = try embed(allocator, p, tokens, model.dModel(cfg)),
+            .blocks = blocks,
+        };
+    }
+
+    pub fn deinit(self: *Cache) void {
+        // Reading the allocator back off a tensor is how the slice is released
+        // without Cache carrying a second source of truth, the trade
+        // `model.Params` and `Grads` already make.
+        const allocator = self.embed.allocator;
+        for (self.blocks) |*one| one.deinit();
+        allocator.free(self.blocks);
+        self.blocks = &.{};
+        self.embed.deinit();
+    }
+
+    /// The stream a block starts from, which is the block before it's output.
+    /// Carried as a field of the previous block rather than in an array of its
+    /// own, so the same tensor is not held twice.
+    fn xIn(self: *const Cache, layer: usize) Tensor {
+        return if (layer == 0) self.embed else self.blocks[layer - 1].out;
+    }
+
+    /// `model.Sink.put` takes the sink as its own first argument so a caller
+    /// does not have to carry a context pointer beside it, which is what makes
+    /// `@fieldParentPtr` how the cache gets back to its own fields.
+    fn put(sink: *model.Sink, name: model.Name, layer: usize, t: Tensor) void {
+        const self: *Cache = @fieldParentPtr("sink", sink);
+        // `model.forwardWith` has already refused a parameter set whose depth
+        // disagrees with the config by the time anything reaches here, so the
+        // index cannot be out of range on any path that runs.
+        const b = &self.blocks[layer];
+        switch (name) {
+            .attn_norm_out => copyInto(b.attn_in, t),
+            .q_rope => copyInto(b.q_pos, t),
+            .k_rope => copyInto(b.k_pos, t),
+            .v => copyInto(b.v, t),
+            .attn_ctx => copyInto(b.ctx, t),
+            .residual1 => copyInto(b.x_mid, t),
+            .mlp_norm_out => copyInto(b.mlp_in, t),
+            .mlp_gate => copyInto(b.gate, t),
+            .mlp_up => copyInto(b.up, t),
+            .mlp_hidden => copyInto(b.a, t),
+            .residual2 => copyInto(b.out, t),
+            // Exhaustively listed rather than collapsed into `else => {}`. The
+            // catch-all was a silent data-loss path across a four-file seam: add
+            // a `model.Name` and this arm swallows the new tensor without
+            // complaint, the gradient comes out wrong, and nothing fails.
+            // Worse, the test that should have caught it derived its expected
+            // count from the same enum the omission lives behind, so it passes
+            // too. A name with no case here is now a compile error, which is
+            // the only version of this failure that cannot be shipped.
+            //
+            // These six are emitted but deliberately not stored:
+            //   `q`, `k`       the projections RoPE consumes; the backward reads
+            //                  the rotated pair, which is `q_rope`/`k_rope`.
+            //   `attn_proj`    the attention output after `wo`, which is `x_mid`
+            //                  minus the block input. The backward gets d_wo from
+            //                  `ctx` and rebuilds the sum, so storing the
+            //                  projection would be 512 KB per layer of nothing.
+            //   `mlp_out`      the feed-forward before the second residual add;
+            //                  the backward reads the sum, which is `residual2`.
+            //   `final_norm`   the model's, not any layer's.
+            //   `logits`       likewise; `dLossDLogits` is the backward's entry
+            //                  point rather than a stored intermediate.
+            .q,
+            .k,
+            .attn_proj,
+            .mlp_out,
+            .final_norm,
+            .logits,
+            => {},
+        }
+    }
+};
+
+/// `dst` is the same shape as `src` because `initBlock` sized it from the same
+/// config the pass that fills it was built from, so a difference here is an
+/// internal invariant that broke rather than a caller that lied.
+fn copyInto(dst: Tensor, src: Tensor) void {
+    std.debug.assert(dst.data.len == src.data.len);
+    @memcpy(dst.data, src.data);
+}
+
+fn initBlock(allocator: std.mem.Allocator, cfg: model.Config, t_count: usize) !Block {
+    const d = model.dModel(cfg);
+    const kv = cfg.n_kv_heads * cfg.head_dim;
+    const h = model.ffnDim(cfg);
+    // Field order, the same eleven the struct declares, so a shape and the
+    // field it belongs to sit side by side.
+    const shapes = [11][2]usize{
+        .{ t_count, d }, // attn_in
+        .{ t_count, d }, // q_pos
+        .{ t_count, kv }, // k_pos
+        .{ t_count, kv }, // v
+        .{ t_count, d }, // ctx
+        .{ t_count, d }, // x_mid
+        .{ t_count, d }, // mlp_in
+        .{ t_count, h }, // gate
+        .{ t_count, h }, // up
+        .{ t_count, h }, // a
+        .{ t_count, d }, // out
     };
+    // The tensors land in an array first, not straight into a `Block` literal.
+    // A literal that fails part way through is never assigned at all, so an
+    // errdefer on it would never be registered and every tensor drawn before
+    // the failure would leak. Here the unwind frees the prefix that exists.
+    var t: [11]Tensor = undefined;
+    var n: usize = 0;
+    errdefer for (t[0..n]) |*one| one.deinit();
+    while (n < t.len) : (n += 1) {
+        t[n] = try Tensor.init(allocator, shapes[n][0], shapes[n][1]);
+    }
     return .{
         .attn_in = t[0],
         .q_pos = t[1],
@@ -292,51 +426,31 @@ fn blockForward(allocator: std.mem.Allocator, l: model.Layer, x: Tensor, cfg: mo
         .gate = t[7],
         .up = t[8],
         .a = t[9],
-        .ff = t[10],
+        .out = t[10],
     };
 }
 
-fn buildStep(
-    allocator: std.mem.Allocator,
-    l: model.Layer,
-    x: Tensor,
+/// The shape and token checks both entry points make, in the order that decides
+/// which error a caller sees. Shared so the six-argument form and the seven-
+/// argument one cannot disagree about what is a valid request.
+fn check(
+    p: model.Params,
+    g: *const Grads,
     cfg: model.Config,
-    t: []Tensor,
-    n: usize,
-) !Tensor {
-    return switch (n) {
-        0 => norm.forward(allocator, x, l.attn_norm),
-        1 => blk: {
-            var q = try tensor.matmul(t[0], l.wq);
-            defer q.deinit();
-            break :blk try rope.forward(allocator, q, 0, rope_theta, cfg.head_dim);
-        },
-        2 => blk: {
-            var k = try tensor.matmul(t[0], l.wk);
-            defer k.deinit();
-            break :blk try rope.forward(allocator, k, 0, rope_theta, cfg.head_dim);
-        },
-        3 => tensor.matmul(t[0], l.wv),
-        4 => attention.forward(allocator, t[1], t[2], t[3], .{
-            .n_heads = cfg.n_heads,
-            .n_kv_heads = cfg.n_kv_heads,
-            .head_dim = cfg.head_dim,
-        }),
-        5 => blk: {
-            var proj = try tensor.matmul(t[4], l.wo);
-            defer proj.deinit();
-            break :blk try residual(allocator, x, proj);
-        },
-        6 => norm.forward(allocator, t[5], l.mlp_norm),
-        7 => tensor.matmul(t[6], l.w_gate),
-        8 => tensor.matmul(t[6], l.w_up),
-        9 => swiglu(allocator, t[7], t[8]),
-        10 => tensor.matmul(t[9], l.w_down),
-        // The caller's loop walks 0 through 10, so no other value arrives. The
-        // switch cannot be written as exhaustive over usize without a prong for
-        // everything above 10, which the loop already rules out.
-        else => unreachable,
-    };
+    tokens: []const u32,
+    dlogits: Tensor,
+) !void {
+    const t_count = tokens.len;
+    if (t_count == 0) return error.EmptyBatch;
+    if (t_count > cfg.n_ctx) return error.SequenceTooLong;
+    if (dlogits.rows != t_count or dlogits.cols != cfg.vocab_size) return error.DimensionMismatch;
+    if (g.layers.len != p.layers.len) return error.DimensionMismatch;
+    // The token index is a trust boundary: the embedding scatter at the bottom
+    // of `backwardFrom` reads it with no bounds check of its own.
+    for (tokens) |tok| {
+        if (@as(usize, tok) >= cfg.vocab_size) return error.TokenOutOfRange;
+    }
+    if (p.tok_embed.rows != cfg.vocab_size or p.tok_embed.cols != model.dModel(cfg)) return error.DimensionMismatch;
 }
 
 /// Accumulates dLoss/d(block input) into `d_x_in`, and the block's nine weight
@@ -697,30 +811,9 @@ fn sigmoid(z: f32) f32 {
     return e / (1 + e);
 }
 
-fn swiglu(allocator: std.mem.Allocator, gate: Tensor, up: Tensor) !Tensor {
-    const a = try Tensor.init(allocator, gate.rows, gate.cols);
-    for (a.data, gate.data, up.data) |*dst, gate_z, up_z| dst.* = mlp.silu(gate_z) * up_z;
-    return a;
-}
-
-/// out = base + branch, the residual add. It has no derivative of its own, which
-/// is why the backward pass writes the stream gradient onto both operands
-/// unchanged.
-fn residual(allocator: std.mem.Allocator, base: Tensor, branch: Tensor) !Tensor {
-    if (base.rows != branch.rows or base.cols != branch.cols) return error.DimensionMismatch;
-    var out = try Tensor.init(allocator, base.rows, base.cols);
-    for (0..out.rows) |r| {
-        const b = base.rowConst(r);
-        const br = branch.rowConst(r);
-        const dst = out.row(r);
-        for (0..out.cols) |i| dst[i] = b[i] + br[i];
-    }
-    return out;
-}
-
 /// x[t] = tok_embed[tokens[t]]. The gradient of this scatter is at the bottom
-/// of `backward`; the forward half is here so the replay and the real forward
-/// read the same rows.
+/// of `backwardFrom`; the forward half is here so the cache and the real
+/// forward read the same rows.
 fn embed(allocator: std.mem.Allocator, p: model.Params, tokens: []const u32, d: usize) !Tensor {
     var x = try Tensor.init(allocator, tokens.len, d);
     errdefer x.deinit();
