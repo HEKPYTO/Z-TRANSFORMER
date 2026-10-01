@@ -17,13 +17,14 @@ const init_stddev: f64 = 0.02;
 /// One intermediate the forward pass hands to a `Sink`, named for what it is
 /// rather than for the local it is bound to.
 ///
-/// `attn_probs` is the one the design names and this enum does not carry,
-/// because `attention.forward` computes it internally and returns only the
-/// reduced result. Reaching it means changing that file, so the parity harness
-/// gates the seventeen this pass can hand over and says so in its own output.
-/// The three SwiGLU tensors are here for the same reason the rest are: the
-/// hand-written backward reads them, and a sink that carried only `mlp_out`
-/// would leave it rebuilding two matmuls per layer.
+/// Every tensor the design names is here. `attn_probs` was the one that was
+/// not, because `attention.forward` computed it internally and returned only
+/// the reduced result; it is the one whose size is quadratic in the context, so
+/// `attention.forwardWith` allocates it only when a sink is present and
+/// `attention.forward` still does not. The three SwiGLU tensors are here for
+/// the same reason the rest are: the hand-written backward reads them, and a
+/// sink that carried only `mlp_out` would leave it rebuilding two matmuls per
+/// layer.
 pub const Name = enum {
     attn_norm_out,
     q,
@@ -31,6 +32,7 @@ pub const Name = enum {
     v,
     q_rope,
     k_rope,
+    attn_probs,
     attn_ctx,
     attn_proj,
     residual1,
@@ -127,7 +129,8 @@ pub const Params = struct {
 /// scale and not a special case: y = x / rms(x) * 1. Zero looks like the
 /// quieter choice, and it is a trap. A zero norm weight makes its branch output
 /// exactly zero, so every branch contributes nothing at step 0, so the loss is
-/// flat in all 28 projection tensors, and d(loss)/d(tok_embed) is zero too
+/// flat in all 28 projection tensors at the default four layers -- seven per
+// layer -- and d(loss)/d(tok_embed) is zero too
 /// because the zero final_norm severs the path back to the embedding. Only the
 /// nine norm weights would receive gradient, and AdamW's 0 / (0 + 1e-8) then
 /// pins the other 29 at their step 0 values for another step, so a run that
@@ -278,7 +281,7 @@ pub fn forwardWith(
         if (sink) |s| s.put(s, .k_rope, layer, k_pos);
         // v is not rotated, so it goes to attention as projected.
 
-        var ctx = try attention.forward(allocator, q_pos, k_pos, v, attn_cfg);
+        var ctx = try attention.forwardWith(allocator, q_pos, k_pos, v, attn_cfg, sink, layer);
         defer ctx.deinit();
         if (sink) |s| s.put(s, .attn_ctx, layer, ctx);
         var proj = try tensor.matmul(ctx, l.wo);

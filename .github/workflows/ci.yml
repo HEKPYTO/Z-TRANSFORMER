@@ -3,6 +3,11 @@ name: CI
 on:
   push:
   pull_request:
+  # The mutation job below is gated on `workflow_dispatch`, so without this
+  # trigger the manual path is unreachable and the gate names an event that can
+  # never fire. Found by reading the condition against the trigger list, which
+  # is the same shape of mistake as a `pull_request` nested under `push`.
+  workflow_dispatch:
   schedule:
     # Weekly, deliberately off the hour: GitHub's scheduler is least reliable at
     # the top of the hour and a dropped run is a check that silently stopped
@@ -66,13 +71,13 @@ jobs:
 
   # That the test suite can still FAIL is a different claim from that it passes,
   # and it is the one nothing above checks. The mutation suite breaks the code on
-  # purpose, 16 ways, and requires the suite to notice; it is what caught the
+  # purpose, 18 ways, and requires the suite to notice; it is what caught the
   # `gradcheck` tolerance being tuned rather than derived, and it is the only
   # instrument here that notices a test quietly ceasing to test anything.
   #
   # Scheduled rather than on every push, because eight minutes on every
   # keystroke is how a check gets skipped. `tools/README.md`
-  # quotes "14 of 16 caught", and before this job existed nothing re-derived
+  # quotes "16 of 18 caught", and before this job existed nothing re-derived
   # that number: a test weakened anywhere in the tree would have moved it and no
   # run would have said so.
   mutation:

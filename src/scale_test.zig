@@ -189,13 +189,16 @@ test "scale: parameter count matches what initParams actually allocates" {
 
 test "scale: the dense score matrix is n_layers * n_heads * T * T * 4" {
     // At the shipped shape: 4 * 4 * 256 * 256 * 4 = 4194304 = 4 MiB.
-    // What the code allocates instead is n_heads * T * 8 = 4 * 256 * 8 = 8192,
-    // one f64 row, 512 times smaller.
+    // What the code allocates instead is T * 8 = 256 * 8 = 2048 -- one f64 row,
+    // held once above the head loop, 2048 times smaller. This line asserted
+    // `n_heads * T * 8` and so agreed with the projection's own 4x overcount;
+    // two agreeing sources is why it survived review. The number to check it
+    // against is the `alloc(f64, q.rows)` in `attention.forward`.
     const p = try scale.project(.{ .name = "shipped", .cfg = shipped });
     try std.testing.expectEqual(@as(u64, 4 * 4 * 256 * 256 * 4), p.scores_dense);
     try std.testing.expectEqual(@as(u64, 4_194_304), p.scores_dense);
-    try std.testing.expectEqual(@as(u64, 4 * 256 * 8), p.scores_row);
-    try std.testing.expectEqual(@as(u64, 8192), p.scores_row);
+    try std.testing.expectEqual(@as(u64, 256 * 8), p.scores_row);
+    try std.testing.expectEqual(@as(u64, 2048), p.scores_row);
     try std.testing.expect(p.scores_dense > p.scores_row);
 }
 
@@ -208,7 +211,7 @@ test "scale: activations are the per-layer blocks, not the logits, at depth" {
     //   head  logits + dlogits   2 * 8192 * 128256      =  2101346304
     //   blocks 32 layers of the eleven tensors in autograd's Block
     //                               32 * 8192 * 75776   = 19864223744
-    // so the blocks are 90% and the head 9%. The logits are the number a
+    // so the blocks are 87% and the head 9%. The logits are the number a
     // reader arrives with and they are not the largest thing here: the cache
     // the backward fills holds one Block per layer, and at 32 layers that is
     // what fills the machine.
@@ -231,12 +234,17 @@ test "scale: activations are the per-layer blocks, not the logits, at depth" {
     const stream: u64 = 8192 * 4096;
     const blocks: u64 = 32 * 8192 * (6 * 4096 + 2 * 1024 + 3 * 16384);
     const grads: u64 = 4 * 8192 * 4096;
-    const attn_back: u64 = 8192 * (4096 + 2 * 1024) + 4 * 8192;
+    const attn_back: u64 = 8192 * (4096 + 2 * 1024) + 6 * 8192;
+    // `blockBackward`'s own transients, which this projection omitted until it
+    // was checked against the `defer`s in that function: six [T, d] plus its own
+    // `d_q` [T, d] and `d_k` [T, kv], which are alive at the same time as the
+    // `ag.dq`/`ag.dk`/`ag.dv` that `attn_back` counts.
+    const block_back: u64 = 8192 * (7 * 4096 + 3 * 16384 + 1024);
     try std.testing.expectEqual(@as(u64, 2_101_346_304), head);
     try std.testing.expectEqual(@as(u64, 19_864_223_744), blocks);
-    // All five terms, added up by hand against the projection.
-    try std.testing.expectEqual(head + stream + blocks + grads + attn_back, p.act);
-    try std.testing.expectEqual(@as(u64, 22_183_706_624), p.act);
+    // All six terms, added up by hand against the projection.
+    try std.testing.expectEqual(head + stream + blocks + grads + attn_back + block_back, p.act);
+    try std.testing.expectEqual(@as(u64, 22_829_645_824), p.act);
     // The blocks are the larger term by a wide margin, and the head is under a
     // tenth of the total.
     try std.testing.expect(blocks > 4 * head);
@@ -324,7 +332,7 @@ test "scale: the report says every deferred item by name" {
     const out = w.buffered();
     for ([_][]const u8{
         "fused_attn", "kv_cache", "tied_head",   "wgrad_swap", "dense_scores",
-        "CROSSOVERS", "core/mlp", "weight_grad", "kv_cache",   "tied_GB",
+        "CROSSOVERS", "core/mlp", "weight_grad", "kv_cache",   "tied_GiB",
     }) |needle| {
         try std.testing.expect(std.mem.indexOf(u8, out, needle) != null);
     }

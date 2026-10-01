@@ -6,17 +6,24 @@
 //! is therefore readable from the loss down to one tensor without jumping, and
 //! checkable against a finite difference of the real forward.
 const std = @import("std");
-const model = @import("model.zig");
+pub const model = @import("model.zig"); // re-exported for the same reason `attention` is: the twin builds a model.Config to call attentionBackward
 const tensor = @import("tensor.zig");
 const norm = @import("norm.zig");
 const rope = @import("rope.zig");
 const mlp = @import("mlp.zig");
-const attention = @import("attention.zig");
+// Re-exported, not private: `src/cuda/attn_twin.zig` needs `attention.forward` for
+// the forward reference and `attentionBackward` below for the backward one, and a
+// module rooted at src/cuda/ may not import outside its own directory. Passing
+// src/attention.zig and src/autograd.zig as two separate modules would compile
+// every symbol they share twice, so the twin takes this one and reaches both.
+pub const attention = @import("attention.zig");
 const Tensor = tensor.Tensor;
 
-/// The same constant `model.zig` passes to `rope.forward`. RoPE sits between
-/// the projection and the attention, and its inverse has to use the same angle.
-const rope_theta: f64 = 500000;
+/// The same constant `model.zig` passes to `rope.forward`, read from there
+/// rather than copied. RoPE sits between the projection and the attention, and
+/// its inverse has to use the same angle; a second literal here would be a stale
+/// number the day the model changed it, and `model.zig` says exactly that.
+const rope_theta: f64 = model.rope_theta;
 
 pub const LayerGrads = struct {
     attn_norm: Tensor, // [d]
@@ -222,9 +229,9 @@ pub fn backwardFrom(
 
 /// Everything `backwardFrom` needs that only the forward pass knows.
 ///
-/// The eleven tensors one block's backward pass reads, plus the block's output.
-/// A tape would keep each op's output separately, which is a wider set than
-/// these twelve, so this holds one `Block` per layer instead. They are the
+/// The eleven tensors one block's backward pass reads -- `out` is one of the
+/// eleven, not a twelfth alongside them. A tape would keep each op's output
+/// separately, which is a wider set, so this holds one `Block` per layer instead. They are the
 /// values the loss was built from, which is the point: the backward
 /// differentiates the forward that actually ran rather than a second one built
 /// to look like it.
@@ -256,7 +263,7 @@ const Block = struct {
     }
 };
 
-/// The twelve tensors one block's forward produced, copied out as it produces
+/// The eleven tensors one block's forward produced, copied out as it produces
 /// them, and the first block's input.
 ///
 /// Every buffer is allocated up front, in `init`, and `put` only copies into
@@ -355,7 +362,7 @@ pub const Cache = struct {
             // too. A name with no case here is now a compile error, which is
             // the only version of this failure that cannot be shipped.
             //
-            // These six are emitted but deliberately not stored:
+            // These seven are emitted but deliberately not stored:
             //   `q`, `k`       the projections RoPE consumes; the backward reads
             //                  the rotated pair, which is `q_rope`/`k_rope`.
             //   `attn_proj`    the attention output after `wo`, which is `x_mid`
@@ -367,9 +374,17 @@ pub const Cache = struct {
             //   `final_norm`   the model's, not any layer's.
             //   `logits`       likewise; `dLossDLogits` is the backward's entry
             //                  point rather than a stored intermediate.
+            //   `attn_probs`   `attentionBackward` is handed `q_pos` and `k_pos`
+            //                  and rebuilds the forward's softmax row in f64 from
+            //                  them, bit for bit, so the matrix the forward now
+            //                  exports is not something it reads. Storing it
+            //                  would be T * n_heads * T per layer for nothing --
+            //                  a mebibyte at the shipped context, against a
+            //                  backward that already has every input it needs.
             .q,
             .k,
             .attn_proj,
+            .attn_probs,
             .mlp_out,
             .final_norm,
             .logits,
@@ -572,7 +587,7 @@ fn blockBackward(
     }
 }
 
-const AttnGrads = struct {
+pub const AttnGrads = struct {
     dq: Tensor, // [T, n_heads * head_dim]
     dk: Tensor, // [T, n_kv_heads * head_dim]
     dv: Tensor, // [T, n_kv_heads * head_dim]
@@ -612,7 +627,7 @@ const AttnGrads = struct {
 /// over `j` or over `s` would reassociate and move the bytes, and none of these
 /// do. A count that is not a multiple of eight finishes on the scalar loop, so
 /// an odd `head_dim` or an odd prefix length costs nothing and changes nothing.
-fn attentionBackward(
+pub fn attentionBackward(
     allocator: std.mem.Allocator,
     q: Tensor,
     k: Tensor,

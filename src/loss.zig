@@ -40,6 +40,6 @@ pub fn forward(logits: Tensor, targets: []const u32) !f64 {
     }
 
     // Fixed row order, one f64 accumulator, no reassociation: the same logits
-    // and targets give the same bits every run, which Phase 2 training needs.
+    // and targets give the same bits every run, which the committed loss curve needs.
     return total / @as(f64, @floatFromInt(t_count));
 }

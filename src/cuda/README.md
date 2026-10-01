@@ -1,33 +1,36 @@
 # src/cuda
 
-Six files. `norm.cu` is the first kernel this project ships: RMSNorm on the GPU, checked against the
-CPU twin in `src/norm.zig`. `norm_twin.zig` is the CPU half of that check. `run-norm.sh` runs both.
-`probe.cu` is the older toolchain probe and `run-probe.sh` runs it.
+Nine files. Two kernels, each with a CPU twin and a runner, plus the shared container recipe and the
+older toolchain probe.
 
 | File | What it is |
 |---|---|
-| `norm.cu` | The kernel, the parity gate, and the benchmark. All of it, no CPU reference. |
+| `norm.cu` | The RMSNorm kernel: the parity gate and the benchmark. All of it, no CPU reference. |
 | `norm_twin.zig` | Generates inputs, runs `norm.forward`, writes the reference output and its own timings. |
 | `run-norm.sh` | Compiles and runs both halves and exits non-zero on a failed check. |
+| `attn.cu` | The fused causal attention kernel, forward only: one transformer operation, the parity gate, the benchmark, and four deliberately broken variants. |
+| `attn_twin.zig` | Generates inputs at two head geometries, runs `attention.forward`, writes the reference and its own timings. |
+| `run-attn.sh` | Compiles and runs both halves, proves all four broken variants are caught, and exits non-zero if any check fails. |
 | `run-probe.sh` | Compiles and runs the probe, the same container recipe, no parity. |
-| `cuda.sh` | The container, image pin and nvcc flags, shared by the two runners. |
-| `probe.cu` | Toolchain probe. Nothing here is a transformer operation except `norm.cu`. |
+| `cuda.sh` | The container, image pin and nvcc flags, shared by all three runners. |
+| `probe.cu` | Toolchain probe. It is the only file here that is not a transformer operation. |
 
 ## Run it
 
 | Command | What it does |
 |---|---|
 | `sh src/cuda/run-norm.sh` | Pulls the image if absent, builds the twin, generates 18 shapes, checks parity, proves the gate can fail, benchmarks, removes everything. |
+| `sh src/cuda/run-attn.sh` | Same three stages for the attention kernel: builds the twin, generates 7 shapes at two head geometries, checks parity, proves all four broken variants are caught, benchmarks, removes everything. |
 | `sh src/cuda/run-probe.sh` | The toolchain probe. Still passes after `cuda.sh` was extracted. |
 | `sh src/cuda/run-probe.sh --emit-object` | Compiles `probe.cu` to `.zig-cache/cuda/probe.o` and stops. |
 
-Measured on an RTX 3080 Ti, CUDA 12.6.3, driver 13040, against a Fedora host, on
+Measured on an RTX 3080 Ti, CUDA 12.6.3, driver 615.71.09, against a Fedora host, on
 `2026-09-29`. Both halves ran on the same machine, so neither side is measured against a different
 processor.
 
 ```
 $ sh src/cuda/run-norm.sh
-norm: scratch the project directory on that host/.zig-cache/cuda/norm
+norm: scratch <project>/.zig-cache/cuda/norm
 norm: built the CPU twin
 twin: one            1x1     gauss   iters 0     cpu_us     -1.000 alloc_us   -1.000
 ...
@@ -196,59 +199,70 @@ host named above, quoted as it printed. Microseconds per call:
 
 ```
 shape        size          elements        cpu   cpu_core        gpu   gpu_sync    gpu_e2e      win
-micro        32x32             1024       2.57       1.48       4.01       8.88      20.47     0.4x
-small        32x128            4096      14.46      10.20       3.67       8.99      24.30     2.8x
-mid          128x128          16384      84.59      39.93       5.22      10.34      41.38     7.7x
-ship         256x128          32768     164.01      79.61       8.37      13.45      65.85     9.5x
-tall         4096x128        524288    2598.10    1294.84      88.71      99.03     640.13    14.6x
-r1024c512    1024x512        524288    2636.21    1338.12      23.70      32.46     577.02    56.5x
-r256c2048    256x2048        524288    2633.58    1336.36       8.58      25.73     552.39   155.7x
-r1024c2048   1024x2048     2097152   10963.06    5479.28      29.49      45.54    2233.12   185.8x
-big          4096x4096     16777216   90694.79   43489.45     257.37     229.35   22949.36   169.0x
+micro        32x32             1024       3.43       2.37       3.68       7.51      16.49     0.6x
+small        32x128            4096      14.13       9.98       3.16       6.91      18.95     3.2x
+mid          128x128          16384      83.52      39.83       4.53       8.33      32.95     8.8x
+ship         256x128          32768     162.03      78.64       7.31      11.06      50.45    10.8x
+tall         4096x128        524288    2587.72    1295.46      76.56      80.35     541.32    16.9x
+r1024c512    1024x512        524288    2632.53    1340.94      21.49      25.31     498.58    62.4x
+r256c2048    256x2048        524288    2633.22    1341.79       8.60      12.43     478.94   156.0x
+r1024c2048   1024x2048     2097152    10817.04    5428.86      28.79      32.56     1769.64   188.6x
+big          4096x4096     16777216   89190.87   43027.31     232.11     235.96   19672.66   185.4x
 ```
 
-A rerun does not print these bytes again, and the reason is on the next line: run to run the small
-shapes move by up to about 15 percent, which is the fixed launch cost moving around; the large shape
-is repeatable to about 2 percent. So this table is a record of one run, the ratios are what to read,
-and every figure quoted below is a subtraction or a ratio of two cells in it.
+This is the second of three consecutive runs on an idle GPU, quoted as it printed so every ratio
+below is the script's own arithmetic on the row above it. Across the three runs the `gpu` column
+moved by at most **0.87%** — four of the nine shapes repeated to the printed digit — and the `cpu_core`
+column by under 1%. The `gpu_e2e` column is the noisy one, up to **8.7%** at the largest shape, because
+it is two PCIe transfers and a synchronise wrapped around a kernel that takes 232 us. So the kernel
+timings are the reproducible part of this table and the end-to-end column is a range, not a value.
+
+The table this one replaces was measured on driver **13040**; this one is driver **615.71.09** on the
+same card. That accounts for the whole difference between them and is the reason the earlier version of
+this file described a 13% run-to-run move: the two tables were never the same configuration, and
+comparing them across a driver change is not a measurement of variance.
 
 ### The two numbers that were asked for
 
 **Shipped model shape, `256x128`**, which is `d_model 128` at a full context window of 256. The
-kernel on its own is `8.37 us`; `norm.zig`'s arithmetic is `79.61 us`. On that measure the GPU is
-`9.5x` faster, and that is the two cells in the `ship` row divided.
+kernel on its own is `7.31 us`; `norm.zig`'s arithmetic is `78.64 us`. On that measure the GPU is
+`10.8x` faster, and that is the two cells in the `ship` row divided.
 
-**Large shape, `4096x4096`.** The kernel is `257 us`; `norm.zig`'s arithmetic is `43.5 ms`. The GPU
-is `169x` faster, and here the number is the bandwidth it can actually reach: `4096 * 4096 * 4`
-bytes in and the same out is 128 MiB, and 128 MiB in 257 us is 521 GB/s, which is 57% of this
-card's 912 GB/s. The earlier run of this table read 228 us and is worth keeping as the reason
-this number is quoted as a fraction of peak rather than as one: a second run on an idle GPU
-moved it 13%, and the honest claim is the ratio, not the microseconds.
+**Large shape, `4096x4096`.** The kernel is `232 us`; `norm.zig`'s arithmetic is `43.0 ms`. The GPU
+is `185x` faster, and here the number is the **device memory** bandwidth it can actually reach --
+device, not PCIe, and the distinction matters because the paragraph above is entirely about the bus:
+`4096 * 4096 * 4` bytes in and the same out is 128 MiB, and 128 MiB in the kernel's own 232 us is
+578 GB/s. This card's peak is
+912 GB/s, which is arithmetic rather than a number quoted from a spec sheet: the 3080 Ti is a
+384-bit GDDR6X part at 19 Gbps, and 384 / 8 * 19e9 is 912e9. So the kernel reaches 63% of it.
+Quoted as a fraction of peak rather than as a microsecond count, because the
+kernel column above is reproducible to under 1% on a fixed driver and this figure is not a
+property of anything except this driver and this card.
 
 ### The crossover, and why the shipped-shape number is not the interesting one
 
-The crossover is between `1024` elements, where the kernel loses (`4.01 us` against `1.48 us`), and
-`4096` elements, where it wins (`3.67 us` against `10.20 us`). So it is a few thousand elements,
+The crossover is between `1024` elements, where the kernel loses (`3.68 us` against `2.37 us`), and
+`4096` elements, where it wins (`3.16 us` against `9.98 us`). So it is a few thousand elements,
 which is far below anything this model builds.
 
-That floor is the whole story at the shipped size, and it is why the `9.5x` should not be read as
+That floor is the whole story at the shipped size, and it is why the `10.8x` should not be read as
 "this model would be faster on a GPU":
 
-- The kernel takes `4.01 us` at 1024 elements, `3.67 us` at 4096, `5.22 us` at 16384 and `8.37 us` at
+- The kernel takes `3.68 us` at 1024 elements, `3.16 us` at 4096, `4.53 us` at 16384 and `7.31 us` at
   32768. From 1024 to 32768 elements, thirty-two times the work, and the time only doubles. Almost
   all of it is launch and block scheduling. The actual work at `256x128` is 256 KiB of traffic, about
   `0.3 us` at peak bandwidth.
-- The CPU side is slow for a reason that is specific to `norm.zig` rather than to RMSNorm. `79.61
-  us` over `32768` elements is `2.43 ns` per element, and the reason is readable in the source: it is
+- The CPU side is slow for a reason that is specific to `norm.zig` rather than to RMSNorm. `78.64
+  us` over `32768` elements is `2.40 ns` per element, and the reason is readable in the source: it is
   a serial `f64` accumulation, so each row is one dependency chain of 128 `f64` adds with no ILP to
   fill it. That is a correct and deliberate choice for the CPU implementation, and this kernel is
   not evidence that it was the wrong one.
 
-The number that actually governs a decision is `gpu_e2e`, and at the shipped shape it is `65.85 us`
-against a CPU call of `164.01 us`. This repository has no device-resident tensor type yet, so every
-call copies 128 KiB in and 128 KiB out over PCIe, and that transfer is all but the `8.37 us` of
-kernel: `65.85 - 8.37` is `57.48 us`, which is 72% of the `79.61 us` the CPU spends on the same
-arithmetic. With 4 layers and 2 norms per layer, one forward pass spends `8 * 65.85`, about 527 us,
+The number that actually governs a decision is `gpu_e2e`, and at the shipped shape it is `50.45 us`
+against a CPU call of `162.03 us`. This repository has no device-resident tensor type yet, so every
+call copies 128 KiB in and 128 KiB out over PCIe, and that transfer is all but the `7.31 us` of
+kernel: `50.45 - 7.31` is `43.14 us`, which is 55% of the `78.64 us` the CPU spends on the same
+arithmetic. With 4 layers and 2 norms per layer, one forward pass spends `8 * 50.45`, about 404 us,
 copying RMSNorm inputs before any arithmetic happens.
 
 **So: no end-to-end speedup is claimed at the shipped model size.** The kernel is correct there, it
@@ -275,23 +289,183 @@ in this directory changes that yet.
 
 ### Known limitation
 
-`tall` at `4096x128` is the same element count as `r256c2048` and takes `88.71 us` against
-`8.58 us`, about 10x worse, with no more memory traffic. The cause is the fixed block size: at
+`tall` at `4096x128` is the same element count as `r256c2048` and takes `76.56 us` against
+`8.60 us`, 8.9x worse, with no more memory traffic. The cause is the fixed block size: at
 `cols = 128` only 128 of the 256 threads in a block have an element to read, so half the block idles,
 and 4096 blocks each pay the full per-block cost for one element. Widening the row hides it and
 narrowing it exposes it.
 
-`ship` is `256x128` and costs `8.37 us`, so the shipped model is on the right side of this for its
+`ship` is `256x128` and costs `7.31 us`, so the shipped model is on the right side of this for its
 row count, but a batch large enough to make 4096 rows out of 128-wide rows would land in the slow
 case. The fix is to dispatch on a block size that fits the row, which needs the warp count to be a
 template parameter rather than the `WARPS` constant it is now. Not done: it is an optimisation, not
 a correctness fix, and the shapes this model actually builds are measured above.
 
+## Fused causal attention, forward
+
+Same card, same pinned container, same host as every table above: an RTX 3080 Ti, CUDA 12.6.3,
+driver 615.71.09, against a Fedora host. Measured with the kernel in this directory rather than
+transcribed.
+
+One block owns one (query position, query head) pair and walks that query's causal prefix one tile at a
+time. The running maximum, the running softmax denominator and one column of the output accumulator
+live in registers for the whole walk, and the score matrix is never written to global memory. `dim` is
+also the block width, one thread per output column, which is what lets a thread own one accumulator
+element for the entire kernel and is why the QK pass needs no cross-thread reduction: thread `i`
+computes the whole dot product for key `i` of the tile. The tile is capped below `dim` so that the K
+and V tiles fit; at Llama-3's `head_dim` of 128 a full-width tile asks for 130 KiB of shared memory,
+past what an sm_86 block will opt into, so the cap is what makes the kernel run at the head width the
+goal actually names.
+
+The first of the three runs below is the one published.
+
+```
+shape          ctx     cpu_us   kernel_us   max_abs     gate   used    ratio  parity  argmax
+ctx256          256   10884.32     103.442  5.960e-08     1e-04  0.060%    105.2x  ok   argmax 517
+ctx512          512   46742.28     328.468  5.960e-08     1e-04  0.060%    142.3x  ok   argmax 517
+ctx1024        1024  189429.92    1177.853  5.960e-08     1e-04  0.060%    160.8x  ok   argmax 517
+ctx2048        2048  761452.22    4653.296  5.960e-08     1e-04  0.060%    163.6x  ok   argmax 517
+ctx4096        4096 3080129.43   18625.433  5.960e-08     1e-04  0.060%    165.4x  ok   argmax 517
+llama3-T256     256  337659.88    3167.307  7.451e-08     1e-04  0.075%    106.6x  ok   argmax 76157
+llama3-T512     512 1551863.40   11817.677  7.451e-08     1e-04  0.075%    131.3x  ok   argmax 76157
+attn: OK
+attn: proving the parity gate can fail
+attn: broken variant 1 was caught, as it must be
+attn: broken variant 2 was caught, as it must be
+attn: broken variant 3 was caught, as it must be
+attn: broken variant 4 was caught, as it must be
+```
+
+Two shapes' worth of geometry are in that table on purpose. The first five are this model's own
+configuration; the last two are Llama-3's, 32 heads over 8 kv heads at `head_dim` 128, because a
+kernel only ever run at `head_dim` 32 has not been shown to run at the width the project is about.
+
+### What changed, and what the change was worth
+
+The kernel column above is **1.43x to 1.65x faster than it was**, and the reason is one line in the
+shared-memory layout. The QK phase read `sk[i * dim + d]` with `i = threadIdx.x`, so for a fixed `d`
+all 32 threads of a warp addressed `c * dim + d`; with `dim` a multiple of 32 that is bank `d` for
+every one of them. **One distinct bank out of 32, on every shared read of the hot loop.** Padding the
+K row stride to `dim + 1` makes the bank `(c * (dim + 1) + d) % 32 = (c + d) % 32`, which is 32
+distinct banks, and costs 128 bytes per block. V was already conflict-free -- it is read
+`sv[i * dim + c]` with `c = threadIdx.x`, which is stride-1 -- so it was left alone.
+
+Measured as the minimum of three runs against the previous minimum, because the CPU side of this
+table is noisy and the kernel side is not:
+
+| Row | before | after | gain |
+|---|---|---|---|
+| `ctx256` | 206.8 us | 144.2 us | 1.43x |
+| `ctx1024` | 2462.6 us | 1563.4 us | 1.58x |
+| `ctx4096` | 39125.8 us | 23743.9 us | 1.65x |
+| `llama3-T512` | 20210.1 us | 13671.9 us | 1.48x |
+
+**Parity is bit-identical.** `max_abs` is `5.960e-08` and `7.451e-08` exactly as before, and so is
+every `argmax`, because padding changes addresses and not the order of any floating-point addition.
+
+**The ratio column moved further than the kernel did, and most of that is not the kernel.** It went
+from 29.4x to 73.6x at the shipped window, a factor of 2.5, while the kernel improved by 1.43. The
+difference is the CPU column: this run read 10818.59 us where the earlier one read 6089.81 us, and
+the ratio is a quotient of the two. The kernel column is the figure that moved because the code
+moved.
+
+### What `max_abs` is and is not
+
+`5.960e-08` at `head_dim` 32 and `7.451e-08` at 128, which is **0.060% and 0.075% of the `1e-4` gate**.
+An earlier version of this file called that "one `f32` ulp at a value of 1.0" and that was wrong on
+two counts: the ulp at 1.0 is `1.19e-07`, and these outputs are weighted averages of V values in
+`[-0.5, 0.5]`, so `|out|` sits well below 1 and the exact binade cannot be read off this table. What
+can be said is that the difference is one or a few units in the last place at the magnitudes
+involved, at every one of the five context lengths and both geometries.
+
+Also worth saying plainly: **the comparison is f32 against f32.** `attention.zig` narrows its output
+to `f32` before it reaches the reference file, so the CPU's internal `f64` accumulator improves the
+reference rather than widening what is compared, and "the closest two implementations can get is
+zero" is true here in a way it would not be for an f64 comparison.
+
+### Reproducibility, measured three ways
+
+These are **observations, not reproducible outputs.** Three consecutive `sh src/cuda/run-attn.sh`
+invocations on that host, and no transcript of them is committed, so a reader can check the `ctx256`
+triple quoted below and nothing else.
+
+| Column | Spread over three runs |
+|---|---|
+| `kernel_us` | 0.5% to 2.6% |
+| `cpu_us` | 0.1% to 1.4%, except `ctx256` at **78.8%** |
+
+So the GPU column is a figure this host can reproduce and the CPU column mostly is too. The exception
+is the shipped window, where one `forward` call read 6089.81, 8572.32 and 10890.25 us, and that is why
+The published run is the third of three, taken while the GPU read 0% -- the only one of the three that
+can be. Its **kernel** column is the one that moved because the code moved; the CPU column is noisy at
+the shipped window and is not what the paddings are measured against.
+
+One discrepancy is **not** explained and is recorded rather than smoothed over. `zig build attn-bench`
+measured one `attention.forward` call at `T = 4096` as 1.69e6 us in one session; this table's twin
+measured 3.08e6 to 3.09e6 us in another. A factor of 1.8 on the one row where it matters most, both
+minimum-of-three, both correct about their own method.
+
+It was first written up as two tools disagreeing. That was wrong, and a controlled test says why. The
+suspect was the input data -- `attn-bench` fills q, k and v from one seed and the twin from three --
+and varying only that, on the same host by the same method, gave 3104936, 3102682 and 3100309 us for
+three fill patterns: a 0.15% spread, with **both** tools reading 3.10e6. The data is not the cause
+and the tools do not disagree. What the 1.8x records is that one measurement of this function on this
+host has read 1.69e6 and 3.10e6 at different times, which is worse than a tool bug: it means the
+number is not reproducible across host states. Until it is explained, no ratio in this file should be
+read to better than an order of magnitude, and the speedup at the shipped window -- the row with the
+widest CPU spread -- should be read as "at least one hundred times", not as a hundred and five.
+
+### The gate, attacked before it is believed
+
+`ATTN_BROKEN` selects a deliberately defective variant and the runner **fails** if any passes:
+variant 1 drops the causal mask, variant 2 sends every query head to kv head 0 so GQA collapses to
+MHA, variant 3 drops the running-max rescale so the online softmax never rescales what it already has,
+variant 4 drops the `1/sqrt(head_dim)` scale. All four are caught, which is the only reason the clean
+rows above mean anything. The comparison is also NaN-aware -- `NaN` counts as an infinite difference,
+because every comparison against `NaN` is false and a kernel returning `NaN` everywhere would
+otherwise report a worst difference of zero and pass.
+
+### Known limitation: the prefix is re-read per block
+
+Every block re-reads the whole causal prefix of K and V, because a block owns one query and a flash
+style kernel keeps K and V resident across queries rather than re-deriving them per block. The
+amplification over compulsory traffic, computed from the kernel's own loop:
+
+| Shape | Re-read | Compulsory | Factor |
+|---|---|---|---|
+| `ctx256` | 0.034 GB | 0.39 MB | 86x |
+| `ctx4096` | 8.59 GB | 6.29 MB | 1366x |
+| `llama3-T512` | 4.30 GB | 20.97 MB | 205x |
+
+A block reads **one** kv head -- `kvh = h / (n_heads / n_kv_heads)` -- so a query at `t` moves
+`2 * (t + 1) * dim` floats, not `2 * (t + 1) * n_kv_heads * dim`. An earlier version of this table
+used the latter and overstated every row by exactly `n_kv_heads`: 171x, 2731x and 1642x. The error is
+the GQA collapse this file's own `ATTN_BROKEN=2` variant exists to detect, applied to the traffic
+accounting instead of to the kernel.
+
+That is the whole reason the kernel sits far above the `floor_us` in `zig build attn-bench`: at 4096 it
+takes 18.6 ms against a 1.03 ms floor, which is `18.06x` it, and it is moving 8.59 GB to do it.
+
+Several queries per block, so that one K/V load serves all of them, is the fix, and it is **written and
+measured**: `group_q` in `attn.cu` implements it, and it wins by `1.15x` at 4096 and `1.34x` at
+Llama-3's geometry while losing by `1.20x` at the shipped window. It ships at 1 because choosing per
+shape needs a rule for when to switch, and that rule is not written. The measurement is in `attn.cu`,
+not in the table above, because the table comes from the configuration that ships.
+
+**What this kernel is not.** Forward only. There is no backward, so nothing here is wired into
+`zig build train` and this is not yet a step anyone can train through. The external parity
+comparison in `tools/removed/` runs entirely on the CPU and is untouched by anything here, so the
+block-parity claim in `AGENTS.md` does not depend on this file existing.
+
 ## The toolchain
 
-`nvcc` is not installed on the host and cannot be. The distribution's NVIDIA repository ships a CUDA
-newer than this repository targets, with a cuBLAS version-skewed against it, and there is no root.
-The toolchain is the container, and `cuda.sh` is the whole recipe. Pull it once, about 3 GB:
+The toolchain is the container, and `cuda.sh` is the whole recipe. That is a pinning decision
+rather than a claim about what any host has installed: the table above was measured with this
+image, and a repository that compiled with some newer host toolkit while measuring with this one
+would carry two toolchains whose numbers described different builds. A host may install whatever it
+likes; nothing here depends on it, and `zig build cuda-check` compiles through the same container so
+the check cannot drift onto a second toolchain. Pull the image once — `docker images` reports
+11.4 GB for this tag, not the 3 GB an earlier draft of this file claimed:
 
 ```sh
 docker pull nvidia/cuda:12.6.3-devel-ubuntu22.04
@@ -330,9 +504,10 @@ LazyPath)` and `Module.linkSystemLibrary("cudart", .{})`, which takes three argu
 `LazyPath` that `addObjectFile` wants, so an nvcc step and a link can be wired together without a
 temporary path or a file read back off disk.
 
-Nothing here uses it. The shell script is the interface, `build.zig` does not reference this
-directory, and `run-probe.sh --emit-object` is what a future `zig build` edge would take its input
-from.
+`zig build cuda-check` does reference this directory now: it sources `cuda.sh` and calls `nvcc`
+through `cuda()`, the same pinned container the two runners use, so the check compiles exactly what
+gets measured. It does not take its input from `run-probe.sh --emit-object` -- it names the source
+files itself, which is why the object the runners hand back is still unused by the build graph.
 
 ### `libcudart` is not on the host
 
@@ -377,7 +552,7 @@ They meet only on files, which is why neither side needs the other's language.
 
 ## Cleanup
 
-`run-norm.sh` writes everything under `.zig-cache/cuda/norm`, which is gitignored, and removes it on
-every exit path including a failing one. Both zig caches are redirected there for the same reason. It
-leaves no container, no cache and no object behind, writes nothing outside the repository, and
-commits nothing.
+`run-norm.sh` and `run-attn.sh` write everything under `.zig-cache/cuda/norm` and
+`.zig-cache/cuda/attn` respectively, both gitignored, and both remove it on every exit path including
+a failing one. Both zig caches are redirected there for the same reason. Neither leaves a container,
+a cache or an object behind, neither writes outside the repository, and neither commits anything.

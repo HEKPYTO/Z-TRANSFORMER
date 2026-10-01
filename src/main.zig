@@ -20,6 +20,7 @@ const model = @import("model.zig");
 const train = @import("train.zig");
 const parity = @import("removed.zig");
 const scale = @import("scale.zig");
+const attn_bench = @import("attn_bench.zig");
 
 const corpus_path = "data/tinyshakespeare.txt";
 const csv_path = "outputs/loss.csv";
@@ -93,8 +94,9 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, args[1], "train")) return runTrain(arena, init.gpa, init.io, init.environ_map);
             if (std.mem.eql(u8, args[1], "parity")) return runRemoved(arena, init.io);
             if (std.mem.eql(u8, args[1], "scale-profile")) return runScaleProfile(init.io);
+            if (std.mem.eql(u8, args[1], "attn-bench")) return runAttnBench(init);
         }
-        std.debug.print("usage: {s} [train|parity|scale-profile]\n", .{args[0]});
+        std.debug.print("usage: {s} [train|parity|scale-profile|attn-bench]\n", .{args[0]});
         return error.UnknownCommand;
     }
 
@@ -378,6 +380,18 @@ fn runScaleProfile(io: Io) !void {
     var buffer: [4096]u8 = undefined;
     var stdout: Io.File.Writer = .init(.stdout(), io, &buffer);
     try scale.print(&stdout.interface);
+    try stdout.interface.flush();
+}
+
+/// `zig build attn-bench`. Measures what one CPU attention call costs at each
+/// context length and prints it beside the PCIe floor a GPU implementation would
+/// have to clear. Unlike `scale-profile` above, the left column is a measurement
+/// and not arithmetic, so it moves with the host the way `bench` does and is
+/// reported the same way: as a figure for this machine, never as a gate.
+fn runAttnBench(init: std.process.Init) !void {
+    var buffer: [4096]u8 = undefined;
+    var stdout: Io.File.Writer = .init(.stdout(), init.io, &buffer);
+    try attn_bench.print(init, init.gpa, &stdout.interface);
     try stdout.interface.flush();
 }
 

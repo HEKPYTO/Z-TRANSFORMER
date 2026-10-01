@@ -527,11 +527,11 @@ test "the sink reports every intermediate, once per layer" {
     var out = try model.forwardWith(std.testing.allocator, p, two_layers, &tokens, rec.asSink());
     defer out.deinit();
 
-    // 15 per-layer names over 2 layers, plus final_norm and logits once each.
-    try std.testing.expectEqual(@as(usize, 15 * two_layers.n_layers + 2), rec.seen);
-    try std.testing.expectEqual(@as(usize, 15 * two_layers.n_layers), rec.per_layer);
+    // 16 per-layer names over 2 layers, plus final_norm and logits once each.
+    try std.testing.expectEqual(@as(usize, 16 * two_layers.n_layers + 2), rec.seen);
+    try std.testing.expectEqual(@as(usize, 16 * two_layers.n_layers), rec.per_layer);
     try std.testing.expectEqual(@as(usize, 2), rec.non_layer_zero);
-    // Each of the 15 layer-scoped names fires once per layer, so the two layers
+    // Each of the 16 layer-scoped names fires once per layer, so the two layers
     // contribute evenly and no name is reported for a layer that did not run.
     for (std.enums.values(model.Name)) |n| {
         const want: usize = switch (n) {

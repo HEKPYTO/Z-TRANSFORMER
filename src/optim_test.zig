@@ -322,8 +322,8 @@ test "clip by norm on a zero gradient neither divides by zero nor makes NaN" {
 }
 
 test "the same parameter and gradient sequence is bit identical across runs" {
-    // Phase 2 wants two runs of one seed to agree to the byte, so the update
-    // order has to be fixed. Three steps over a 2x2 parameter with two
+    // Two runs of one seed have to agree to the byte, which is what the committed
+    // loss curve claims, so the update order has to be fixed. Three steps over a 2x2 parameter with two
     // different gradients, run twice, compared as raw bit patterns.
     const grads_seq = [_][4]f32{
         .{ 0.5, -1.25, 2.0, 0.75 },

@@ -107,6 +107,34 @@ const unroll_s = model.Config{
     .ffn_mult = 1,
 };
 
+/// `head_dim` 32, which is **the shipped model's `head_dim`**, not a stand-in
+/// for it. The `dim / lanes` loops in `attentionBackward` — the `dq` split and
+/// the `dk`/`dv` split — divide `head_dim` by eight, and until this fixture
+/// existed every finite-difference check in the repository ran `head_dim` 12,
+/// which is `12 / 8 = 1` group plus a four-wide tail. So group index 1, 2 and 3
+/// of the shipped shape executed in no finite-difference check anywhere, and a
+/// defect in any of them passed the whole suite. Found by reading which loop
+/// splits which dimension, not by a failing test: nothing was failing.
+///
+/// One head and one kv head, so `kv` is identically zero here and the fixture
+/// says so rather than implying otherwise. That is not a gap in this fixture,
+/// it is a gap `unroll_s` already covers: `kv = h / group` needs two kv heads to
+/// select a nonzero one, and `unroll_s` is that check. This one is here for the
+/// `dim` split alone, and taking the smallest config that produces four groups
+/// is what keeps it affordable — `d_model` 32 rather than the shipped 128,
+/// because the `w.rows` and `dout.cols` splits in `inputGrad` and `weightGrad`
+/// already run six groups wide under `unroll_s` and gain nothing from a wider
+/// row.
+const unroll_group = model.Config{
+    .n_layers = 1,
+    .n_heads = 1,
+    .n_kv_heads = 1,
+    .head_dim = 32,
+    .n_ctx = 16,
+    .vocab_size = 16,
+    .ffn_mult = 1,
+};
+
 /// Four distinct tokens, so every position owns a `tok_embed` row of its own and
 /// the gradient scatter is position resolvable. It is also, and that is the
 /// reason it is worth reading, **below `lanes`**: every `checkAll` in this file
@@ -248,6 +276,12 @@ test "autograd: gradcheck where the attention backward unrolls execute" {
     var p = try liveParams(std.testing.allocator, unroll_s);
     defer p.deinit();
     try gradcheck.checkAll(std.testing.allocator, unroll_s, p, tok8, tgt8);
+}
+
+test "autograd: gradcheck at the shipped head_dim, where the dim split has four groups" {
+    var p = try liveParams(std.testing.allocator, unroll_group);
+    defer p.deinit();
+    try gradcheck.checkAll(std.testing.allocator, unroll_group, p, tok8, tgt8);
 }
 
 test "autograd: gradcheck passes for two layers" {

@@ -137,8 +137,11 @@ pub fn run(
     var batcher = try data.Batcher.init(allocator, train_tokens, cfg.ctx, cfg.seed);
     defer batcher.deinit();
     // Its own batcher over its own tokens, never the training one. It reshuffles
-    // per epoch like the training one, from a stream the training batcher's does
-    // not touch, so the two orders stay independent.
+    // per epoch like the training one, and it is seeded with the same `cfg.seed`,
+    // so the two permutations are the same sequence rather than two independent
+    // draws. The guarantee that matters does not depend on that: the two batchers
+    // index disjoint token slices, so no validation token is ever trained on
+    // whatever order either of them picks.
     var val_batcher = try data.Batcher.init(allocator, val_tokens, cfg.ctx, cfg.seed);
     defer val_batcher.deinit();
     if (val_batcher.order.len == 0) return error.EmptyValidation;

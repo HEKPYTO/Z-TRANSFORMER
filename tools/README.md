@@ -14,12 +14,12 @@ three are separate on purpose: a machine without torch has not failed a parity c
 |---|---|
 | Reference | `reference-library==4.57.3`, `torch` 2.14.0, CPU, float32, attention `eager` |
 | Shape | d_model 64, 2 layers, 4 heads over 2 kv heads of 16, ffn 256, vocab 256, ctx 512, batch 1 |
-| Sweep | sequence lengths 1, 8 and 257, at seeds 7 and 8. Six runs, 156 tensor rows, 532 argmax comparisons |
-| Last verdict | OK. 14 tensor kinds inside their gates, worst 2.1e-06 against a 2.0e-05 gate |
+| Sweep | sequence lengths 1, 8 and 257, at seeds 7 and 8. Six runs, 204 tensor rows, 532 argmax comparisons |
+| Last verdict | OK. 18 tensor kinds, every row inside its own gate. The worst case is 2.056e-06 on `l0.k_rope`, against that kind's 2.0e-05 gate. The tightest gate in the set is 2.0e-06, on `attn_norm_out` — a different tensor, so the two numbers are not to be compared |
 | Argmax | 532 of 532 rows pick the same token |
 | Record | `report.csv` in this directory, one row per tensor per run. `check.sh` checks the report it just wrote against two digests `build.zig` holds, so the two rows above are checked on every run rather than true once. The portable one covers the row set, the shapes, the gates, the verdicts and the argmax count, and runs on every host. The byte digest covers `max_abs_delta` as well, and runs only where this host's oracle reports the same six version columns the committed file records. |
 
-All three are pinned, to the versions the committed `report.csv` records in every one of its 156
+All three are pinned, to the versions the committed `report.csv` records in every one of its 206
 rows, and each pin earns its place.
 
 `reference-library` is the one that changes the answer. v5 moved `rope_theta` into `rope_parameters`, so
@@ -123,19 +123,58 @@ exist.
 
 Initialisation, because the harness pins the weights on both sides and never compares how they were
 drawn. Batched forward, because this model has no batch axis and the harness runs batch 1. A KV
-cache, quantized weights, or CUDA. The attention probabilities and the SwiGLU hidden state, which
-`attention.forward` and `mlp.forward` reduce internally and never return; reaching either means
-changing those two functions, which changes the numbers everything else is gating.
+cache, quantized weights, or CUDA.
+
+Nothing is left over, and that is the first thing to check rather than the last. The forward pass exports
+**18 activations**; all 18 are gated, and `argmax` is a further check, not a gate: it is a property of
+the whole comparison rather than of one tensor, and it is what says the two models pick the same token.
+
+| | count | why |
+|---|---|---|
+| gated activations | 18 | the `GATES` table in `oracle.txt` |
+| named, absent | 0 | nothing the forward pass names is left ungated |
+
+`attn_probs` was the last one, and it closed the only gap that was real rather than bookkeeping: it is
+the attention softmax matrix, so a defect in *which* probability was formed used to show up nowhere
+except diffused through `attn_ctx`. The reference does compute it. `eager_attention_forward` is a
+module-level function in `modeling_llama` that returns `(attn_output, attn_weights)`, and
+`LlamaAttention.forward` hands that tuple straight back — only the decoder layer one frame up drops it,
+on `hidden_states, _ = self.self_attn(...)`. So no hook could reach it, and `Capture` instead rebinds
+the module attribute to a three-line wrapper that calls the original, records its second return value
+and returns the same tuple. That is observation, and the alternative the harness exists to prevent was
+re-softmaxing the reference's own `q` and `k` in numpy: a second implementation of the model agreeing
+with itself. The one operation applied to the captured tensor before the comparison is a reshape in
+`Capture.result`, which reindexes `[H, T, T]` into the export's `[H·T, T]` and computes nothing. The
+export's `attention.forwardWith` materialises it as `[T·H, T]` only when a sink is present, at 1 MiB for
+the shipped context and freed before the call returns; measured, the step time did not move. The
+training path, the autograd pass and the bench all reach attention through `model.forwardWith` with a
+live sink, so they do pay that; `attention.forward` is the same function with a null sink and is for a
+caller that wants no intermediate at all.
+
+The three SwiGLU tensors were the second gap and are now closed. They were listed here for two rounds on
+the claim that `LlamaMLP` applies `silu(gate) * up` inside its forward and exposes no hook that returns
+it. Both halves of that were wrong, and the second one is the interesting one. The export always had the
+bytes: `mlp.forwardWith` takes a sink, `mlp.zig` hands the tensor to it, and `removed.zig` writes every
+`Name` member it is given, which is why the oracle exited 2 on a blob it could not account for rather
+than silently skipping it. And the reference does expose all three, because `LlamaMLP` holds
+`gate_proj`, `up_proj` and `down_proj` as separate `nn.Linear` children and calls each as a module: the
+two halves are their outputs, and the product is `down_proj`'s own input argument, readable by a forward
+pre-hook. So every one of the three is a tensor the reference produced, read at a module boundary. The
+oracle computes no silu and multiplies nothing — the alternative, rebuilding the product in Python, is
+the second implementation agreeing with itself that this whole harness exists to avoid.
 
 And sensitivity, which is worth stating precisely rather than in the abstract. The sweep shape was
 chosen for legibility — `d_model` 64 over four heads of 16 keeps every tensor small enough to read.
 Measured at that shape by `sh tools/removed/sensitivity.sh`: perturbing one element of `wq` by 1e-3
-fails 21 gates, and scaling the whole 4096-element block by 1.001 still fails 27. A tenth of a percent is inside this harness's reach. What
+fails 20 of the 204 compared rows, and scaling the whole 4096-element block by 1.001 still fails 18. All
+seven perturbations are caught, and across the sweep all 18 gated tensors move under some perturbation
+— a gate that never moved would be present but unexercised, and the script fails on that rather than
+reporting it. A tenth of a percent is inside this harness's reach. What
 does slip under the gates is narrower: dropping the f64 accumulator in `norm.zig` to f32 passes,
 because at `d_model` 64 the drift that 512-element tests exist to catch is still below the 2e-6 gate
 here. Sensitivity grows with the row width the gates are set against, not with the tensor count.
 
-Both have to hold: all fourteen gates and the same token on every row. The gates are the sensitive
+Both have to hold: all eighteen tensor gates and 532 of 532 argmax rows. The gates are the sensitive
 one. The smallest reference top1-top2 margin on this sweep is 8.5e-04 and the widest gate on the
 logits is 2e-4, so a run that passes the gates cannot have flipped a token, and the argmax cannot
 fail on its own. Its job is the diagnosis: for any row where the two disagree, the reference's own
@@ -145,9 +184,9 @@ top1-top2 margin is printed, so a near-tie is visibly a near-tie.
 
 How good is the test suite, as a number somebody can check.
 
-    sh tools/mutation/run.sh                      # 16 mutations, 8 minutes
+    sh tools/mutation/run.sh                      # 18 mutations, about 10 minutes
     sh tools/mutation/run.sh matmul,rope          # a subset, matched as substrings
-    MUTATION_MODE=debug sh tools/mutation/run.sh  # the same set in Debug, 39 minutes
+    MUTATION_MODE=debug sh tools/mutation/run.sh  # the same set in Debug, 44 minutes
 
 Each argument is matched as a substring, so `matmul` is the whole matmul family and `rope` is the
 rope mutation. That is the command a developer reaches for mid-run, and it used to exit 2: a `case`
@@ -198,11 +237,11 @@ and every such mutation reads as coverage that does not exist.
 The Debug suite and the ReleaseFast one are both timed by the two commands below, on this host
 with a warm build cache; a cold cache adds compilation to both and moves neither ratio.
 
-    zig build test                              # Debug: 161 s here
-    zig build test -Doptimize=ReleaseFast        # ReleaseFast: 7 s here
+    zig build test                              # Debug: 145 s here
+    zig build test -Doptimize=ReleaseFast        # ReleaseFast: 33 s here
 
 The difference is the suite executing, not compiling: a mutation invalidates one file either way. A
-Debug-only default is about 39 minutes for 16 mutations, at the 145 s a Debug mutation measured in
+Debug-only default is about 44 minutes for 18 mutations, at the 145 s a Debug mutation measured in
 `run.sh`'s own timing comment rather than at a second, conflicting figure, which is a number nobody runs, and a default
 nobody runs measures nothing. ReleaseFast is also the mode the `train` binary ships in.
 
@@ -217,7 +256,7 @@ this set the choice cost nothing measured. `MUTATION_MODE=verify` runs both conf
 badly written and nothing about the suite, so it is reported separately and never folded into the
 headline. `SURVIVED` is the rest, and each survivor is classified in the output rather than counted,
 because a survivor that is behaviourally identical is not a hole in the suite and one that moves the
-numbers is. At HEAD, 14 of 16 caught, by between 1 and 18 tests each:
+numbers is. At HEAD, 16 of 18 caught, by between 1 and 21 tests each:
 
 | Mutation | Class | What it means |
 |---|---|---|
@@ -237,7 +276,7 @@ matching — because the source moved — writes an unmutated file, the suite pa
 reports a live defect as a coverage hole. A false survivor is worse than no harness, because it is
 a number a reader would believe.
 
-`class` in that table is an author's claim, not a measurement: the suite's exit code alone decides
+the classification in that table is an author's claim, not a measurement: the suite's exit code alone decides
 caught or survived, and the class only labels the damage afterwards. `mutate list` prints the
 names, and `mutate show <name>` prints the exact before and after for any one of them.
 

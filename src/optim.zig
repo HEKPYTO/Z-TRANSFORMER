@@ -3,7 +3,7 @@
 //! This module consumes gradients it is handed. It computes none, and it has no
 //! backward pass, so the caller owns the backward functions and the buffers they
 //! write into. Every loop here runs in a fixed order over a flat buffer, because
-//! Phase 2 wants two runs of one seed to agree bit for bit.
+//! two runs of one seed have to agree bit for bit.
 
 const std = @import("std");
 const Tensor = @import("tensor.zig").Tensor;

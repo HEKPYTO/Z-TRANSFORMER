@@ -26,6 +26,7 @@ comptime {
     _ = @import("autograd_test.zig");
     _ = @import("gradcheck_test.zig");
     _ = @import("scale_test.zig");
+    _ = @import("attn_bench_test.zig");
 }
 
 comptime {
@@ -39,6 +40,14 @@ comptime {
 // Every `src/*_test.zig` is named by one of the blocks above, and a file that
 // is not named there compiles to nothing: no test in it is ever built, and
 // `zig build test` stays green. That is the failure this exists to catch.
+//
+// The scope is test files, and saying so is the point: `src/cuda/norm_twin.zig`
+// is 337 lines of Zig under `src/` that this walk cannot see and no build
+// target compiles. It is not dead -- `src/cuda/run-norm.sh` builds it as its
+// own module root -- but nothing in `zig build test` or CI checks it, which is
+// why `AGENTS.md` says no CI step reaches it. (`zig build cuda-check` compiles
+// `norm.cu` and `probe.cu` under the pinned toolchain, but not this file, which
+// is a module root only for run-norm.sh, and it is not in `verify` either.")
 //
 // Zig 0.16 has no comptime filesystem: `std.fs.cwd` is gone with the rest of
 // the pre-`std.Io` API, and every `std.Io.Dir` call needs an `Io` instance,

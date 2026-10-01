@@ -57,7 +57,7 @@ const corpus_sha256 = "86c4e6aa9db7c042ec79f339dcb96d42b0075e16b8fc2e86bf0ca57e2
 const loss_csv_path = "outputs/loss.csv";
 const loss_csv_sha256 = main_source.csv_sha256;
 
-/// `tools/removed/report.csv`: the 156 tensor rows of the Llama
+/// `tools/removed/report.csv`: the 204 tensor rows of the Llama
 /// comparison, written by `tools/removed/oracle.txt` while
 /// `sh tools/removed/check.sh` ran it against the pinned `reference-library` 4.57.3
 /// and `torch` 2.14.0 reference in a repo-local virtualenv.
@@ -73,19 +73,27 @@ const loss_csv_sha256 = main_source.csv_sha256;
 /// owner; it is not a second spelling of the comparison, which is why
 /// `check.sh` still is the only entry point to that.
 ///
-/// Two digests rather than one, because this one was measured to be unreachable
-/// from anywhere but the machine that committed it. The report carries
-/// `max_abs_delta` per row and a six-column environment block, and a second
-/// host's BLAS rounds the first differently: `l0.v` reads `5.96e-08` on macOS
-/// and `1.043e-07` on glibc, both far inside the `1e-05` gate, and a CUDA
-/// torch build spells its own version `2.14.0+cu130` where the committed
-/// record says `2.14.0`. A byte digest over the whole file therefore fails on
-/// every host that is not the one that produced it, which is the only host CI
-/// is not, so the gate had never run anywhere automatic. `addParityReportCheck`
-/// states the two halves: a projection every host can check, and these bytes
-/// where they are comparable.
+/// Two digests rather than one, because this one is reachable only on the
+/// platform that committed it, and that is a property of the version string
+/// rather than of the arithmetic. The report carries `max_abs_delta` per row
+/// and a six-column environment block. The Linux torch wheel bakes its CUDA
+/// build into the version it reports at runtime — `2.14.0+cu130` where the
+/// committed record says `2.14.0` — while the macOS wheel is CPU-only and
+/// reports the bare `2.14.0`. So on every Linux host, Fedora and
+/// ubuntu-latest alike, the environment guard fires and these bytes are not
+/// compared; on macOS they are. Measured on Fedora: the projection matched
+/// exactly, all 18 kinds and 206 rows, and the byte digest was skipped for the
+/// version string, not for a float.
+///
+/// What that costs is stated rather than hidden: the cross-host question for
+/// `max_abs_delta` is not answered by this gate, on any host, ever. Nothing
+/// here shows that two hosts round the delta the same way, and the two values
+/// once quoted as evidence of a host difference were `l0.v` at `T=1` and `T=8`
+/// in one host's own report. `addParityReportCheck` states the two halves: a
+/// projection every host checks, and these bytes on the one host whose version
+/// string matches.
 const removed_report_path = "tools/removed/report.csv";
-const removed_report_sha256 = "c91abe2e924883b519ecfa537f015de1cf4d7e034fcbfd92828e21d139c8d30e";
+const removed_report_sha256 = "d0d501f0dcc5170b7b3bb8f324ed14badae9a2282b7f14245e80bdd8525586b1";
 
 /// `report.csv` with the two groups of columns that are not a property of the
 /// comparison removed: `max_abs_delta`, which is the float another host rounds
@@ -109,7 +117,7 @@ const removed_report_sha256 = "c91abe2e924883b519ecfa537f015de1cf4d7e034fcbfd928
 /// inside the gate, but two orders of magnitude worse — is invisible here, and
 /// that is stated in the READMEs rather than left to be discovered. The
 /// projection is a check on the gates, not on the arithmetic behind them.
-const removed_report_projection_sha256 = "09bf8ff177240862ec421cd5f69a19d19cd2a09e848eb94ddec02827f4ebba9d";
+const removed_report_projection_sha256 = "eb303e0b4d2a84c9c98c7af373dc165643df0058e4364b58ed6580a789db18f4";
 
 /// The environment columns of the committed report, and the predicate for
 /// running the byte digest over it.
@@ -241,6 +249,15 @@ pub fn build(b: *std.Build) void {
     });
     const dbg_train_run = b.addRunArtifact(dbg_train_exe);
     dbg_train_run.addArg("train");
+    // This step's entire purpose is the comparison, and a Debug build of
+    // identical source does not reproduce the committed ReleaseFast curve, so
+    // `settleCsv` refuses to promote it and exits 1. That guard is right for
+    // `zig build train` and wrong here: without this the step failed on every
+    // run, which is the guard working and the step being useless at the same
+    // time. The flag acknowledges the difference and still does not replace the
+    // committed curve, so `train` keeps the guard and only this step relaxes it,
+    // and the Debug build is still covered by `zig build test`.
+    dbg_train_run.setEnvironmentVariable("ZTRANSFORMER_ACCEPT_LOSS_DIFFERENCE", "1");
     const dbg_train_step = b.step("dbg-train", "Train in Debug, for a host-difference comparison");
     dbg_train_step.dependOn(&dbg_train_run.step);
 
@@ -253,6 +270,18 @@ pub fn build(b: *std.Build) void {
     scale_run.addArg("scale-profile");
     const scale_step = b.step("scale-profile", "Print the projected cost of shapes this model cannot be run at");
     scale_step.dependOn(&scale_run.step);
+
+    // `zig build attn-bench` measures what one CPU attention call costs at each
+    // context length and prints it beside the PCIe floor a GPU version would
+    // have to clear. It reuses the same ReleaseFast binary as `zig build train`
+    // rather than adding an executable: ReleaseFast because the whole point is
+    // the time, and a Debug figure would describe code the project does not
+    // ship; the train step's corpus dependency is on the run step, not the
+    // artifact, so nothing is fetched. It writes nothing.
+    const attn_bench_run = b.addRunArtifact(train_exe);
+    attn_bench_run.addArg("attn-bench");
+    const attn_bench_step = b.step("attn-bench", "Measure CPU attention per context length against the PCIe floor a GPU kernel must clear");
+    attn_bench_step.dependOn(&attn_bench_run.step);
 
     // One test binary per mode. The two run concurrently: `train_test.zig`
     // writes its scratch CSVs under a per-process directory, so two copies in one
@@ -358,6 +387,55 @@ pub fn build(b: *std.Build) void {
     const bench = b.step("bench", "Report median CPU seconds per training step over N runs (default 3)");
     bench.dependOn(&addBench(b, train_exe).step);
 
+    // Nothing in this graph reached `src/cuda/` until now, which `AGENTS.md`
+    // said out loud: a change there was unchecked until a person ran
+    // `sh src/cuda/run-norm.sh` on an NVIDIA host. This compiles the two `.cu`
+    // files, so a syntax or type error in them is caught by the build system.
+    //
+    // Deliberately NOT in `verify`, and the reason is the same one that keeps
+    // `removed-digest` out: `verify` is silent on success and CI asserts that, so
+    // anything in it runs on every ubuntu runner. A GitHub runner has no CUDA
+    // toolchain and never will, so a compile step there would be a red for a
+    // reason that has nothing to do with the code. A named step a reader has to
+    // ask for is better than a gate that is always red or a directory nothing
+    // compiles.
+    //
+    // It sources `src/cuda/cuda.sh` and compiles through `cuda()`, rather than
+    // restating the flags or calling the host's nvcc, so the architecture
+    // derivation, the `-Werror -fPIC` set and the toolchain itself keep exactly
+    // one owner. That matters more than it looks: a host may well have a second,
+    // newer toolkit installed, and compiling with that while measuring with the
+    // pinned one would mean two toolchains in one repository, which is the
+    // condition that lets a benchmark quietly stop describing the build that
+    // produced it. So this says nothing about what any host has installed; the
+    // invariant it enforces is that the check compiles what is measured.
+    //
+    // It also inherits cuda.sh's guard: with no toolchain and no GPU, sourcing
+    // fails and the step says so rather than skipping. A compile check that
+    // quietly compiles nothing is the same defect as a gate that quietly checks
+    // nothing.
+    const cuda_check = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        \\set -eu
+        \\CUDA_ROOT_DIR=$PWD
+        \\export CUDA_ROOT_DIR
+        \\. src/cuda/cuda.sh
+        \\cuda_pull
+        \\flags=$(cuda_nvcc_flags)
+        \\for f in norm probe attn; do
+        \\  cuda "nvcc $flags -c -o .zig-cache/cuda-check-$f.o src/cuda/$f.cu"
+        \\  echo "cuda-check: src/cuda/$f.cu compiled for $CUDA_ARCH"
+        \\done
+        \\for f in norm probe attn; do rm -f ".zig-cache/cuda-check-$f.o"; done
+        \\echo "cuda-check: every source compiled with the pinned toolchain, which is"
+        \\echo "the one sh src/cuda/run-norm.sh measures with."
+        ,
+    });
+    cuda_check.setCwd(b.path("."));
+    const cuda_check_step = b.step("cuda-check", "Compile src/cuda/*.cu with the pinned toolchain, or fail loudly if there is none");
+    cuda_check_step.dependOn(&cuda_check.step);
+
     // Every `module.Symbol` row in src/README.md's tables names a declaration the
     // code actually makes pub. The drift is not hypothetical: 6c2a9c5 had to
     // hand-edit five table rows because nothing said otherwise, and the script
@@ -400,7 +478,34 @@ pub fn build(b: *std.Build) void {
     const report_rows = b.addSystemCommand(&.{
         "sh",
         "-c",
-        \\if grep -q FAIL "$1"; then
+        \\# `-r` and the case-insensitive match are both load-bearing, and both
+        \\# were found by breaking this gate rather than by reading it. `grep -q`
+        \\# exits 2 on a missing file, so the `if` below was false and the step
+        \\# exited 0: a committed report that is *absent* passed the check
+        \\# written to catch one that is corrupt. And `FAIL` is the oracle
+        \\# writer's casing, not a contract this gate asserts, so a one-character
+        \\# change to `fail` turned the gate into a no-op. And a readable but EMPTY
+        \\# file satisfied `-r` while grep found no failing row in nothing, so an
+        \\# empty export was green too. So there are three tests and they fail
+        \\# closed: unreadable or absent, near-empty, and a failing row. What
+        \\# they do NOT catch is a partial export that keeps several rows and
+        \\# drops the rest -- nothing here compares the row count to 204 -- and
+        \\# the digest check that would catch that is deliberately out of
+        \\# `verify`, so this gate is narrower than the failure it names.
+        \\if [ ! -r "$1" ]; then
+        \\  echo "tools/removed/report.csv is missing or unreadable, so there is" >&2
+        \\  echo "no committed comparison for this gate to inspect. A gate that" >&2
+        \\  echo "cannot read its subject has not passed it." >&2
+        \\  exit 1
+        \\fi
+        \\if [ ! -s "$1" ] || [ "$(grep -c . "$1")" -lt 3 ]; then
+        \\  echo "tools/removed/report.csv has fewer than three lines, so it is" >&2
+        \\  echo "empty or truncated rather than a comparison. Readable is not" >&2
+        \\  echo "populated, and the failing-row grep below finds nothing in" >&2
+        \\  echo "nothing, so without this both tests pass a zero-byte report." >&2
+        \\  exit 1
+        \\fi
+        \\if grep -qi fail "$1"; then
         \\  echo "tools/removed/report.csv carries failing rows, so the committed" >&2
         \\  echo "report is a perturbed export rather than a comparison that" >&2
         \\  echo "passed. check.sh and sensitivity.sh both write this file:" >&2
@@ -630,25 +735,14 @@ fn addPeakRssCheck(b: *std.Build, train_exe: *std.Build.Step.Compile) *std.Build
 
 /// Reports the ReleaseFast training run's CPU seconds per step, median of N.
 ///
-/// Reports, never gates; `addPeakRssCheck` explains why the two differ. CPU
-/// time rather than wall clock because this box is shared and wall clock tracks
-/// whatever else is running, not this program. `/usr/bin/time` is used for the
-/// same reason the memory gate uses it: `zig build` makes the binary a
-/// grandchild and the number never reaches the build runner.
-///
-/// `ZTRANSFORMER_ACCEPT_LOSS_DIFFERENCE=1` for the reason the memory gate sets
-/// it: a libm difference on another host must not turn a timing run into a
-/// failure. The curve digest is not this step's business, and nothing is
-/// promoted either way.
-///
-/// Reports the ReleaseFast training run's CPU seconds per step, median of N.
-///
 /// The step count is read from the run rather than written here, so the figure
 /// is total CPU over the steps the run actually did.
 ///
 /// Reports, never gates; `addPeakRssCheck` explains why the two differ. CPU
 /// time rather than wall clock because this box is shared and wall clock tracks
-/// whatever else is running, not this program.
+/// whatever else is running, not this program. `/usr/bin/time` is used for the
+/// same reason the memory gate uses it: `zig build` makes the binary a
+/// grandchild and the number never reaches the build runner.
 ///
 /// That distinction is load-bearing and the first version of this script got it
 /// wrong in a way that is invisible from its own output. macOS `/usr/bin/time
@@ -674,7 +768,7 @@ fn addPeakRssCheck(b: *std.Build, train_exe: *std.Build.Step.Compile) *std.Build
 /// `ZTRANSFORMER_ACCEPT_LOSS_DIFFERENCE=1` for the reason the memory gate sets
 /// it: a libm difference on another host must not turn a timing run into a
 /// failure. The curve digest is not this step's business, and nothing is
-/// promoted it either way beyond what `train` always does on a digest match.
+/// promoted by it either way beyond what `train` always does on a digest match.
 ///
 /// It runs the whole training run N times, tokenizer startup included, and
 /// divides by the steps the run reports rather than by a constant here. So the
@@ -854,7 +948,26 @@ fn addParityReportCheck(b: *std.Build) *std.Build.Step.Run {
         \\  rm -f "$p"; exit 1
         \\fi
         \\rm -f "$p"
-        \\got=$(awk -F, 'NR > 1 { print $10 "," $11 "," $12 "," $13 "," $14 "," $15; exit }' "$1" | tr -d '\r')
+        \\# Every row's environment, not row 2's. This predicate decides whether
+        \\# the byte digest runs at all, and it was read out of the file it is
+        \\# checking, so editing one row's version columns made it disagree with
+        \\# the committed record and switched the byte digest off -- an inflated
+        \\# `max_abs_delta` then passed with every verdict still reading `pass`.
+        \\# Found by breaking the gate, not by reading it. Rows that disagree
+        \\# with each other are a malformed report, so this fails rather than
+        \\# skips; a genuinely different host has every row agreeing, which is
+        \\# the case the skip exists for.
+        \\uniq=$(awk -F, 'NR > 1 { print $10 "," $11 "," $12 "," $13 "," $14 "," $15 }' "$1" | tr -d '\r' | sort -u)
+        \\rows=$(printf '%s\n' "$uniq" | wc -l | tr -d ' ')
+        \\if [ "$rows" -ne 1 ]; then
+        \\  echo "committed parity report: the environment columns are not the same" >&2
+        \\  echo "on every row ($rows distinct values), so this is not a report one" >&2
+        \\  echo "oracle wrote. A row was edited to move the predicate below, which" >&2
+        \\  echo "is the switch that decides whether the byte digest runs." >&2
+        \\  printf '%s\n' "$uniq" | sed 's/^/  /' >&2
+        \\  exit 1
+        \\fi
+        \\got=$uniq
         \\if [ "$got" != "$3" ]; then
         \\  echo "removed-digest: projection OK; byte digest NOT run, this host's oracle is not" >&2
         \\  echo "            the one the committed digest was taken over."

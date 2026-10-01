@@ -214,8 +214,9 @@ test "tensor matmul reduces in f32, not f64" {
     // The reference is narrowed to f32 before it is compared, because that is
     // what `matmul` returns. Both spellings store f32, so comparing an f32
     // against an unrounded f64 sum leaves the f32 store rounding on one side
-    // only, and that term alone is 9.3e-9 here: two orders above the f64 gate
-    // and a test that cannot tell an f64 accumulator from an f32 one.
+    // only, and that term alone is 9.3e-9 here, which is 8.2e4 times the 1.14e-13
+    // f64 gate -- nearly five orders, and a test that cannot tell an f64
+    // accumulator from an f32 one.
     //
     // The normalisation is the sum of the absolute products rather than the
     // result, because the result of a cancelling dot product is near zero and a

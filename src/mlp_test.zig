@@ -4,7 +4,7 @@ const tensor = @import("tensor.zig");
 const Tensor = tensor.Tensor;
 
 // f32 keeps about seven significant digits, so a hand-written fp64 literal
-// cannot be asserted exactly. 1e-6 is the Phase 1 tolerance.
+// cannot be asserted exactly. 1e-6 is the tolerance this file uses throughout.
 const tol: f32 = 1e-6;
 
 fn make(allocator: std.mem.Allocator, rows: usize, cols: usize, vals: []const f32) !Tensor {

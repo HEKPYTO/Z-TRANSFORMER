@@ -14,9 +14,11 @@
 # manifest rather than hardcoding shapes of its own.
 #
 # Everything lands under .zig-cache/cuda/norm, which is gitignored, and all of it
-# is removed on every exit path including a failing one. Nothing is left on the
-# host, nothing is written outside the repository, and no container, cache or
-# object survives the run.
+# is removed on every exit path including a failing one. Nothing is written
+# outside the repository, and no container, scratch file or object survives the
+# run. One thing does survive, on purpose: the pinned CUDA image, 11.4 GB, which
+# `docker run --rm` does not remove and `docker image rm` in cuda.sh would rather
+# not do on every invocation. It is a toolchain, not output.
 
 set -eu
 

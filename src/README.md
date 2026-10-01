@@ -27,10 +27,12 @@ deliberately exports no modules, because a file that is both re-exported by the 
 imported directly puts one file in two Zig modules, which the build refuses.
 
 One directory here is not Zig. `src/cuda/` holds the CUDA source and the container recipe that
-compiles and runs it, because `nvcc` cannot be installed on a GPU host without root, and the CUDA
-the distribution's NVIDIA repository ships is version-skewed against the one this repository targets.
-No `src/*.zig` file imports it and `build.zig` does not reference it yet, so the 33 `.zig`
-files above are still the whole compiled surface. `sh
+compiles and runs it. The container is the pinned toolchain rather than the host's: the benchmark
+table in `src/cuda/README.md` was measured with it, and a repository that compiles with one CUDA
+and measures with another describes a build that never ran. `zig build cuda-check` therefore
+compiles both `.cu` files through the same `cuda()` the runners use, so the directory is reached
+from the build graph. No `src/*.zig` file imports it, so the 33 `.zig` files above are still the
+whole compiled Zig surface. `sh
 src/cuda/run-probe.sh` compiles the probe and runs it on the local GPU; `src/cuda/README.md` says
 what that does and does not establish.
 
@@ -55,6 +57,7 @@ what that does and does not establish.
 | `mlp.silu` | `silu(z: f32) f32` | `z * sigmoid(z)`, safe in the negative tail. |
 | `attention.Config` | `{ n_heads, n_kv_heads, head_dim }` | Grouped-query shape. |
 | `attention.forward` | `forward(allocator, q, k, v, cfg) !Tensor` | Causal GQA, two passes over the scores. |
+| `attention.forwardWith` | `forwardWith(allocator, q, k, v, cfg, ?*model.Sink, layer) !Tensor` | The same pass, materialising the `[T·n_heads, T]` softmax matrix and handing it to `sink`. `forward` is this with a null sink. The training step is **not** on that path: `train.zig` passes a live sink, so it materialises the matrix and pays for it. Only `evalLoss` and `gradcheck` use the null form. |
 | `loss.forward` | `forward(logits, targets) !f64` | Mean cross-entropy, `logsumexp` form. No allocator argument. |
 
 `rope.forward` takes the head width because the row is `n_heads` head blocks laid end to end, each
@@ -267,9 +270,9 @@ re-run. `bench` reports the whole run and nothing below its level.
 
 The first round unrolled `weightGrad`'s column loop and `inputGrad`'s row loop eight ways, which
 were 77% of the backward. The second went after `attentionBackward`, at an observed 10.54 ms a call
-and 14.7% of a step, and took it to 6.11 ms and 9.1%: 4.43 ms a call times 4 calls is 17.7 ms a step
-against an observed 18.2 ms a step end to end, so 3% of the gain came from anywhere else. Note that
-0.4522 to 0.2721 is the span of **both** rounds, not of the second alone.
+and took it to 6.11 ms. A step is about 272 ms, so 4.43 ms a call times 4 calls is 17.7 ms of it,
+against an observed **18.2 ms reduction in the whole step** — 3% of the gain came from anywhere else. Note that 0.4522 to 0.2721 is the span of **both** rounds, not
+of the second alone.
 
 What made the second round different is that its split axis was neither a column nor a row. The two
 gathered-row dot products split on `s`, giving eight independent chains of length `dim`; the `d q`
@@ -300,7 +303,7 @@ makes `h * dim` and `kv * dim` identically zero in the only check that reached t
 it is the only fixture that executes those paths. The proof that it is load-bearing is a manual experiment rather than a committed
 mutation, and there is no `tools/mutation` entry for it: no mutation in `mutate.zig` targets an
 unrolled lane. Replacing one unrolled lane write with lane zero's value fails that test and
-**only** it, 191 of 192 still passing, because every other gradcheck in the file never reaches that
+**only** it, 192 of 193 still passing, because every other gradcheck in the file never reaches that
 code at all. A reviewer read the test names back and observed that `train_test.zig` does reach the
 `s`-splits at `ctx 32`; whether its other assertions would catch a bad `d q` lane is not checkable
 from the tree, so the "only it" is what was measured, not what is proven.
@@ -322,7 +325,7 @@ eight by accident. `unroll_tail` in `src/autograd_test.zig` is the fixture that 
 | `model.initParams` | `initParams(allocator, cfg, seed) !Params` | Deterministic from `seed`. |
 | `model.forward` | `forward(allocator, p, cfg, tokens) !Tensor` | Returns logits `[T, vocab]`. |
 | `model.forwardWith` | `forwardWith(allocator, p, cfg, tokens, ?*Sink) !Tensor` | The same pass, handing each intermediate to a `Sink`. `forward` is this with a null sink. |
-| `model.Name` | 17 values | Which intermediate a `Sink.put` call is about. |
+| `model.Name` | 18 values | Which intermediate a `Sink.put` call is about. |
 | `model.Sink` | `{ put }` | A callback, not a bag of pointers: the intermediates live in buffers the pass frees before it returns. |
 | `parity.run` | `run(allocator, io, s: Sweep) !Summary` | Writes the weights, intermediates, token ids and shape to `outputs/parity/`. |
 | `parity.runInto` | `runInto(allocator, io, out_dir, s: Sweep) !Summary` | `run` with the output directory as an argument. One caller overrides it: `removed_test.zig`, which would otherwise overwrite the sweep the Python oracle reads with a one-layer fixture. |
@@ -340,11 +343,23 @@ callback is the only thing the pass does that the arithmetic does not already do
 the same statements in the same order, which `model_test.zig` asserts bit for bit. It is a function
 pointer rather than a set of tensor pointers because the intermediates live in buffers the pass frees
 before it returns, and a pointer recorded during the pass would dangle by the time a reader got to it.
-The one tensor the design names and this cannot reach is the attention probabilities:
-`attention.forward` reduces them internally and returns only the result, so reaching them means
-changing that file. `parity.run` writes raw little-endian f32 with a text index rather than
-safetensors, because the oracle never calls `from_pretrained` and there is one dtype and no mmap on
-either side. `tools/README.md` says what the harness checks and what it does not.
+Of the tensors the design names, all of them are gated, and the last one to close was the attention
+probabilities. `attention.forwardWith` materialises them as `[T·n_heads, T]` — row `h·T + t` is the
+softmax over the causal prefix of query `t` in head `h`, with the upper triangle left at the zero
+`Tensor.init` writes, which is what a causal query's out-of-prefix keys are — and `attention.forward`
+still does not, because it is that function with a null sink. Note which callers
+that does and does not spare: the autograd pass, the training run and the bench all reach attention
+through `model.forwardWith` with a live sink and so do materialise it; the null path is for a caller
+that wants no intermediate at all. That is the only intermediate quadratic in the context, and what a
+sink costs is 1 MiB at the shipped T=256 over four heads, freed before `forwardWith` returns — one
+layer's worth of peak against a measured whole-model peak of about 47 MiB, and a step time that did
+not move. `autograd.Cache` takes the name and stores nothing, which is true rather than convenient —
+`attentionBackward` is handed `q_pos` and `k_pos` and rebuilds the forward's softmax row in f64 from
+them. `mlp_gate`, `mlp_up` and `mlp_hidden` are exported into `data.bin` at `[T, ffn]` and compared
+against external, which hands all three over at module boundaries: the two halves as `gate_proj` and
+`up_proj` outputs, the product as `down_proj`'s input. `parity.run` writes raw little-endian f32 with a
+text index rather than safetensors, because the oracle never calls `from_pretrained` and there is one
+dtype and no mmap on either side. `tools/README.md` says what the harness checks and what it does not.
 
 ## Gradients
 
@@ -462,11 +477,19 @@ weakening reports 3.93 and passes a 1.5 floor with room to spare — while raisi
 catch it would report every correct gradient as a failure. The gate was pointed the wrong way, and
 could only ever have caught a budget that had been *tightened*.
 
+One note on the figures in this section, because they are the kind that get quoted onward: `2.6184`,
+`2.6442`, `0.46 to 10.2`, `0.88` and `0.62` are **not** reproduced by any command in this repository.
+No test prints them — `gradcheck_test.zig` asserts `2.62 +/- 0.35` and stops there — and the
+sweep harness that produced them was never committed, the same as the 550-sweep analysis below. They
+are recorded here with their method (a pinned-seed finite-difference sweep, `liveParams` drawing from
+`0xbeef`, median over the grid), as are the figures derived from them — `3.93` at `f = 1.5` and
+`26` at `f = 10` — and they are evidence for the committed constant `k = 12`, not measurements of
+the current tree. What the tree does reproduce is the assertion.
+
 Both sides are now asserted against a measurement rather than a preference. The fixture is pinned —
 `liveParams` draws from the literal `0xbeef` — so the sweep is the same sweep every run, reading 2.6184
 in ReleaseFast and 2.6442 in Debug. The 0.35 tolerance is about 13%: an order of magnitude above the 1%
-spread between the two configurations, and an order of magnitude below the 51% a 1.5x weakening moves
-it by. A budget multiplied by `f` reports `2.6184 * f`, so the band catches any change beyond roughly
+spread between the two configurations, and 3.8x below the 50% a 1.5x weakening moves it by. A budget multiplied by `f` reports `2.6184 * f`, so the band catches any change beyond roughly
 0.87x to 1.13x in either direction.
 
 The 4000-draw study of the headroom under **redrawn** seeds, which runs 0.46 to 10.2, still governs
@@ -527,7 +550,7 @@ you do.
 <!-- scale-profile:begin -->
 ```
 ARITHMETIC, PROJECTED, GFLOP
-name              attn_core   attn_proj         mlp   tied_head weight_grad  core/mlp   core%   tied%
+name              attn_core   attn_proj         mlp    tied/stp weight_grad  core/mlp   core%   tied%
 shipped                0.02        0.03        0.10        0.20        0.13     0.167    3.9%   10.5%
 ctx-1k                 0.27        0.10        0.40        0.81        0.50     0.667   11.6%    8.0%
 ctx-4k                 4.30        0.40        1.61        3.22        2.01     2.667   22.7%    4.1%
@@ -537,14 +560,14 @@ llama3-8b-32k       8796.36     2748.78    13194.14   103285.37    15942.92     
 at-parity-12d      19791.61     4123.17    19791.21   154928.06    23914.38     1.000   15.1%    3.6%
 
 BYTES, PROJECTED, GiB
-name               params     grads      adam       act      peak    scores   tied_GB  kv_cache
-shipped             0.001     0.001     0.002     0.003     0.007     0.004     0.125     0.000
-ctx-1k              0.001     0.001     0.002     0.012     0.016     0.063     0.500     0.002
-ctx-4k              0.001     0.001     0.002     0.048     0.053     1.000     2.000     0.008
-d4096-ctx4k         7.740     7.740    15.479    10.330    41.288    64.000  8016.000     1.000
-llama3-8b           7.740     7.740    15.479    20.660    51.618   256.000 16032.000     2.000
-llama3-8b-32k       7.740     7.740    15.479    82.641   113.599  4096.000 64128.000     8.000
-at-parity-12d       7.740     7.740    15.479   123.961   154.919  9216.000 96192.000    12.000
+name               params     grads      adam       act      peak    scores  tied_GiB  kv_cache
+shipped             0.004     0.004     0.008     0.014     0.031     0.004     0.125     0.000
+ctx-1k              0.004     0.004     0.008     0.058     0.075     0.063     0.500     0.002
+ctx-4k              0.004     0.004     0.008     0.232     0.248     1.000     2.000     0.008
+d4096-ctx4k        30.958    30.958    61.916    42.524   166.356    64.000  8016.000     1.000
+llama3-8b          30.958    30.958    61.916    85.047   208.879   256.000 16032.000     2.000
+llama3-8b-32k      30.958    30.958    61.916   340.188   464.020  4096.000 64128.000     8.000
+at-parity-12d      30.958    30.958    61.916   510.282   634.114  9216.000 96192.000    12.000
 
 VERDICTS, one line per deferred item, at 32 GiB of host memory
 shape             fused_attn     kv_cache    tied_head   wgrad_swap  dense_scores
@@ -568,12 +591,20 @@ the 6% the note names is `T = 0.71 * d` rather than whatever the dense count giv
 the deferral survives, and it was the right call anyway: the core is 3.9% of a layer's step at the
 shipped shape and 4.0% at Llama-3 8B. The threshold was wrong.
 
-The three thresholds, as the tool prints them:
+The four deferred items and their thresholds. `zig build scale-profile` prints these as its
+`CROSSOVERS` block, and this table is transcribed from it rather than gated by it: the automated
+check in `build.zig` compares the `scale-profile:begin`/`end` block above against the tool's output
+and would reject prose in between. So the transcription is a place this file can drift, and the
+command to re-check it is the one named in `build.zig`. The `T >= 3 * d` column is the tool's
+`no below T = 383 ... yes at or above` restated for this model's `d = 128` head width: `crossoverT`
+is `3 * bar * h - 1` with `h = 4d`, so for `bar = 0.25` it is `3d - 1 = 383`, and the tool's first
+affirmative `T` is 383. The table rounds that to `3 * d`, which is the same threshold stated for a
+head width that cannot be fractional and is off by the one the `-1` leaves behind.
 
 | Deferred item | Worth doing at | Deciding number |
 |---|---|---|
-| Fused IO-aware attention | `T >= 3 * d` | `core/mlp >= 0.25`. No at the shipped shape (0.167) and no at 8B (0.167), yes at 32k (0.667). |
-| KV cache | `T >= 3 * d` | The same term, because the only thing a cache removes is the recompute of the quadratic part. It also costs 2 GiB at 8B and 12 GiB at the parity row. |
+| Fused IO-aware attention | `T >= 3 * d` | **Superseded.** `core/mlp >= 0.25` gives no at the shipped shape (0.167) and no at 8B (0.167), yes at 32k (0.667). The kernel exists and wins at least 105x at the shipped shape, between 106x and 165x across the other shapes. `core/mlp` is a share of arithmetic and not of time. See "Attention: the floor, and then the kernel" below. |
+| KV cache | `T >= 3 * d` | The same term, and the same flaw: it is a share of arithmetic and not of time. Still a target, unmeasured. The attention row above is the cautionary tale for this one. It also costs 2 GiB at 8B and 12 GiB at the parity row. |
 | Tied-head restructure | `vocab >= 3 * d` | Landed, see below. `tied / (3 * mlp) >= 0.25` at every row here, including the shipped one at 10.5% of the step. |
 | `weightGrad` loop-order swap | never | Not a ratio. It reorders a fixed multiply-add count, so no shape improves it, and `matmul`, `weightGrad` and `inputGrad` already stream contiguous rows. |
 
@@ -602,6 +633,119 @@ f64 accumulator is not negotiable here: it is the tied head that the softmax in 
 exponentiates. The tied-head *backward* in `autograd` is a separate loop, and was left alone for
 the same reason this section's first paragraph gives for the shape: it is intensity, not count.
 
+## Attention: the floor, and then the kernel
+
+`zig build attn-bench` measures one call of `attention.forward` at five context lengths and prints it
+beside the PCIe floor a GPU implementation would have to clear.
+
+```
+     ctx       calls  cpu_us_min   pcie_MiB    floor_us   ratio  verdict
+  --------  ---------  ------------  ---------  ----------  --------  -------------------------------------------
+       256         82       6084.07      0.375       64.46       94x  floor is below the cpu: the kernel's own cost decides
+       512         20      25313.41      0.750      128.92      196x  floor is below the cpu: the kernel's own cost decides
+      1024          5     103435.41      1.500      257.85      401x  floor is below the cpu: the kernel's own cost decides
+      2048          3     422220.31      3.000      515.69      819x  floor is below the cpu: the kernel's own cost decides
+      4096          3    1693164.72      6.000     1031.39     1642x  floor is below the cpu: the kernel's own cost decides
+```
+
+On the 32-core Linux host. `cpu_us_min` is the **minimum** per-call time over `calls` calls, because
+contention and frequency scaling only make a call slower. `floor_us` is q, k and v in plus the result
+out at 6.1 GB/s, the rate `src/cuda/README.md` measured; `src/attn_bench.zig` names where that constant
+comes from, and it is the weakest number in the table.
+
+**The ratio column is not a figure to quote to two significant digits.** Three sweeps of this table on
+that host put the shipped row at 6084, 8344 and 10311 us, a 69% spread in host load alone. What is
+stable across all three is the order of magnitude: two at the shipped window, three at 4096.
+
+### What the kernel turned out to be: `sh src/cuda/run-attn.sh`
+
+`src/cuda/attn.cu` is that kernel: one block per query and head, walking the causal prefix with the
+running softmax in registers and no score matrix ever written to global memory. It is forward only and
+it is not wired into `zig build train`. The full table, the three-run reproducibility measurement, the
+attack on its own gate and its known limitation are in `src/cuda/README.md`; the two facts that belong
+here are these.
+
+```
+shape          ctx     cpu_us   kernel_us   max_abs     gate   used    ratio  parity  argmax
+ctx256          256   10884.32     103.442  5.960e-08     1e-04  0.060%    105.2x  ok   argmax 517
+ctx4096        4096 3080129.43   18625.433  5.960e-08     1e-04  0.060%    165.4x  ok   argmax 517
+llama3-T512     512 1551863.40   11817.677  7.451e-08     1e-04  0.075%    131.3x  ok   argmax 76157
+attn: OK
+attn: broken variant 1 was caught, as it must be
+attn: broken variant 2 was caught, as it must be
+attn: broken variant 3 was caught, as it must be
+attn: broken variant 4 was caught, as it must be
+```
+
+At Llama-3's own geometry -- 32 heads over 8 kv heads at `head_dim` 128 -- the parity is `7.451e-08`,
+0.075% of the gate. That row is there because a kernel only ever run at `head_dim` 32 has not been
+shown to run at the width this project is about.
+
+`max_abs` is `5.960e-08` and `7.451e-08`, which is 0.060% and 0.075% of the `1e-4` gate. An earlier
+version of this file called that "one `f32` ulp at a value of 1.0". That was wrong: the ulp at 1.0 is
+`1.19e-07`, and these outputs are weighted averages of V values in `[-0.5, 0.5]` so `|out|` sits well
+below 1. The defensible statement is one or a few units in the last place at the magnitudes involved,
+at every context length and both geometries. Note also that the comparison is **f32 against f32** --
+`attention.zig` narrows to `f32` before the reference reaches disk -- so the CPU's `f64` accumulator
+improves the reference rather than widening what is compared.
+
+### The speedup, and why it is not the floor's number
+
+At the shipped window the kernel is **at least 105x** faster, and across every other shape it runs between
+64x and 79x. Three runs put the `kernel_us` spread at 0.5% to 2.6% and the `cpu_us` spread at 0.1% to 1.4%
+-- except at `ctx256`, where one `forward` call read 6089.81, 8572.32 and 10890.25 us, a 78.8% spread.
+The published run is the third of three and the only one taken while the GPU read 0%, so its ratio is
+three.
+
+Comparing both ratios from that same run rather than from two: the floor promises 169x at the shipped
+window and the kernel delivers 62% of it; at 4096 the floor promises 2986x on the twin's own CPU figure -- against the
+1642x printed four lines above from `attn-bench`'s, which is the same disagreement the next paragraph
+records -- and the kernel delivers 5.5%. The reason is the known limitation in `src/cuda/README.md`: every block re-reads the whole
+causal prefix of K and V, so at 4096 the kernel moves 8.6 GB against 6.3 MB of compulsory traffic, a
+1366x amplification. An earlier version of that figure said 17.2 GB and 2731x, which overcounted by
+`n_kv_heads`: a block reads one kv head, not all of them. It is arithmetic and L2 bound, not bandwidth bound, which is why it is nowhere
+near the bus.
+
+One discrepancy is recorded rather than smoothed over. `attn-bench` measured one `forward` call at
+4096 as 1.69e6 us in one session, and this table's twin measured 3.08e6 to 3.09e6 us in another -- a
+factor of 1.8, both minimum-of-three, both correct about their own method.
+
+**That was first written up as two tools disagreeing, and that framing was wrong.** The obvious
+suspect was the input data: `attn-bench` fills q, k and v from one seed and the twin from three, so
+the softmax sees a different distribution and `exp` sees a different argument range. A controlled
+test varying only that -- same host, same method, same three-call minimum, three fill patterns --
+refuted it:
+
+```
+same seed (attn-bench)          3104936 us
+distinct seeds (twin)           3102682 us
+distinct, k/v swapped           3100309 us
+```
+
+A 0.15% spread, and **3.10e6 us from both tools.** So the data is not the cause, the two tools do not
+disagree, and what the factor of 1.8 actually records is that *one measurement of this function on
+this host has read 1.69e6 and 3.10e6 at different times with no methodological difference identified.*
+That is a worse thing to have found than a bug in a tool, because it means the number is not
+reproducible across host states. Until it is explained, nothing above should be read to better than
+an order of magnitude.
+
+### It reverses the `scale-profile` verdict, and the projection was the weaker of the two
+
+`scale-profile` answers `fused_attn` with `core/mlp >= 0.25`, which at the shipped shape is `0.167`, so
+it says no, and the kernel above wins by at least 105x. Both are computed correctly, because they
+measure different things: `core/mlp` is the share of an MLP layer's *arithmetic* that attention
+contributes and it says nothing about how long either takes. `src/scale.zig` calls the bar "a choice,
+and named as one".
+
+The arithmetic and the time disagreed because the CPU path was a naive scalar `f64` loop. One call at
+the shipped window is exactly `4 * 32 * (256 * 257 / 2) = 4.21 M` multiply-adds for QK and the same
+again for PV, `8.42 M` in all. `scale-profile` prints the same quantity as `attn_core 0.02 GFLOP`,
+which is those same 8.42 M multiply-adds counted as two operations each. Nothing was wrong with the
+tool; using a share of arithmetic as if it were a share of time was the error.
+
+The KV cache row above is gated on the same `core/mlp` term and this section does not speak to it. It
+is still a target and its reasoning has the same flaw the attention row had.
+
 ## Tokenizer
 
 | Symbol | Signature | Purpose |
@@ -620,7 +764,7 @@ memory on every run, so there is nothing to persist and nothing to keep in step 
 
 One test file per module, collected by `comptime` blocks in `tests.zig`. Zig has no test globbing,
 so a new test file is inert until it is named there, and nothing fails when a name goes missing.
-`tests.zig` is 73 lines and holds 3 tests of its own, the third being the guard that closes that gap:
+`tests.zig` is 79 lines and holds 3 tests of its own, the third being the guard that closes that gap:
 Zig 0.16 has no comptime filesystem, so it walks `src/` at test time against its own source embedded
 with `@embedFile`, and fails with `error.TestUnreferencedTestFile` on any `*_test.zig` the blocks
 above do not name. It is a test rather than a compile error, which means a cached run can skip it, so
@@ -641,12 +785,15 @@ agree to the last bit. The accumulator's error grows with `k`, and `w_down` at t
 multiplies a 256-token batch through the 512-long reduction into 128 columns, which is the widest
 reduction the model has. Its two gates are the same formula with the machine epsilon of the
 accumulator swapped in, `(k - 1) * e` against the sum of the absolute products, so nothing is picked:
-`1.14e-13` for `f64` and `6.09e-5` for `f32`, with the measured divergence of 1.98e-7 between them.
-An `f64` accumulator lands on the exact reduction and the divergence is `0`; an `f32` one is two
-hundred times under the `f32` gate. The reference is narrowed to `f32` before it is compared,
-because that is what `matmul` returns — comparing an `f32` against an unrounded `f64` sum leaves the
-store rounding on one side only, and that term alone is `9.3e-9`, which passes the `f64` gate and
-makes the test blind to the thing it is for.
+`1.14e-13` for `f64` and `6.09e-5` for `f32`, with the measured divergence of `1.9e-7` between them.
+That divergence is 1.7 million times the `f64` gate and 0.3% of the `f32` one, so an `f32`
+accumulator is comfortably outside the first and comfortably inside the second, and the test can
+tell the two apart in both directions. The reference is narrowed to `f32` before it is compared,
+because that is what `matmul` returns: comparing an `f32` against an unrounded `f64` sum leaves the
+`f32` store rounding on one side only, and that term alone is `9.3e-9` against a `1.14e-13` `f64`
+gate, `8.2e4` times it. **Nearly five orders above**, which is what makes it the thing the test has
+to be blind to. The conclusion never depended on the magnitude; this file said "two orders" until
+an audit recomputed it, which was wrong by three.
 
 ### Two survivors that are not holes
 
@@ -658,10 +805,15 @@ it is below the resolution of any tolerance that could be written down.
 
 The reassociation touches no reduction, so its error is the rounding of one element's three
 operations and cannot grow with `d`: measured at 1.1 to 1.6 `f32` ulp for `d` from 4 to 4096, flat.
+That pair, and the `0.0` below, are hand-computed figures with no committed command behind them —
+hand arithmetic on three rows, which is why they are quoted as observations rather than as
+measurements of the tree.
 The gate in `norm_test.zig` is `1e-6`, which is 8.4 ulp at a value of one, so catching it would mean
 a sub-ulp tolerance. There is a second and stronger reason, and it is the reason no such test should
-be written: every weight in `norm_test.zig` is a power of two — `0.5`, `1`, `2`, `0.25` — and a power
-of two commutes exactly with a single `f32` division. Measured on all three hand-computed rows, the
+be written: every weight on the rows this argument rests on is a power of two — `0.5`, `1`, `2`,
+`0.25` — and a power of two commutes exactly with a single `f32` division. One test in this file does
+use the weight `3`; its input is all zero, so it agrees for an unrelated reason and says nothing about
+this one. Measured on all three hand-computed rows, the
 two spellings differ by `0.0`: they are bit-identical, so they are identical at a tolerance of zero
 and not merely at `1e-6`. Catching this needs a non-dyadic weight, and then the divergence is one
 ulp, which is a statement about `f32` and not about this function. The `tol` is left where it is.

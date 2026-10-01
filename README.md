@@ -3,7 +3,7 @@
 A transformer built from scratch in Zig: RMSNorm, RoPE, grouped-query attention, SwiGLU and tied
 embeddings, with hand-derived gradients checked against central differences. Everything runs on the
 CPU in f32. The block is checked tensor by tensor against a Llama reference, and a
-GPT-mini trains end to end. One CUDA kernel exists and is benchmarked against its own CPU twin; the
+GPT-mini trains end to end. Two CUDA kernels exist and each is benchmarked against its own CPU twin; the
 rest of the plan does not, and `src/cuda/README.md` says exactly which parts those are and why.
 
 On "Llama-shaped", precisely: the block has RMSNorm, RoPE at Llama-3's theta, grouped-query
@@ -19,8 +19,8 @@ statements say at every shape from the shipped one to 32k context, every number 
 projection and none of them measured.
 
 Requires Zig 0.16.0, enforced by `build.zig` rather than by hope. There is nothing to install and
-no package manager step. Tested on macOS on Apple Silicon; the CPU path is portable, but the CUDA
-row below needs a Linux host with docker and a GPU. A fresh clone has no git hook, because
+no package manager step. Tested on macOS on Apple Silicon; the CPU path is portable, but the four rows
+that need one require a Linux host with docker and a GPU. A fresh clone has no git hook, because
 `core.hooksPath` is per-clone local config:
 
     git config core.hooksPath .githooks
@@ -38,22 +38,26 @@ row below needs a Linux host with docker and a GPU. A fresh clone has no git hoo
 | `sh tools/removed/check.sh` | Compares the block against a Llama reference, tensor by tensor, then checks the report it just wrote against the committed record: the platform-independent projection on every host, and the exact bytes too where the oracle's versions match the committed ones. Needs the pinned oracle in a repo-local virtualenv; see `tools/README.md`. | `tools/removed/report.csv` |
 | `sh tools/removed/sensitivity.sh` | Proves those gates can fail: perturbs the exported weights on one side only and requires the check to catch it. Same venv requirement. | nothing |
 | `sh src/cuda/run-norm.sh` | Runs the RMSNorm kernel against its CPU twin across eighteen shapes: the parity table and the benchmark table, including where the GPU stops winning. Needs a Linux host with docker and a GPU. | nothing |
-| `sh src/cuda/run-probe.sh` | Compiles and runs one CUDA kernel on an NVIDIA GPU, in a container, and checks its integer sum against a closed form. Needs a Linux host with docker and a GPU. See `src/cuda/README.md`. | nothing |
+| `zig build attn-bench` | Measures one CPU attention call at five context lengths and prints it beside the PCIe floor a GPU kernel would have to clear. ReleaseFast, because the number is the point. See `src/README.md`. | nothing |
+| `zig build cuda-check` | Compiles all three `.cu` files with the pinned toolchain the two shell scripts measure with, so a syntax or type error in the CUDA sources is caught by the build system. Deliberately outside `verify`, because a GitHub runner has no CUDA toolchain and a gate that is permanently red for a reason unrelated to the code is worse than no gate. Fails loudly rather than skipping when there is no toolchain or no GPU. | nothing |
+| `sh src/cuda/run-attn.sh` | Grades the fused causal attention kernel against the CPU implementation it replaces, across seven shapes at two head geometries including Llama-3's: the parity table, the speedup, and a proof that all four deliberately broken variants are caught by the gate. Needs a Linux host with docker and a GPU. The kernel is forward only. See `src/cuda/README.md`. | nothing |
+| `sh src/cuda/run-probe.sh` | Compiles and runs `src/cuda/probe.cu` on an NVIDIA GPU, in a container, and checks its integer sum against a closed form. Needs a Linux host with docker and a GPU. See `src/cuda/README.md`. | nothing |
 
 ## Status
 
 The numerics run on CPU f32. The five block ops and the gradients are real and tested, and the block
 is checked against a Llama reference. The CUDA toolchain is proven end to end on a real
-GPU, and one CUDA source implements a transformer operation: RMSNorm, matching its CPU twin to 1e-5
-across eighteen shapes and benchmarked against it, 9.5x faster in isolation at the shipped model
-shape. `sh src/cuda/run-norm.sh` prints the ratio and names the shape it applies to. No
+GPU, and two CUDA sources implement transformer operations: RMSNorm, matching its CPU twin to 1e-5
+across eighteen shapes and benchmarked against it, 10.8x faster in isolation at the shipped model
+shape, and a fused causal attention forward kernel, matching `attention.forward` to 0.06% of its gate at
+seven shapes and at least 105x faster at the shipped one. `sh src/cuda/run-norm.sh` prints the ratio and names the shape it applies to. No
 end-to-end speedup is claimed from it: the model has no device-resident tensor, so every other part
-of a step would have to cross PCIe to use the GPU as well, and there is no fused attention kernel.
+of a step would have to cross PCIe to use the GPU as well, and the attention kernel is forward only, so it is not yet a training step.
 No checkpoint is written: a run leaves a loss curve and no model. The table above is the whole
 interface a reader needs, and `build.zig` declares two steps beyond it that no reader needs:
 `zig build dbg-train`, a Debug `train` binary for reproducing a checked-build failure, and
 `zig build removed-digest`, the report gate that `sh tools/removed/check.sh` runs over the report it
-has just written. It is one command doing two checks, and which of them ran is printed on every
+has just written. `removed-digest` is one command doing two checks, and which of them ran is printed on every
 invocation: a projection of the report that any host can check, and the exact bytes as well where
 the oracle's versions are the committed ones.
 
@@ -113,17 +117,24 @@ rather than a claim that it is.
 |---|---|
 | Reference | `reference-library==4.57.3`, `torch` 2.14.0, CPU, float32, attention `eager` |
 | Shape | d_model 64, 2 layers, 4 heads over 2 kv heads of 16, ffn 256, vocab 256, ctx 512, batch 1 |
-| Sweep | sequence lengths 1, 8 and 257, at seeds 7 and 8. Six runs, 156 tensor rows, 532 argmax comparisons |
-| Result | 14 tensor kinds inside their gates, worst case 2.1e-06 against a 2.0e-05 gate |
+| Sweep | sequence lengths 1, 8 and 257, at seeds 7 and 8. Six runs, 204 tensor rows, 532 argmax comparisons |
+| Result | 18 tensor kinds, every row inside its own gate. The worst case is 2.056e-06 on `l0.k_rope`, against that kind's 2.0e-05 gate. The tightest gate in the set is 2.0e-06, on `attn_norm_out` — a different tensor, so the two numbers are not to be compared |
 | Argmax | 532 of 532 rows pick the same token. Smallest reference top1-top2 margin 8.5e-04 |
-| Record | `tools/removed/report.csv`, one row per tensor per run. `check.sh` checks the report it just wrote against the digests held in `build.zig`: the byte digest `c91abe2e 924883b5 19ecfa53 7f015de1 cf4d7e03 4fcbfd92 828e21d1 39c8d30e`, and a digest over the same file with `max_abs_delta` and the six environment columns dropped. The projection is checked on every host, so the row set, the gates, the verdicts and the argmax count above are the table a run reproduces rather than one that was true once. The bytes are checked only where the oracle reports the same six version columns this file records, because a different host's BLAS rounds `max_abs_delta` its own way — `l0.v` reads `5.96e-08` on macOS and `1.043e-07` on glibc, both far inside the `1e-05` gate. `zig build removed-digest` prints which of the two it ran. |
+| Record | `tools/removed/report.csv`, one row per tensor per run. `check.sh` checks the report it just wrote against the digests held in `build.zig`: the byte digest `d0d501f0 dcc5170b 7b3bb8f3 24ed14ba dae9a228 2b7f1424 5e80bdd8 525586b1`, and a digest over the same file with `max_abs_delta` and the six environment columns dropped. The projection is checked on every host, so the row set, the gates, the verdicts and the argmax count above are the table a run reproduces rather than one that was true once. The bytes are checked only where the oracle reports the same six version columns this file records, and in
+practice that is macOS alone: the Linux torch wheel reports itself as `2.14.0+cu130` where this file
+records `2.14.0`, so on Fedora and on `ubuntu-latest` alike the guard fires and the bytes are skipped.
+Measured on Fedora: the projection matched exactly — 18 kinds, 206 rows, every gate and verdict
+identical — and the bytes were skipped for the version string, not for a float. Nothing here therefore
+shows that two hosts round `max_abs_delta` the same way, and no cross-host pair of deltas has been kept.
+The projection is the check that runs wherever a comparison actually runs. `zig build removed-digest`
+prints which of the two it ran. |
 
-All fourteen gates and the argmax have to hold. The two are not ranked, and the argmax is not the
+All eighteen gates and the argmax have to hold. The two are not ranked, and the argmax is not the
 sharper of the two: on this sweep the smallest reference top1-top2 margin is 8.5e-04 while the
 widest gate on the logits is 2e-4, so any run that passes the gates cannot have flipped a token. The
 gates are what catch a real difference, and `sh tools/removed/sensitivity.sh` is the command that
-proves it: perturbing one element of `wq` by 1e-3 fails 21 of them, and scaling the whole
-projection by a tenth of a percent still fails 27. The argmax earns its place by saying *why* a row failed: on any row where the
+proves it: perturbing one element of `wq` by 1e-3 fails 20 of the 204 compared rows, and scaling the
+whole projection by a tenth of a percent still fails 18. The argmax earns its place by saying *why* a row failed: on any row where the
 two disagree, the reference's own top1-top2 margin is printed, which turns "it failed" into "it
 failed on a near-tie" or "it failed outright".
 
@@ -131,8 +142,9 @@ What it claims: that this forward pass and the reference's agree, on the sweep a
 set of pinned weights. What it does not claim: anything about initialisation, because the harness
 pins the weights on both sides and never compares how they were drawn; anything about batched
 forward, because there is no batch axis in this model and the harness runs batch 1; anything about a
-KV cache, quantized weights, or CUDA; and the attention probabilities and the SwiGLU hidden state,
-which `attention.forward` and `mlp.forward` reduce internally and never hand out. It also does not
+KV cache, quantized weights, or CUDA; and the four tensors `forward` reduces internally
+and never hands out. `forwardWith` does hand them out, through the sink, and that is the
+path the harness uses, so all four are gated. It also does not
 claim sensitivity: this shape is small, and an error of about a tenth of a percent in a projection
 passes. `tools/README.md` says what was measured. The oracle is
 Python and lives outside `src/`; the export it reads is written by Zig alone, so no committed number

@@ -33,20 +33,10 @@ const Mutation = struct {
     expect: usize = 1,
     /// The load-bearing claim this mutation attacks, printed with the result.
     what: []const u8,
-    /// An author's claim about what a survivor here means, and the only reason
-    /// `class` exists. Empty means nobody has decided, and the harness prints
-    /// `unclassified` rather than guessing.
-    ///
-    ///   equivalent  - the mutant computes the same function, so no test could
-    ///                ever catch it and writing one would be a waste
-    ///   below-gate  - the output moves, by less than the tightest tolerance
-    ///                any test asserts. Real, and needs a tighter test rather
-    ///                than a different implementation.
-    ///
-    /// This is never consulted when deciding caught or survived. The suite's
-    /// exit code decides that alone, and this only labels the damage after the
-    /// fact.
-    class: []const u8 = "",
+    // There is no `class` field here any more. One mutation set it, nothing read
+    // it, and `run.sh` classifies survivors from its own table of the mutation
+    // name, with tools/README.md stating the same taxonomy for a reader. A field
+    // nothing reads is a third copy that drifts from both.
 };
 
 const mutations = [_]Mutation{
@@ -87,7 +77,6 @@ const mutations = [_]Mutation{
         .what = "the fused scale is v / rms * w[i] reassociated to v * w[i] / rms",
         .from = "        for (x_row, 0..) |v, i| y_row[i] = v / rms * w[i];",
         .to = "        for (x_row, 0..) |v, i| y_row[i] = v * w[i] / rms;",
-        .class = "below-gate",
     },
     .{
         .name = "norm-f32-acc",
@@ -150,6 +139,20 @@ const mutations = [_]Mutation{
         .what = "every query head reads kv head h, so grouped-query sharing is gone",
         .from = "    const group = cfg.n_heads / cfg.n_kv_heads;",
         .to = "    const group: usize = 1;",
+    },
+    .{
+        .name = "attn-dim-group-write",
+        .file = "src/autograd.zig",
+        .what = "the dq lane-group split writes a scaled value for group 2 and above, " ++
+            "so only the second and later groups of the shipped head_dim are wrong. " ++
+            "Every other fixture in the tree runs head_dim 12 or smaller, which is " ++
+            "one group, so this is caught by exactly one test and by nothing else",
+        .from =
+        \\                for (0..lanes) |u| g.dq.set(t, h * dim + j + u, @floatCast(acc[u]));
+        ,
+        .to =
+        \\                for (0..lanes) |u| g.dq.set(t, h * dim + j + u, @floatCast(if (g_lane >= 2) acc[u] * 1.5 else acc[u]));
+        ,
     },
     .{
         .name = "attn-unroll-lane-write",

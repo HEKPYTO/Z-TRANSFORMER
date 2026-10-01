@@ -2,8 +2,7 @@ const std = @import("std");
 const norm = @import("norm.zig");
 const Tensor = @import("tensor.zig").Tensor;
 
-/// Tolerance for every literal below. Phase 1 exit criterion is 1e-6 against a
-/// hand-computed fp64 answer.
+/// Tolerance for every literal below: 1e-6 against a hand-computed fp64 answer.
 const tol: f32 = 1e-6;
 
 test "norm forward matches a hand computed 1x4 row" {

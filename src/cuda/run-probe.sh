@@ -1,11 +1,11 @@
 #!/bin/sh
 # Compile src/cuda/probe.cu with nvcc and run it on the local NVIDIA GPU.
 #
-# nvcc is not installed on the host and cannot be: the distribution's NVIDIA
-# repository ships a CUDA newer than this repository targets, with a cuBLAS that
-# is version-skewed against it. The toolchain is therefore the container, and
-# this script is the whole recipe. It needs no root and writes nothing outside
-# the repository.
+# The toolchain is the container, and that is a pin rather than a statement about
+# this host: the benchmark table in src/cuda/README.md was measured with it, and
+# one repository must not compile with a second toolchain while measuring with
+# this one. So this script needs no root, no host CUDA install and no root-owned
+# system state, and it writes nothing outside the repository.
 #
 #   sh src/cuda/run-probe.sh                 compile, run, print the evidence, leave nothing
 #   sh src/cuda/run-probe.sh --emit-object   compile only, leave .zig-cache/cuda/probe.o

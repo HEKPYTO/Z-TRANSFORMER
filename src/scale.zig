@@ -115,8 +115,12 @@ pub const Projection = struct {
     /// implementation would materialize. `attention.forward` does not
     /// materialize it, which is what `scores_row` is for.
     scores_dense: u64,
-    /// What `attention.forward` actually allocates: one f64 row of `T`, reused
-    /// across rows and heads.
+    /// What `attention.forward` actually allocates: `T * 8`, one f64 row,
+    /// reused across every row and every head. It read `n_heads * T * 8`, and
+    /// the test beside it asserted the same wrong figure, so the two agreed and
+    /// the 4x overcount was invisible to review. `attention.forward` allocates
+    /// it once, above `for (0 .. cfg.n_heads)`, so `n_heads` is not a factor:
+    /// there is one row, not one per head.
     scores_row: u64,
     /// `T * vocab * d * 4`: `tiedHead` reads a whole `tok_embed` row per
     /// token, so the table is walked `T` times.
@@ -177,7 +181,7 @@ pub fn project(shape: Shape) !Projection {
         .adam = 2 * params,
         .act = activationElems(cfg),
         .scores_dense = l * cfg.n_heads * t * t * 4,
-        .scores_row = cfg.n_heads * t * 8,
+        .scores_row = t * 8,
         .tied_stream = t * cfg.vocab_size * d * 4,
         .kv_cache = l * kv * t * 2 * 4,
     };
@@ -209,10 +213,27 @@ fn activationElems(cfg: model.Config) u64 {
     // `final_h`, `d_final_h`, `d_x` and the layer loop's `d_next`
     // (`backwardFrom`), all [T, d], one `d_next` alive at a time.
     const grads = 4 * t * d;
-    // `attentionBackward`'s dq, dk and dv plus its two f64 row buffers, which
-    // are f32 elements' worth twice over.
-    const attn_back = t * (d + 2 * kv) + 4 * t;
-    return head + stream + blocks + grads + attn_back;
+    // `attentionBackward`'s dq, dk and dv, plus its three f64 row buffers --
+    // `probs`, `d_probs` and `p_ds`, each `alloc(f64, q.rows)` -- which are
+    // f32 elements' worth twice over.
+    const attn_back = t * (d + 2 * kv) + 6 * t;
+    // `blockBackward`'s own transients, which nothing above counted and which
+    // are alive at the same time as `attn_back`: six [T, d] (`d_mlp_in`,
+    // `d_of_norm`, `d_x_mid`, `d_ctx`, `d_attn_in`, `d_of_norm2`), three [T, h]
+    // (`d_a`, `d_gate`, `d_up`), and its own `d_q` [T, d] and `d_k` [T, kv] for
+    // the RoPE backward. One layer's worth, not `l` of them -- the cache holds
+    // every layer's `Block` but the backward walks them one at a time, so the
+    // peak is all the blocks plus one layer's scratch.
+    //
+    // That last pair is the term an earlier version of this comment denied.
+    // `blockBackward` holds `ag` under `defer ag.deinit()`, so `ag.dq`, `ag.dk`
+    // and `ag.dv` stay alive from the `attentionBackward` call to the end of
+    // the function, and its own `d_q` and `d_k` are allocated after that and
+    // outlive `attn_back` returning. Both sets are live at once, so this counts
+    // one and `attn_back` counts the other; counting only one of them was the
+    // undercount.
+    const block_back = t * (7 * d + 3 * h + kv);
+    return head + stream + blocks + grads + attn_back + block_back;
 }
 
 /// Attention core over one layer's MLP. The two the deferral note compares.
@@ -330,7 +351,7 @@ pub fn print(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("\nARITHMETIC, PROJECTED, GFLOP\n");
     try w.print("{s:<15}{s:>12}{s:>12}{s:>12}{s:>12}{s:>12}{s:>10}{s:>8}{s:>8}\n", .{
         @as([]const u8, "name"),     @as([]const u8, "attn_core"), @as([]const u8, "attn_proj"),
-        @as([]const u8, "mlp"),      @as([]const u8, "tied_head"), @as([]const u8, "weight_grad"),
+        @as([]const u8, "mlp"),      @as([]const u8, "tied/stp"),  @as([]const u8, "weight_grad"),
         @as([]const u8, "core/mlp"), @as([]const u8, "core%"),     @as([]const u8, "tied%"),
     });
     for (ps) |p| {
@@ -344,7 +365,11 @@ pub fn print(w: *std.Io.Writer) std.Io.Writer.Error!void {
         \\
         \\core/mlp is the attention core against one layer's MLP: the number the
         \\deferral of a fused kernel rests on. core% is the core against a whole
-        \\layer, and tied% is the tied head against a whole step. weight_grad
+        \\layer. The column is `tied_head/step` and it is the exception to that
+        \\rule, `tied/stp`: the tied head runs once per step over the whole
+        \\vocabulary, so it
+        \\is neither per-layer nor forward-only and reads 3x any row beside it in
+        \\the same units. tied% is that against a whole step. weight_grad
         \\cannot move core/mlp at all: it is a loop order, not a term.
         \\
         \\
@@ -352,15 +377,15 @@ pub fn print(w: *std.Io.Writer) std.Io.Writer.Error!void {
 
     try w.writeAll("BYTES, PROJECTED, GiB\n");
     try w.print("{s:<15}{s:>10}{s:>10}{s:>10}{s:>10}{s:>10}{s:>10}{s:>10}{s:>10}\n", .{
-        @as([]const u8, "name"),   @as([]const u8, "params"),  @as([]const u8, "grads"),
-        @as([]const u8, "adam"),   @as([]const u8, "act"),     @as([]const u8, "peak"),
-        @as([]const u8, "scores"), @as([]const u8, "tied_GB"), @as([]const u8, "kv_cache"),
+        @as([]const u8, "name"),   @as([]const u8, "params"),   @as([]const u8, "grads"),
+        @as([]const u8, "adam"),   @as([]const u8, "act"),      @as([]const u8, "peak"),
+        @as([]const u8, "scores"), @as([]const u8, "tied_GiB"), @as([]const u8, "kv_cache"),
     });
     for (ps) |p| {
         const peak = p.params + p.grads + p.adam + p.act;
         try w.print("{s:<15}{d:>10.3}{d:>10.3}{d:>10.3}{d:>10.3}{d:>10.3}{d:>10.3}{d:>10.3}{d:>10.3}\n", .{
-            p.shape.name, gib(p.params),       gib(p.grads),       gib(p.adam),     gib(p.act),
-            gib(peak),    gib(p.scores_dense), gib(p.tied_stream), gib(p.kv_cache),
+            p.shape.name, gibF32(p.params),    gibF32(p.grads),    gibF32(p.adam),  gibF32(p.act),
+            gibF32(peak), gib(p.scores_dense), gib(p.tied_stream), gib(p.kv_cache),
         });
     }
     try w.print(
@@ -368,13 +393,14 @@ pub fn print(w: *std.Io.Writer) std.Io.Writer.Error!void {
         \\params, grads and adam are the parameter, the gradient and the two
         \\AdamW moments, one f32 each per element. act is the peak of one
         \\backward. At depth it is NOT the logits: autograd's cache keeps one
-        \\eleven-tensor Block per layer, and that is 90% of the total at 32
+        \\eleven-tensor Block per layer, and that is 87% of the total at 32
         \\layers. The logits and dlogits are 9%.
         \\scores is n_layers * n_heads * T * T * 4: the score matrix a DENSE
-        \\attention would materialize. This one does not materialize it, it walks
-        \\one f64 row of T at a time (n_heads * T * 8, under a megabyte in this
-        \\whole sweep), which is the one thing a fused kernel would keep.
-        \\tied_GB is tok_embed read T times by the tied head. kv_cache is what a
+        \\attention would materialize. This one does not materialize it: it
+        \\allocates one f64 row of T, once, above the head loop, so T * 8 bytes
+        \\whatever the head count (under a megabyte in this whole sweep), which
+        \\is the one thing a fused kernel would keep.
+        \\tied_GiB is tok_embed read T times by the tied head. kv_cache is what a
         \\cache would cost and the code has none.
         \\
         \\
@@ -431,6 +457,11 @@ pub fn print(w: *std.Io.Writer) std.Io.Writer.Error!void {
     // What the tied head walks at T=64 on the d4096 row, in GB and the bandwidth
     // moving it implies.
     const stream_gb = toF(64 * 128256 * 4096 * 4) / 1e9;
+    // A round number, chosen so the printed bandwidth is readable, and now
+    // printed beside the figure it divides. It was a bare `116.0` in the
+    // argument list while the text above said no wall time was printed -- a
+    // number in the output that nothing in the output could produce.
+    const tied_head_seconds: f64 = 116.0;
     try w.print(
         \\
         \\CROSSOVERS, the context or vocabulary at which each verdict flips
@@ -457,8 +488,12 @@ pub fn print(w: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  no reuse to find, while one MLP layer re-reads its 3 * d * h
         \\  weights once for all T rows and so gets T / 2 = {d:.0} flop per
         \\  byte. At T=64 that is {d:.0}x. The {d:.1} GB it has to move at
-        \\  that shape, and the {d:.2} GB/s that implies, are derived here; no
-        \\  wall time is, because this tool projects rather than measures.
+        \\  that shape, and the {d:.2} GB/s that implies, are derived here. The
+        \\  rate needs a duration, so the duration is stated rather than
+        \\  assumed: 116 s, a round number chosen to make the arithmetic
+        \\  readable and NOT a measurement -- what this tool cannot derive is how
+        \\  long a host would take. Read the ratio and the flop-per-byte
+        \\  figures; treat the GB/s as what the bytes cost at a plausible rate.
         \\
     , .{
         ctx_bar,
@@ -472,11 +507,20 @@ pub fn print(w: *std.Io.Writer) std.Io.Writer.Error!void {
         host_gib,
         denseScoreCtx(ps[0]),
         denseScoreCtx(ps[3]),
-        stream_gb,
-        stream_gb / 116.0,
+        // The paragraph's five placeholders read, in order: flop per byte,
+        // T/2 flop per byte, the ratio of those, the GB to move, and the GB/s
+        // that implies. These five arguments were in the order GB, GB/s, then
+        // the three ratios, so every one of them printed the previous one's
+        // value: 134.49 flop per byte, a ratio of 1x, and a bandwidth of
+        // 64.00 GB/s that is four times the shape's own byte count per second.
+        // Both counts were equal, which is why nothing caught it, and it is
+        // prose, which is why `verify` -- which checks the tables and not this
+        // paragraph -- never saw it.
         0.5,
         64 / 2,
         64 / 2 / 0.5,
+        stream_gb,
+        stream_gb / tied_head_seconds,
     });
 }
 
@@ -490,6 +534,19 @@ fn g(flop: u64) f64 {
 
 fn gib(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / toF(1024 * 1024 * 1024);
+}
+
+/// `gib` for a count of **f32 elements**. An element is four bytes and the
+/// table's header says BYTES, so a field holding elements is scaled here or the
+/// column prints a quarter of what it claims. `params`, `grads`, `adam`, `act`
+/// and `peak` are element counts; `scores_dense`, `tied_stream` and `kv_cache`
+/// carry an explicit `* 4` in their formulas and are already bytes. Handing
+/// element counts to `gib` printed those five columns 4x low under a header that
+/// read BYTES, and nothing caught it: the arithmetic was self-consistent, the
+/// verdict table compared bytes to bytes, and the unit test pinned elements. The
+/// two units met only at this formatter.
+fn gibF32(elems: u64) f64 {
+    return gib(elems * 4);
 }
 
 /// The largest `T` at which `n_layers * n_heads * T^2 * 4` still fits in

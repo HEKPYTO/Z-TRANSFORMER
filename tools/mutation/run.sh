@@ -56,7 +56,7 @@ fi
 # ReleaseFast by default, and the reason is measured rather than assumed. On this
 # machine the Debug suite takes 145 s and ReleaseFast 33 s, and the difference is
 # the suite executing, not compiling — a mutation costs a rebuild of one file
-# either way. A Debug-only default is 39 minutes for 16 mutations, which is a
+# either way. A Debug-only default is 44 minutes for 18 mutations, which is a
 # number nobody runs, and a default nobody runs measures nothing. ReleaseFast is
 # also the mode the `train` binary ships in, so it is the mode whose silence a
 # reader would actually be misled by.

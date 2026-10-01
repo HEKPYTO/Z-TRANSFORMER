@@ -100,7 +100,9 @@ test "gradcheck: compare returns the whole sweep as data" {
     try std.testing.expect(r.floor > 0);
     var gmax: f64 = 0;
     for (g.tok_embed.data) |v| gmax = @max(gmax, @abs(@as(f64, @floatCast(v))));
-    try std.testing.expect(r.floor < gmax);
+    // Only the tight bound is asserted. `floor < gmax` was here too and was
+    // implied by the next line for every `gmax > 0`, so it could never be the
+    // assertion that fails and only read like coverage.
     try std.testing.expect(r.floor < gmax * 0.001);
 
     // A correct gradient is accepted, and the per tensor worst is a real
