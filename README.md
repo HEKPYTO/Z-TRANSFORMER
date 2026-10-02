@@ -3,16 +3,22 @@
 A transformer built from scratch in Zig: RMSNorm, RoPE, grouped-query attention, SwiGLU and tied
 embeddings, with hand-derived gradients checked against central differences. Everything runs on the
 CPU in f32. The block is checked tensor by tensor against a Llama reference, and a
-GPT-mini trains end to end. Two CUDA kernels exist and each is benchmarked against its own CPU twin; the
-rest of the plan does not, and `src/cuda/README.md` says exactly which parts those are and why.
+GPT-mini trains end to end. Four CUDA kernels implement transformer operations, and each is timed
+against its own CPU twin, though only the attention forward carries a published speedup ratio; the
+rest of the plan is not measured, and `src/cuda/README.md` says exactly which parts those are and why.
 
 On "Llama-shaped", precisely: the block has RMSNorm, RoPE at Llama-3's theta, grouped-query
 attention, SwiGLU and no biases, and it matches the reference op by op. It is not a Llama-3 you
-could scale up, and three things say so. The feed-forward width is `ffn_mult * d_model` with
+could scale up, and the differences are these. The feed-forward width is `ffn_mult * d_model` with
 `ffn_mult` an integer, so it is 4x where Llama-3 is 3.5x rounded to a multiple of 256 — the rule
 cannot express Llama-3's at all. There is no RoPE scaling, so long context is out. The embeddings
-are tied, where Llama-3 8B's are not. Everything is f32, not bf16, and the model has no KV cache,
-so a position is always 0. At the 8B shape this does not run: the tied head is 5.6% of a step there,
+are tied, where Llama-3 8B's are not. Everything is f32, not bf16. A KV cache exists
+(`src/kv_cache.zig`) and nothing decodes through it: there is no generation loop, and the forward
+kernel takes a `q_offset` and an `n_keys`, and both are exercised only at `q_offset` 0
+across the whole `T`, which is the training shape, so nothing yet calls them with a cache. A training batch is
+still correct — `rope.forward` derives row `r`'s angle from `pos + r`, so positions run `0..T-1` —
+but there is no way to start that at an offset, which is exactly what the cache needs. At the 8B shape this
+does not run: the tied head is 5.6% of a step there,
 and the logits tensor alone is `T * vocab` f32, which is 4.2 GB at T=8192 and `vocab = 128256`, of
 which a backward pass holds two. `zig build scale-profile` prints what the formulas behind those
 statements say at every shape from the shipped one to 32k context, every number labelled a
@@ -34,30 +40,86 @@ that need one require a Linux host with docker and a GPU. A fresh clone has no g
 | `zig build test` | Runs the test suite, and writes nothing at all when it passes. | nothing |
 | `zig build verify` | The whole gate CI runs, silent when it passes: `zig fmt --check`; the test suite in Debug and in ReleaseFast; the version banner; a sha256 on each committed input and output, the corpus against the digest `data/README.md` documents and `outputs/loss.csv` against the digest this file documents; the scale tables quoted in `src/README.md` against `zig build scale-profile`'s own output; `tools/symbols.sh` against the symbol table in that same file; `tools/removed/report.csv` against carrying no failing row; and the training run's peak resident set size against a budget in `build.zig`, read through `/usr/bin/time` on both Darwin and Linux. | nothing |
 | `zig build bench` | Reports user CPU seconds per training step, median of `-Dbench-runs` runs (default 3). It reports and never gates: a time in seconds is a property of this program and this machine, and a threshold on one fires on somebody else's load average. The figure includes fixed startup work and says so in its own output. | nothing |
-| `zig build peak-rss` | The memory gate on its own, so the number can be read rather than inferred. Measures on Darwin and Linux, and **fails** on Linux rather than skipping when `/usr/bin/time` is absent, because CI runs there. Budget: 128 MiB, chosen to sit between two measured populations. Also runs as part of `verify`. | nothing |
+| `zig build peak-rss` | The memory gate on its own, so the number can be read rather than inferred. Measures on Darwin and Linux, and **fails** rather than skipping anywhere else: on Linux when `/usr/bin/time` is absent, because CI runs there, and on a platform that is neither Darwin nor Linux, because a gate that cannot run is a claim. Budget: 128 MiB, chosen to sit between two measured populations. Also runs as part of `verify`. | nothing |
 | `sh tools/removed/check.sh` | Compares the block against a Llama reference, tensor by tensor, then checks the report it just wrote against the committed record: the platform-independent projection on every host, and the exact bytes too where the oracle's versions match the committed ones. Needs the pinned oracle in a repo-local virtualenv; see `tools/README.md`. | `tools/removed/report.csv` |
 | `sh tools/removed/sensitivity.sh` | Proves those gates can fail: perturbs the exported weights on one side only and requires the check to catch it. Same venv requirement. | nothing |
 | `sh src/cuda/run-norm.sh` | Runs the RMSNorm kernel against its CPU twin across eighteen shapes: the parity table and the benchmark table, including where the GPU stops winning. Needs a Linux host with docker and a GPU. | nothing |
 | `zig build attn-bench` | Measures one CPU attention call at five context lengths and prints it beside the PCIe floor a GPU kernel would have to clear. ReleaseFast, because the number is the point. See `src/README.md`. | nothing |
-| `zig build cuda-check` | Compiles all three `.cu` files with the pinned toolchain the two shell scripts measure with, so a syntax or type error in the CUDA sources is caught by the build system. Deliberately outside `verify`, because a GitHub runner has no CUDA toolchain and a gate that is permanently red for a reason unrelated to the code is worse than no gate. Fails loudly rather than skipping when there is no toolchain or no GPU. | nothing |
-| `sh src/cuda/run-attn.sh` | Grades the fused causal attention kernel against the CPU implementation it replaces, across seven shapes at two head geometries including Llama-3's: the parity table, the speedup, and a proof that all four deliberately broken variants are caught by the gate. Needs a Linux host with docker and a GPU. The kernel is forward only. See `src/cuda/README.md`. | nothing |
+| `zig build cuda-check` | Compiles the four CUDA sources with the pinned toolchain the two shell scripts measure with, as three compile units: `norm`, `probe` and `attn`, with the shipped `attn_kernels.cu` reached through the include in `attn.cu`. So a syntax or type error in the CUDA sources is caught by the build system. Deliberately outside `verify`, because a GitHub runner has no CUDA toolchain and a gate that is permanently red for a reason unrelated to the code is worse than no gate. Fails loudly rather than skipping when there is no toolchain or no GPU. | nothing |
+| `sh src/cuda/run-attn.sh` | Grades the fused causal attention kernels -- forward and backward -- against the CPU implementations they replace, across eleven shapes at five head widths from 32 to 256: a parity table and a speedup for the forward, three parity gates for the backward (one each for dq, dk and dv), and a proof that all eight deliberately broken variants are caught, four per direction, with the backward's four required to produce four *distinct* signatures. Needs a Linux host with docker and a GPU. Neither half is wired into `zig build train`. See `src/cuda/README.md`. | nothing |
 | `sh src/cuda/run-probe.sh` | Compiles and runs `src/cuda/probe.cu` on an NVIDIA GPU, in a container, and checks its integer sum against a closed form. Needs a Linux host with docker and a GPU. See `src/cuda/README.md`. | nothing |
 
 ## Status
 
-The numerics run on CPU f32. The five block ops and the gradients are real and tested, and the block
-is checked against a Llama reference. The CUDA toolchain is proven end to end on a real
-GPU, and two CUDA sources implement transformer operations: RMSNorm, matching its CPU twin to 1e-5
-across eighteen shapes and benchmarked against it, 10.8x faster in isolation at the shipped model
-shape, and a fused causal attention forward kernel, matching `attention.forward` to 0.06% of its gate at
-seven shapes and at least 105x faster at the shipped one. `sh src/cuda/run-norm.sh` prints the ratio and names the shape it applies to. No
-end-to-end speedup is claimed from it: the model has no device-resident tensor, so every other part
-of a step would have to cross PCIe to use the GPU as well, and the attention kernel is forward only, so it is not yet a training step.
+**The block is real and the CUDA path is real.** The five block ops and every gradient run on CPU
+f32 and are checked against a Llama reference, tensor by tensor, across all eighteen
+intermediates the forward pass hands over.
+
+Four CUDA kernels implement transformer operations, and each is graded against this repository's
+own CPU twin rather than against a hand-written expectation:
+
+| kernel | graded against | gate | measured |
+|---|---|---|---|
+| `rmsNormKernel` | `norm.forward` | 1e-5, 18 shapes | worst `2.861e-06`, 28.6% of gate |
+| `fusedAttnForward` | `attention.forward` | 1e-4, 11 shapes | `5.960e-08` at `head_dim` 32, `7.451e-08` at 128, `1.043e-07` at 192 |
+| `attnDqKernel` | `attentionBackward` | 1e-5 | worst `1.118e-08` |
+| `attnDkDvKernel` | `attentionBackward` | 1e-5 | worst `5.960e-07` |
+
+**Attention now runs on the GPU inside a real training step.** One flag in `src/model.zig`
+(`cuda_attn`) routes the forward and backward through `attn_kernels.cu`, and `zig build
+cuda-attn-check` grades that path against `attention.forward` on a real step's tensors. It is a
+relative gate, `max|a-b| <= 1e-4 * max|b|`, because a real step's gradients are orders of magnitude
+smaller than the synthetic inputs the benchmark uses; the observed ratio is `3.79e-08`, so the gate
+sits about 2600x above the noise, and a deliberate `+0.05` on one uploaded key makes it fail.
+
+**It is not Llama-3-shaped.** `head_dim` must be even and in `[32, 256]`; nothing requires a power
+of two, and eleven benchmark shapes cover `head_dim` 32, 96 (Phi-3), 128 (Llama-3), 192 (DeepSeek
+MLA) and 256 (Gemma-2). At 256 the shared-memory request does not fit, so the kernel narrows its
+own tile and runs; before that it killed the process outright on a width its own predicate accepted.
+
+### What is not claimed
+
+**The measured ratio, three runs of `sh src/cuda/run-attn.sh` on the generalised kernel, idle GPU, one host.** Minimum first, because that is this repository's rule for a shared host:
+
+| shape | min of 3 | max of 3 |
+|---|---|---|
+| `ctx256` | 68.9x | 108.0x |
+| `ctx512` | 140.3x | 143.0x |
+| `ctx1024` | 162.4x | 163.4x |
+| `ctx2048` | 165.1x | 167.8x |
+| `ctx4096` | 166.9x | 169.4x |
+| `llama3-T256` | 68.1x | 108.1x |
+| `llama3-T512` | 71.1x | 133.5x |
+| `phi3-T256` | 55.4x | 104.6x |
+| `phi3-T512` | 59.5x | 108.9x |
+| `mla-T256` | 102.6x | 106.6x |
+| `gemma2-T256` | 98.1x | 100.2x |
+
+**That is the whole claim: 55x to 169x per call, and no floor.** The five shapes that swing -- `ctx256`, `llama3-T256`, `llama3-T512`, `phi3-T256`, `phi3-T512` -- read 1.48x to 1.86x across the three runs on the CPU column while the kernel column held to 1.03x at every one of them. The six stable shapes hold their CPU column to 1.01x. It is not `T` (`ctx256` swings and `ctx512` does not), not `head_dim` (32 and 96 swing, 128, 192 and 256 do not) and not `n_heads` (`ctx256` has 4 and swings; `mla-T256` has 16 and does not). **The unstable set does not correlate with anything this repository measures**, so the mechanism is unidentified and no ratio at those five shapes is quoted to better than an order of magnitude.
+
+**The backward publishes no speedup ratio at all.** `attn_twin.zig` times the CPU backward and
+writes it to the manifest, but the benchmark prints only the kernel's own `bwd_us`, and the CPU
+backward at ctx4096 has read 1.69e6 us and 3.10e6 us in different sessions. A ratio built on that is
+not a figure.
+
+**None of this is a step speedup.** Attention is 6.3% to 7.3% of a training step at this model's
+shape, so moving it to the GPU is worth 1.065x to 1.077x on a step. The other 92.7% is matmul,
+norms, RoPE, SwiGLU, the tied head and AdamW, all still on the CPU. **The model has no
+device-resident tensor**, so every other part of a step would still cross PCIe to use the GPU.
+
+**The CUDA gates and the block-parity gates share no number.** `ATTN_TOL` and `ATTN_BWD_TOL` grade a
+CUDA kernel against this repository's own CPU twin. The eighteen per-tensor gates in
+`tools/removed/oracle.txt` grade this block against external. A row passing the first says nothing
+about the second, and the Llama-3 block-parity claim rests entirely on the `oracle.txt` gates.
+
 No checkpoint is written: a run leaves a loss curve and no model. The table above is the whole
-interface a reader needs, and `build.zig` declares two steps beyond it that no reader needs:
-`zig build dbg-train`, a Debug `train` binary for reproducing a checked-build failure, and
+interface a reader needs, and `build.zig` declares four steps beyond it, none of which a reader needs to run:
+`zig build dbg-train`, a Debug `train` binary for reproducing a checked-build failure;
 `zig build removed-digest`, the report gate that `sh tools/removed/check.sh` runs over the report it
-has just written. `removed-digest` is one command doing two checks, and which of them ran is printed on every
+has just written; and the two CUDA steps `zig build cuda-attn-check` and `zig build cuda-train`,
+which are the ones that link `attn_kernels.o`. Both of the CUDA pair **exit 1 while `cuda_attn` is
+false**, naming the line to edit, rather than skipping: a green that checked nothing is worse than
+a refusal. `removed-digest` is one command doing two checks, and which of them ran is printed on every
 invocation: a projection of the report that any host can check, and the exact bytes as well where
 the oracle's versions are the committed ones.
 
@@ -93,13 +155,20 @@ Both halves of that are commands rather than sentences. `zig build verify` check
 curve against its digest, so `f1dd5444 5064810c 28002dca caf23b4b c82bb1e6 ecfa28f5 ed91e7fa 4518f792`
 is what is in the tree. `zig build train` writes `outputs/loss.pending.csv` and renames it over
 `outputs/loss.csv` only when those bytes match, so a run on a host with a different libm reports the
-difference, leaves the committed curve alone, and still exits 0. It is a different libm, not a broken
+difference, leaves the committed curve alone, and **exits 1** -- the env var named in the next sentence is what turns that into an exit 0 without promoting anything. An earlier version of this line said it still exited 0, which is what the env var does and not what the default does, and it is the line a reader on a second machine follows. It is a different libm, not a broken
 build, and the run says so in those words.
 
 Source lives in `src/`. Everything the repository generates lands in `outputs/`. Apache-2.0 licensed.
 
-One measured training result is committed, and it is the whole of that kind. `zig build verify` fails
-if its bytes are not the ones below, so these two numbers are checked rather than quoted. The default
+One measured training result is committed, and it is the whole of that kind. Two different checks
+cover it and they are not the same check, which an earlier version of this paragraph ran together.
+`zig build verify` fails if the committed `outputs/loss.csv` is not byte-for-byte the file these two
+numbers were read from, so the curve cannot be edited out from under the paragraph. It does **not**
+check that the code still produces that file: `verify` compares the file against a constant, so
+changing `optim.AdamW.beta1` leaves it green. The gate for *that* is `zig build train`, which re-runs
+the training and refuses to promote a curve that differs — and it is a manual, single-host command,
+because a different libm legitimately produces different bytes and making it a CI gate would leave
+the job permanently red for a reason unrelated to the code. The default
 `zig build train` ends at a
 train loss of 5.593455 and a validation loss of 5.154903; both are the last row of the committed
 `outputs/loss.csv`, and the validation number is measured on held-out tokens the training batcher

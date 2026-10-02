@@ -244,8 +244,9 @@ test "cosine lr degrades gracefully when warmup is degenerate" {
     // would be 0 / 0 is guarded to 0 / 1, so step 3 sees progress 0 and 0.1.
     try std.testing.expectEqual(@as(f32, 0.1), optim.cosineLR(3, 3, 3, 0.1));
     // total 0 with no warmup has no decay half at all, and must still answer.
-    const empty = optim.cosineLR(0, 0, 0, 0.1);
-    try std.testing.expect(std.math.isFinite(empty));
+    // The value, not its finiteness: the schedule collapses to `base_lr` on this
+    // path, so `isFinite` would hold for any answer at all.
+    try std.testing.expectEqual(@as(f32, 0.1), optim.cosineLR(0, 0, 0, 0.1));
 }
 
 test "clip by norm scales a gradient that is over the limit" {

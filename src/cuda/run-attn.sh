@@ -84,6 +84,22 @@ ATTN_GROUP_Q=${ATTN_GROUP_Q:-1}
 echo "attn: running with ATTN_GROUP_Q=$ATTN_GROUP_Q"
 cuda "ATTN_GROUP_Q=$ATTN_GROUP_Q '$BIN' '$SCRATCH'"
 
+# ATTN_MAX_TILE is the tile cap, the one launch parameter that also decides whether
+# a head WIDTH runs at all: at head_dim 256 a cap of 64 does not fit a block, and
+# the launcher narrows the tile on its own. Setting it HERE, inside the container's
+# own command string, for the reason ATTN_GROUP_Q's paragraph gives -- `docker run`
+# drops host environment variables that are not named with -e, so exporting this
+# one on the host and reading a table off the result is the same silent no-op that
+# produced six runs of the default once. Its floor of 1 is the smallest workable
+# tile and is the way to grade the claim that a tile of 1 is correct, which is why
+# it is reachable rather than argued.
+#
+# The broken-variant loops below do NOT take it. They run at the default cap so
+# their signatures stay comparable with the ones src/cuda/README.md publishes.
+ATTN_MAX_TILE=${ATTN_MAX_TILE:-64}
+echo "attn: running with ATTN_MAX_TILE=$ATTN_MAX_TILE"
+cuda "ATTN_MAX_TILE=$ATTN_MAX_TILE '$BIN' '$SCRATCH'"
+
 # A gate that has never been seen to fail is not known to be a gate. Each
 # variant below is a real defect, and each must make the parity check exit
 # non-zero. If one of them passes, the check is not looking at what it claims
@@ -142,5 +158,8 @@ fi
 echo "attn: ...and all four signatures differ, so they are four different defects"
 
 echo "attn: the backward kernel exists and is graded, but NOTHING in this file is"
-echo "      wired into zig build train, there is still no KV cache, and the"
-echo "      external parity comparison still runs entirely on the CPU."
+echo "      wired into zig build train. A KV cache exists (src/kv_cache.zig, five"
+echo "      tests) and nothing decodes through it: there is no generation loop, so"
+echo "      the forward kernel's q_offset is exercised only by this benchmark at"
+echo "      q_offset 0, which is the training shape. The external parity"
+echo "      comparison still runs entirely on the CPU."

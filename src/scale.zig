@@ -8,11 +8,24 @@
 //! There is no `@setRuntimeSafety` escape and no unsafe, so every product below
 //! is checked: a shape whose arithmetic overflows `u64` traps rather than
 //! printing a wrapped number. The softmax is left out of the attention FLOP
-//! count, which is a bound rather than an oversight: `attention.forward` does
-//! four non-multiply-add operations per score against `head_dim` multiply-adds,
-//! so the whole softmax term is `4 / head_dim` of the attention core and under
-//! 3% at any head_dim this project uses. It is named in the output so the
-//! omission is checkable.
+//! count, and the omission is named in the output so it is checkable rather than
+//! assumed. Two earlier versions of this note were wrong in a way that made the
+//! omitted term look smaller than it is, so the count is spelled out:
+//!
+//!   `attn_core` is `2 * d * t * (t + 1)` with `d = n_heads * head_dim`. Divided
+//!   by the `n_heads * t * (t + 1) / 2` causal (query, key) pairs it counts
+//!   4 * head_dim operations per score, because it covers BOTH matmuls: the QK
+//!   dot is 2 * head_dim and the PV accumulation is another 2 * head_dim.
+//!
+//!   `attention.forwardWith` performs SIX non-multiply-add operations per score:
+//!   the `* scale`, the `@max`, the subtract inside the exp, the `@exp`, the
+//!   `denom +=`, and the normalising divide.
+//!
+//! So the softmax term is 6 / (4 * head_dim) of the core: 4.7% at the shipped
+//! head_dim of 32 and 1.2% at Llama-3's 128. It is excluded because at every
+//! head_dim in this sweep it is a few percent, NOT because it is negligible --
+//! at head_dim 8 it would be 18.75%, and nothing in this project stops someone
+//! configuring that.
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -326,9 +339,10 @@ pub fn print(w: *std.Io.Writer) std.Io.Writer.Error!void {
         \\
         \\FLOP counts are per layer and forward only unless the column says
         \\otherwise, and a fused multiply-add counts as two operations. The
-        \\softmax is left out of the attention core: four non-multiply-add
-        \\operations per score against head_dim multiply-adds makes the whole
-        \\term 4/head_dim of the core, under 3% anywhere in this sweep.
+        \\softmax is left out of the attention core: six non-multiply-add
+        \\operations per score, against the 4*head_dim operations the two
+        \\matmuls contribute, makes the term 6/(4*head_dim) of the core --
+        \\4.7% at head_dim 32 and 1.2% at 128, and 18.75% at a head_dim of 8.
         \\
         \\
     );

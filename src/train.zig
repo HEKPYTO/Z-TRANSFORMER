@@ -18,6 +18,7 @@ const data = @import("data.zig");
 const loss = @import("loss.zig");
 const optim = @import("optim.zig");
 const tensor = @import("tensor.zig");
+const attention = @import("attention.zig");
 const Tensor = tensor.Tensor;
 
 pub const Config = struct {
@@ -493,3 +494,141 @@ fn evalLoss(
     if (n == 0) return error.EmptyValidation;
     return total / @as(f64, @floatFromInt(n));
 }
+
+// THE ONE GATE ON THE CUDA ATTENTION SEAM, and it is in this file because it
+// needs BOTH halves at once: `autograd.Cache` for the tensors a real training
+// step's forward produced, and `attention.forward` for the CPU twin that grades
+// them. `src/cuda/run-attn.sh` can only have the second -- it grades uniform
+// +/-0.5 inputs and knows nothing about a step.
+//
+// THE TWO SIDES, and the earlier version of this test had both of them on the
+// GPU: `want` was read out of the same cache the CUDA arm had just written, and
+// `got` was a second launch of the same kernel, so `attention.forward` -- the
+// implementation this is a claim about -- was never called and the test could
+// only fail if the kernel were non-deterministic. It printed "ok" and meant
+// nothing. So the CPU side is called here, directly, on the three tensors the
+// CUDA arm was handed, and the CUDA side is what the MODEL got: `b.ctx` is
+// `model.forwardWith`'s own `.attn_ctx`, which under `cuda_attn` is
+// `cudaForward`'s return value. Reading the answer out of the model rather than
+// launching the kernel again from here is what makes it a gate on the SEAM --
+// `Attn.init`, the three uploads, the launch config, the download and the shape
+// checks are all inside `cudaForward` and all of them are graded by this
+// comparison, none of which a hand-rolled second launch in the test would have
+// covered.
+//
+// WHY THE `comptime`, which is the part that is load-bearing. This test is
+// compiled into `tests.o` in EVERY configuration, because `src/train_test.zig`
+// imports this file and the CPU suite is rooted at `src/tests.zig`. An `extern fn`
+// becomes a link-time requirement as soon as the function calling it is
+// ANALYSED, so a body that merely NAMES a kernel entry point behind a runtime
+// `if` -- or that takes its address, the shape `src/cuda/device.zig` carries a
+// paragraph about having shipped once and reverted -- puts `zt_attn_forward` and
+// `cudaFree` into that object and takes `zig build test` down on every host with
+// no CUDA toolchain, which is every GitHub runner. Zig does not analyse the
+// untaken arm of a comptime-known `if`, so the arm above is the whole of this
+// file's contribution to a CPU link. Checked rather than assumed: a
+// `@compileError` put in it does not fire.
+//
+// WHERE IT RUNS, and the CPU run is not asked to report a pass it did not earn.
+// `zig build cuda-attn-check` and nothing else: it is the only build in the
+// graph that links `src/cuda/attn_kernels.cu`, and on a tree where
+// `src/model.zig:cuda_attn` is false it EXITS 1 naming the line to edit rather
+// than skipping quietly. Everywhere else the arm below returns
+// `error.SkipZigTest`, which the test runner reports as `SKIP` and does NOT count
+// as passed -- Zig prints `... SKIP` on its own line and a summary that reads
+// `passed; 1 skipped; 0 failed`. A CPU-only `zig build test` therefore cannot be
+// read as having compared anything.
+test "the CUDA attention forward agrees with the CPU one on a real training step" {
+    if (comptime model.cuda_attn) {
+        const cfg = model.defaultConfig();
+        const t_count = cfg.n_ctx;
+        const gpa = std.testing.allocator;
+
+        var params = try model.initParams(gpa, cfg, 7);
+        defer params.deinit();
+
+        // Real ids in range, and that is the whole of what a batch has to be: the
+        // embedding is indexed by them and every check on them is a bound. Nothing
+        // here needs a corpus, and reading one would tie the gate to a file the
+        // numerics do not care about.
+        const tokens = try gpa.alloc(u32, t_count);
+        defer gpa.free(tokens);
+        for (tokens, 0..) |*tok, i| tok.* = @intCast(i % cfg.vocab_size);
+
+        // One real step's forward pass, through `model.forwardWith`, which is what
+        // decides which arm of the seam ran. The cache copies the intermediates
+        // out because the pass frees each layer's buffers before it returns.
+        var cache = try autograd.Cache.init(gpa, params, cfg, tokens);
+        defer cache.deinit();
+        var logits = try model.forwardWith(gpa, params, cfg, tokens, &cache.sink);
+        defer logits.deinit();
+        const b = cache.blocks[0];
+
+        // THE CUDA SIDE: what the model got. `b.ctx` is the cache's copy of the
+        // pass's `.attn_ctx`, which `cudaForward` produced because `cuda_attn` is
+        // true -- the same constant the arm this test is in reads.
+        const got = b.ctx;
+
+        // THE CPU SIDE: `src/attention.zig`'s own forward, called here on `q_pos`,
+        // `k_pos` and `v` exactly as the CUDA arm received them, with the same
+        // `attention.Config` `model.forwardWith` builds for itself. Nothing in this
+        // test reaches the device to produce this number.
+        var want = try attention.forward(gpa, b.q_pos, b.k_pos, b.v, .{
+            .n_heads = cfg.n_heads,
+            .n_kv_heads = cfg.n_kv_heads,
+            .head_dim = cfg.head_dim,
+        });
+        defer want.deinit();
+        try std.testing.expectEqual(want.data.len, got.data.len);
+
+        // RELATIVE, and the reason is this repository's own: `run-attn.sh`'s
+        // `ATTN_TOL` is an ABSOLUTE bound calibrated on that script's own uniform
+        // +/-0.5 inputs, so it says nothing about a kernel handed the magnitudes a
+        // step actually produces, and an absolute gate here would be either
+        // vacuous or unreachable depending on the answer. `max|a-b| <= tol *
+        // max|b|` means the same thing at any scale, which is the only property a
+        // forward comparison needs.
+        var worst: f32 = 0;
+        var scale: f32 = 0;
+        for (want.data, got.data) |w, h| {
+            worst = @max(worst, @abs(w - h));
+            scale = @max(scale, @abs(w));
+        }
+        // The reference has to carry a magnitude at all. `scale == 0` would make
+        // the gate below an equality test against a pair of zero tensors, which
+        // passes, and a comparison that can pass on nothing is the defect this
+        // test was written to stop repeating.
+        if (!(scale > 0)) return error.EmptyReference;
+        if (!(worst <= attn_rel_tol * scale)) {
+            std.debug.print(
+                "\nCUDA attention forward differs from the CPU one by {e} against a" ++
+                    " reference of at most {e},\nwhich is {e} times the relative gate" ++
+                    " of {e}.\n",
+                .{ worst, scale, worst / scale, attn_rel_tol },
+            );
+            return error.AttentionMismatch;
+        }
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+// The relative gate above, as a named constant because the failure message quotes
+// it and a literal in two places is one of them to forget.
+//
+// MEASURED, not assumed. On the 32-core NVIDIA host at seed 7 and the shipped
+// shape -- 256 tokens, 4 heads over 2 kv heads, head_dim 32, `group_q` 1,
+// `max_tile` 64 -- the worst absolute difference between the CUDA answer and
+// `attention.forward` is 2.9802322e-08 against a largest reference value of
+// 7.8568566e-01: a ratio of 3.793161e-08, so this gate sits about 2600x above the
+// noise, and what is left of that gap is the CPU twin's f64 accumulation.
+//
+// 1e-4 rather than something tighter, and the reason is what the gate has to
+// catch. The defects this seam can carry -- a dropped causal mask, a collapsed GQA
+// group, a missing or doubled `1/sqrt(head_dim)` -- each move the answer by a
+// fraction of itself rather than by a part in a million of it, so 1e-4 clears all
+// of them by more than an order of magnitude and leaves three orders of magnitude
+// for a different card, a different libm and a different summation order inside
+// the kernel. It is also the constant `sh src/cuda/run-attn.sh` gates that same
+// kernel at, so a reader comparing the two gates is comparing like with like.
+const attn_rel_tol: f32 = 1e-4;

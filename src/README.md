@@ -1,7 +1,8 @@
 # src
 
-Fifteen modules, plus the `main.zig` binary, `lib.zig` and the `tests.zig` root. 33 `.zig` files,
-15 of them `*_test.zig`.
+Seventeen modules, plus the `main.zig` binary, `lib.zig` and the `tests.zig` root. 36 `.zig` files
+directly in `src/`, 16 of them `*_test.zig`. Three more sit in `src/cuda/`: `device.zig` and the two
+CPU twins, `norm_twin.zig` and `attn_twin.zig`.
 
 There is deliberately no line count here. Three of them have been written and all three were wrong
 within a commit, the last by 64 lines, because any line count is invalidated by every commit that
@@ -26,13 +27,16 @@ In-tree code reaches the implementation by relative path, `@import("tensor.zig")
 deliberately exports no modules, because a file that is both re-exported by the library and
 imported directly puts one file in two Zig modules, which the build refuses.
 
-One directory here is not Zig. `src/cuda/` holds the CUDA source and the container recipe that
+One directory here is mostly not Zig. `src/cuda/` holds the CUDA source and the container recipe that
 compiles and runs it. The container is the pinned toolchain rather than the host's: the benchmark
 table in `src/cuda/README.md` was measured with it, and a repository that compiles with one CUDA
 and measures with another describes a build that never ran. `zig build cuda-check` therefore
-compiles both `.cu` files through the same `cuda()` the runners use, so the directory is reached
-from the build graph. No `src/*.zig` file imports it, so the 33 `.zig` files above are still the
-whole compiled Zig surface. `sh
+compiles three of the four CUDA sources through the same `cuda()` the runners use -- the units are
+`norm`, `probe` and `attn`, and `attn_kernels.cu` arrives through the `#include` in `attn.cu` -- so
+the directory is reached from the build graph. One file in it is Zig and the directory is not outside
+the compiled surface: `src/tests.zig` imports `cuda/device.zig` by path, deliberately, so that its
+inline tests are built. The two twins are in none of these builds; `run-attn.sh` and `run-norm.sh`
+compile each with its own `zig build-exe`. `sh
 src/cuda/run-probe.sh` compiles the probe and runs it on the local GPU; `src/cuda/README.md` says
 what that does and does not establish.
 
@@ -348,8 +352,10 @@ probabilities. `attention.forwardWith` materialises them as `[T·n_heads, T]` �
 softmax over the causal prefix of query `t` in head `h`, with the upper triangle left at the zero
 `Tensor.init` writes, which is what a causal query's out-of-prefix keys are — and `attention.forward`
 still does not, because it is that function with a null sink. Note which callers
-that does and does not spare: the autograd pass, the training run and the bench all reach attention
-through `model.forwardWith` with a live sink and so do materialise it; the null path is for a caller
+that does and does not spare: the autograd pass and the training run reach attention through
+`model.forwardWith` with a live sink and so do materialise it, while `attn_bench.zig` calls
+`attention.forward` with no sink at all -- its own comment at line 98 says so -- so **the bench's ratio
+is a per-call figure on the null-sink path and not on this one**; the null path is for a caller
 that wants no intermediate at all. That is the only intermediate quadratic in the context, and what a
 sink costs is 1 MiB at the shipped T=256 over four heads, freed before `forwardWith` returns — one
 layer's worth of peak against a measured whole-model peak of about 47 MiB, and a step time that did
@@ -603,8 +609,8 @@ head width that cannot be fractional and is off by the one the `-1` leaves behin
 
 | Deferred item | Worth doing at | Deciding number |
 |---|---|---|
-| Fused IO-aware attention | `T >= 3 * d` | **Superseded.** `core/mlp >= 0.25` gives no at the shipped shape (0.167) and no at 8B (0.167), yes at 32k (0.667). The kernel exists and wins at least 105x at the shipped shape, between 106x and 165x across the other shapes. `core/mlp` is a share of arithmetic and not of time. See "Attention: the floor, and then the kernel" below. |
-| KV cache | `T >= 3 * d` | The same term, and the same flaw: it is a share of arithmetic and not of time. Still a target, unmeasured. The attention row above is the cautionary tale for this one. It also costs 2 GiB at 8B and 12 GiB at the parity row. |
+| Fused IO-aware attention | `T >= 3 * d` | **Superseded.** `core/mlp >= 0.25` gives no at the shipped shape (0.167) and no at 8B (0.167), yes at 32k (0.667). The kernel exists and ran 98.7x at the shipped shape, between 103x and 160x across the other shapes, the floor withdrawn pending re-measurement. `core/mlp` is a share of arithmetic and not of time. See "Attention: the floor, and then the kernel" below. |
+| KV cache | `T >= 3 * d` | The same term, and the same flaw: it is a share of arithmetic and not of time. The attention row above is the cautionary tale for this one. `src/kv_cache.zig` has landed and carries five tests, but nothing decodes through it -- there is no generation loop and the forward kernel's `q_offset` is exercised only at 0, the training shape, so a cached key is not yet attended to by a single-token query -- and the row is still unmeasured on time. It also costs 2 GiB at 8B and 12 GiB at the parity row. |
 | Tied-head restructure | `vocab >= 3 * d` | Landed, see below. `tied / (3 * mlp) >= 0.25` at every row here, including the shipped one at 10.5% of the step. |
 | `weightGrad` loop-order swap | never | Not a ratio. It reorders a fixed multiply-add count, so no shape improves it, and `matmul`, `weightGrad` and `inputGrad` already stream contiguous rows. |
 
@@ -650,20 +656,36 @@ beside the PCIe floor a GPU implementation would have to clear.
 
 On the 32-core Linux host. `cpu_us_min` is the **minimum** per-call time over `calls` calls, because
 contention and frequency scaling only make a call slower. `floor_us` is q, k and v in plus the result
-out at 6.1 GB/s, the rate `src/cuda/README.md` measured; `src/attn_bench.zig` names where that constant
+out at 6.1 GB/s. **No run in this repository measures a PCIe rate.** `src/attn_bench.zig` derives that constant
+from the norm table's own `gpu_e2e` minus `gpu`, and says so at `src/attn_bench.zig:36`; `src/attn_bench.zig` names where that constant
 comes from, and it is the weakest number in the table.
 
 **The ratio column is not a figure to quote to two significant digits.** Three sweeps of this table on
 that host put the shipped row at 6084, 8344 and 10311 us, a 69% spread in host load alone. What is
 stable across all three is the order of magnitude: two at the shipped window, three at 4096.
 
+**That row is also not reproducible across sessions.** The `6084.07 us` over 82 calls printed above and
+the `10707.91 us` over 47 calls in `src/cuda/README.md` are the same tool, the same shape, the same
+host, 1.76x apart, from a later session. Neither number is deleted here: the pair is the record, and
+what it establishes is that a single `zig build attn-bench` cell is a sample of a noisy quantity and
+not a property of the code.
+
 ### What the kernel turned out to be: `sh src/cuda/run-attn.sh`
 
-`src/cuda/attn.cu` is that kernel: one block per query and head, walking the causal prefix with the
-running softmax in registers and no score matrix ever written to global memory. It is forward only and
-it is not wired into `zig build train`. The full table, the three-run reproducibility measurement, the
-attack on its own gate and its known limitation are in `src/cuda/README.md`; the two facts that belong
-here are these.
+`src/cuda/attn_kernels.cu` is that kernel: one block per query and head, walking the causal prefix with
+the running softmax in registers and no score matrix ever written to global memory. Its two backward
+kernels are in that same file and are graded against `attentionBackward` by the same script, at three
+separate gates, one each for dq, dk and dv; neither half is wired into `zig build train`. The file
+beside it, `src/cuda/attn.cu`, is the benchmark harness and not a library: it `#include`s the kernels
+and defines `main`, so it cannot be linked as one. The full table, the three-run reproducibility
+measurement, the attack on its own gate and its known limitation are in `src/cuda/README.md`; the two
+facts that belong here are these.
+
+**The `gate` column is `ATTN_TOL` 1e-4 from `src/cuda/attn.cu`, and it belongs to none of the eighteen
+per-tensor gates in `tools/removed/oracle.txt`** -- those run 2e-6 to 2e-4 against a Llama
+reference, while the backward's `ATTN_BWD_TOL` 1e-5 grades this directory's own `attentionBackward`.
+Three tolerance systems, no number in common, and a row passing here says nothing about the
+block-parity claim, which rests entirely on `oracle.txt`.
 
 ```
 shape          ctx     cpu_us   kernel_us   max_abs     gate   used    ratio  parity  argmax
@@ -676,6 +698,12 @@ attn: broken variant 2 was caught, as it must be
 attn: broken variant 3 was caught, as it must be
 attn: broken variant 4 was caught, as it must be
 ```
+
+**That transcript is abridged, three rows out of seven and with two tables' worth of output removed.**
+The full run also prints the backward parity table with its three worst-case index columns, the
+`ATTN_GROUP_Q=` line, the `configurations used:` block, the four backward variants each with the
+`[dq/dk/dv ...]` signature it produced, and the line asserting that those four signatures differ.
+`src/cuda/README.md` carries the seven-row forward sweep; neither file quotes the run whole.
 
 At Llama-3's own geometry -- 32 heads over 8 kv heads at `head_dim` 128 -- the parity is `7.451e-08`,
 0.075% of the gate. That row is there because a kernel only ever run at `head_dim` 32 has not been
@@ -691,9 +719,12 @@ improves the reference rather than widening what is compared.
 
 ### The speedup, and why it is not the floor's number
 
-At the shipped window the kernel is **at least 105x** faster, and across every other shape it runs between
-64x and 79x. Three runs put the `kernel_us` spread at 0.5% to 2.6% and the `cpu_us` spread at 0.1% to 1.4%
--- except at `ctx256`, where one `forward` call read 6089.81, 8572.32 and 10890.25 us, a 78.8% spread.
+The kernel ran **98.7x** faster at the shipped window and between 103x and 160x across the other six, a floor that
+is withdrawn rather than restated until the table is re-measured: the ratio's denominator is a CPU call that has
+read 6450.78 to 10770.23 us across sessions on one host, a spread of 1.67x, so no floor here was ever a property
+of the kernel. It previously read
+106x and 165x. Three runs put the `kernel_us` spread at 0.5% to 2.6% and the `cpu_us` spread at 0.1% to 1.4%
+-- except at `ctx256`, where one `forward` call read 6089.81, 8572.32 and 10884.32 us, a 78.8% spread.
 The published run is the third of three and the only one taken while the GPU read 0%, so its ratio is
 three.
 
@@ -732,7 +763,7 @@ an order of magnitude.
 ### It reverses the `scale-profile` verdict, and the projection was the weaker of the two
 
 `scale-profile` answers `fused_attn` with `core/mlp >= 0.25`, which at the shipped shape is `0.167`, so
-it says no, and the kernel above wins by at least 105x. Both are computed correctly, because they
+it says no, and the CUDA kernel wins over `attention.forward` by 98.7x at the shipped window, the floor being withdrawn pending re-measurement. Both are computed correctly, because they
 measure different things: `core/mlp` is the share of an MLP layer's *arithmetic* that attention
 contributes and it says nothing about how long either takes. `src/scale.zig` calls the bar "a choice,
 and named as one".
@@ -744,7 +775,10 @@ which is those same 8.42 M multiply-adds counted as two operations each. Nothing
 tool; using a share of arithmetic as if it were a share of time was the error.
 
 The KV cache row above is gated on the same `core/mlp` term and this section does not speak to it. It
-is still a target and its reasoning has the same flaw the attention row had.
+has landed -- `src/kv_cache.zig`, five tests -- and its reasoning still has the flaw the attention row
+had: the threshold is not yet backed by a time, because nothing decodes through the cache. There is
+no generation loop, and the forward kernel's `q_offset` is exercised only at 0, so a cached key cannot yet be attended to by
+a single-token query.
 
 ## Tokenizer
 
@@ -764,7 +798,7 @@ memory on every run, so there is nothing to persist and nothing to keep in step 
 
 One test file per module, collected by `comptime` blocks in `tests.zig`. Zig has no test globbing,
 so a new test file is inert until it is named there, and nothing fails when a name goes missing.
-`tests.zig` is 79 lines and holds 3 tests of its own, the third being the guard that closes that gap:
+`tests.zig` holds 3 tests of its own, the third being the guard that closes that gap:
 Zig 0.16 has no comptime filesystem, so it walks `src/` at test time against its own source embedded
 with `@embedFile`, and fails with `error.TestUnreferencedTestFile` on any `*_test.zig` the blocks
 above do not name. It is a test rather than a compile error, which means a cached run can skip it, so

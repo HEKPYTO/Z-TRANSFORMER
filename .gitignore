@@ -18,3 +18,4 @@ zt-debug-train
 
 # AGENTS.md allows only README.md, LICENSE and CHANGELOG.md in the commit tree.
 docs/
+.scratch/

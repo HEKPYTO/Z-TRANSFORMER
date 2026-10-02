@@ -33,6 +33,35 @@ set -eu
 readme=${1:-src/README.md}
 root=${2:-.}
 
+# The discovery grep below has to MATCH SOMETHING, and that is checked before
+# anything else rather than inferred from the exit code.
+#
+# This is not hypothetical. The whole check is one pipeline: a `grep -o` feeds a
+# `sed` feeds a `while` loop that accumulates into `$bad`, and the script exits 0
+# when `$bad` is empty. Every stage of that pipeline succeeds on EMPTY input --
+# `grep` finds nothing and exits 1, which `set -e` does not see because it is
+# the left side of a pipe, and the loop body simply never runs. So a single extra
+# space after the leading `|` in every table row, or the backticks dropped, takes
+# 65 documented symbols down to 0 discovered ones and `verify` goes green over a
+# table of 65 lies.
+#
+# Measured, on the real file: 65 rows today; one space of drift gives 0 rows and
+# exit 0. And the failure mode is silence -- there is no output to notice,
+# because a check that read nothing has nothing to report.
+#
+# The same reasoning is why `build.zig`'s report-rows gate asserts
+# `grep -c . "$1" -lt 3` rather than trusting a diff, and why `src/tests.zig`
+# asserts `named > 0` before walking. This gate had no such floor and an audit
+# found it.
+rows=$(grep -c '^| `[a-z_]*\.[A-Za-z_][A-Za-z_0-9]*`' "$readme" || true)
+if [ "$rows" -lt 20 ]; then
+    echo "$readme: found $rows module.Symbol rows to check." >&2
+    echo "  That is far below the 65 the table has, so the discovery grep is" >&2
+    echo "  reading nothing and this check is vacuous. Either the table moved or" >&2
+    echo "  the pattern is stale; both are failures, and both are silent today." >&2
+    exit 1
+fi
+
 bad=$(
     grep -o '^| `[a-z_]*\.[A-Za-z_][A-Za-z_0-9]*`' "$readme" |
         sed 's/^| `//; s/`$//' |

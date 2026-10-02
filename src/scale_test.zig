@@ -332,7 +332,7 @@ test "scale: the report says every deferred item by name" {
     const out = w.buffered();
     for ([_][]const u8{
         "fused_attn", "kv_cache", "tied_head",   "wgrad_swap", "dense_scores",
-        "CROSSOVERS", "core/mlp", "weight_grad", "kv_cache",   "tied_GiB",
+        "CROSSOVERS", "core/mlp", "weight_grad", "tied_GiB",
     }) |needle| {
         try std.testing.expect(std.mem.indexOf(u8, out, needle) != null);
     }

@@ -27,9 +27,17 @@ pub fn forward(allocator: std.mem.Allocator, x: Tensor, weight: Tensor) !Tensor 
         const x_row = x.rowConst(r);
         var sum_sq: f64 = 0;
         for (x_row) |v| sum_sq += @as(f64, v) * @as(f64, v);
-        // f64 accumulator, narrowed once per row: 4096 f32 squares lose the low
-        // bits of the row and drift the scale by more than 1e-6, which the
-        // numerics tests hold this op to.
+        // f64 accumulator, narrowed once per row. The justification is the 512-row
+        // measurement written down in `norm_test.zig`, which is the widest row this
+        // model actually builds: f64 lands 5.7e-08 from exact, f32 lands 1.667e-06,
+        // and the 1e-6 tolerance sits between them.
+        //
+        // An earlier version of this comment justified the same choice with a
+        // 4096-wide row -- on the grounds that 4096 f32 squares "drift the scale by
+        // more than 1e-6". That is true of f32 in general, and `norm_test.zig` says
+        // in as many words that 4096 "is a shape nothing here ever produces, and a
+        // tolerance picked for it says nothing about the rows that run". The comment
+        // was arguing for a decision with a measurement the enforcing test disowned.
         const rms: f32 = @floatCast(@sqrt(sum_sq / @as(f64, @floatFromInt(d)) + eps));
 
         const y_row = out.row(r);

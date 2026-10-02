@@ -1,4 +1,25 @@
 const std = @import("std");
+const model = @import("model.zig");
+
+// Llama-3's RoPE base is 500000, not the textbook 10000, and NOTHING in the Zig
+// suite would otherwise notice a change to it. The exporter writes
+// `model.rope_theta` into the shape it hands the oracle and `removed_test.zig`
+// once compared that field against `model.rope_theta` -- a value against itself, which
+// passes for any value at all, and a silent edit to 10000 left `zig build verify`
+// green, `zig build test` green, and CI green. It now reads the field back out of the
+// exported `config.txt` and compares THAT against the constant, so the drift is caught
+// in CI rather than by a manual parity run. What no longer holds is the older claim
+// that the only thing which notices is
+// the Python parity run, which no build gate invokes and which is a manual
+// command on one host. An audit found this by asking what the parity harness
+// depends on that nothing checks.
+//
+// The assertion is here rather than in `removed_test.zig` because this is the file
+// that owns RoPE, and because a failure should name the constant rather than a
+// field of an exported struct.
+test "llama3 rope base is 500000, not the textbook 10000" {
+    try std.testing.expectEqual(@as(f64, 500000), model.rope_theta);
+}
 const rope = @import("rope.zig");
 const tensor = @import("tensor.zig");
 

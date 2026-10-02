@@ -37,9 +37,42 @@ comptime {
     _ = @import("removed_test.zig");
 }
 
+// `src/cuda/device.zig` lives under `src/cuda/` and holds its tests inline, which
+// looks like it should be a `src/cuda/device_test.zig` and is deliberately not.
+// The walk test above opens `src` non-recursively, so a test file under
+// `src/cuda/` would be invisible to it AND unregistered, and the failure mode of
+// that is the one this file exists to prevent: tests that never run, reported
+// green. Importing the file itself from here is what actually builds its tests,
+// and `src/` can reach `src/cuda/` -- the module-root restriction runs the other
+// way, and is why the file imports nothing but `std`.
+//
+// Its tests are the pure size arithmetic only. The `extern fn` declarations are
+// unreferenced there, so nothing is linked and the test binary needs no CUDA.
+comptime {
+    _ = @import("cuda/device.zig");
+}
+
+// The KV cache. In `src/` rather than `src/cuda/` because it is pure Zig with no
+// device in it at all, and because the walk test above opens `src` -- a
+// `src/kv_cache_test.zig` would be the right file by that test's own convention and
+// is deliberately not used, for the same reason `cuda/device.zig` is imported
+// directly: one mechanism, not two.
+comptime {
+    _ = @import("kv_cache.zig");
+}
+
 // Every `src/*_test.zig` is named by one of the blocks above, and a file that
 // is not named there compiles to nothing: no test in it is ever built, and
 // `zig build test` stays green. That is the failure this exists to catch.
+//
+// The needle is the whole `@import("...")` and not the bare file name, because
+// the reference below is this file's own text and this file discusses itself in
+// prose: it spells `src/cuda/device_test.zig` and `src/kv_cache_test.zig` in
+// the comments above, to say why neither exists. A bare-name search found them
+// there, so creating either one -- tests that never run, reported green, the
+// exact failure this exists to catch -- left the walk passing and the build
+// green. The quoted form also stops `a_test.zig` from being satisfied by
+// `ba_test.zig`, which a substring search over the two of them cannot.
 //
 // The scope is test files, and saying so is the point: `src/cuda/norm_twin.zig`
 // is 337 lines of Zig under `src/` that this walk cannot see and no build
@@ -68,7 +101,9 @@ test "every test file in src is named by the collection above" {
     while (try it.next(io)) |entry| {
         if (!std.mem.endsWith(u8, entry.name, "_test.zig")) continue;
         named += 1;
-        if (std.mem.indexOf(u8, source, entry.name) == null) {
+        var needle: [96]u8 = undefined;
+        const quoted = try std.fmt.bufPrint(&needle, "@import(\"{s}\")", .{entry.name});
+        if (std.mem.indexOf(u8, source, quoted) == null) {
             std.debug.print(
                 "\n{s} holds tests but no comptime block above names it, so none of them are built\n",
                 .{entry.name},

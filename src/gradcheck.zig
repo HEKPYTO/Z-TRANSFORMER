@@ -18,10 +18,16 @@ const Tensor = tensor.Tensor;
 /// which dividing by 2h turns into the budget in `floorOf`; the truncation error
 /// is h^2 times the third derivative. One step is used for every element rather
 /// than one per tensor, and the budget is computed rather than guessed: measured
-/// by Richardson on the real f32 forward, truncation sits near 1e-6 at this step,
-/// three orders below the roundoff term unless a third derivative exceeds a
-/// thousand, so the total is flat here and the cheaper of the two errors is not
-/// worth trading.
+/// by Richardson on the real f32 forward, truncation sits near 1e-6 at this step.
+/// The gap to the roundoff term is shape-dependent rather than one number, since
+/// `floorOf` divides by sqrt(T): about 1.5 orders of magnitude at the shipped
+/// context (T=256) and about 2.5 at the fixtures' T=4. "Three orders" held at no
+/// shape that can be measured here, so the conclusion this comment draws is
+/// correspondingly weaker than the one it used to -- the truncation term is
+/// OMITTED from the budget rather than bounded by it, and it stays negligible
+/// only while a third derivative is a few tens of what the shipped context
+/// produces and a few hundred of what T=4 produces. The cheaper error is still
+/// not worth trading, but it is not three orders of slack.
 const step: f32 = 1e-3;
 
 /// f32 has a 24 bit significand, so a value carries a representation error of
@@ -343,12 +349,14 @@ const k: f64 = 12.0;
 /// it does not license a loose assertion about it, which is why the assertion
 /// in `gradcheck_test.zig` brackets one pinned draw instead.
 ///
-/// Two things the derivation omits. Truncation, `h^2/6 * f'''`, is three orders
-/// below the roundoff term on the real f32 forward and is not in the total; if
-/// a future shape ever makes the two comparable, add a term for it rather than
-/// widening `k`, which measures weight spread and would then hide both. Gradient
-/// path accumulation depth needs no term: at d_model 32, sweeping kv-group 1 to
-/// 4 over five draws, per-element sigma was flat with no trend.
+/// Two things the derivation omits. Truncation, `h^2/6 * f'''`, is 1.5 orders of
+/// magnitude below the roundoff term at the shipped context and 2.5 at the test
+/// fixtures' T=4, so a shape that pushes it up would bring the two together, and
+/// it is not in the total. If a future shape ever makes them comparable, add a
+/// term for it rather than widening `k`, which measures weight spread and would
+/// then hide both. Gradient path accumulation depth needs no term: at d_model 32,
+/// sweeping kv-group 1 to 4 over five draws, per-element sigma was flat with no
+/// trend.
 fn floorOf(logit_scale: f64, tokens: usize) f64 {
     const t: f64 = @floatFromInt(tokens);
     return @sqrt(2.0) * k * f32_epsilon * logit_scale / (2.0 * @as(f64, @floatCast(step)) * @sqrt(t));

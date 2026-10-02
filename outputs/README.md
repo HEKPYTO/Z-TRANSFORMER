@@ -20,9 +20,16 @@ never touches, and is written onto the last row of that epoch only, so every ear
 `0.000000`. That is the shape of the measurement, not a missing one.
 
 The committed curve is the default `zig build train` run: 123 windows, one epoch, 64 KiB of corpus.
-The root `README.md` quotes the two final numbers out of it, and `zig build verify` checks the file
-those numbers came from, so a run that no longer produces it is a failing gate rather than a stale
-paragraph. A run that does produce it finds `loss.pending.csv` byte-identical, promotes it, and
+The root `README.md` quotes the two final numbers out of it.
+
+Two gates cover it, and they catch different things. `zig build verify` checks the file against the
+digest in `src/main.zig`, so it catches **an edited curve**. `zig build train` re-runs the training
+and refuses to promote a curve that differs, so it catches **a changed codebase**. Only the first is
+in `verify` and therefore in CI; the second is a manual command on one host, because a host with a
+different libm produces different bytes legitimately and a CI gate on it would be permanently red
+for a reason that has nothing to do with the code. An earlier version of this paragraph said `verify`
+made a stale run "a failing gate rather than a stale paragraph", which is true of an edited file and
+false of changed arithmetic, and the distinction is the whole point. A run that does produce it finds `loss.pending.csv` byte-identical, promotes it, and
 leaves nothing behind.
 
 Nothing else is here yet. There is no benchmark file and no checkpoint: `train.run` returns the

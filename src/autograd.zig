@@ -164,7 +164,14 @@ pub fn backwardFrom(
     try check(p, g, cfg, tokens, dlogits);
     const t_count = tokens.len;
     const d = model.dModel(cfg);
-    if (c.blocks.len != p.layers.len) return error.DimensionMismatch;
+    // The zero case is named separately because nothing above has refused it.
+    // `check` compares `g.layers.len` to `p.layers.len` and this compares
+    // `c.blocks.len` to it, so a zero-layer config with a zero-layer parameter set
+    // passes all three and `p.layers.len == 0` reaches the index below. The
+    // six-argument `backward` never got here because `model.forwardWith` validates
+    // first; `backwardFrom` is `pub`, takes the cache as its argument and runs no
+    // forward pass, so this function owns the check.
+    if (c.blocks.len == 0 or c.blocks.len != p.layers.len) return error.DimensionMismatch;
     const stream = c.blocks[c.blocks.len - 1].out;
 
     var d_final_h = try Tensor.init(allocator, t_count, d);
@@ -635,6 +642,34 @@ pub fn attentionBackward(
     dout: Tensor,
     cfg: model.Config,
 ) !AttnGrads {
+    // The two refusals `attention.forwardWith` opens with, restated here rather
+    // than reached through it, and the reason is who calls this. The CUDA
+    // backward kernels are graded against this function -- `src/cuda/attn_twin.zig`
+    // is their reference -- so a request this cannot answer has to be an error
+    // and not a number, or a wrong one reads as a passing gate. The forward gets
+    // these checks for free because `model.forwardWith` runs them on the way in;
+    // this is reached directly, by the twin and by any caller holding a cache,
+    // and had no validation of its own at all.
+    //
+    // The geometry first, in the forward's order, so the two name the same error
+    // for the same geometry: a zero kv head count divides by zero in the group
+    // split below, a zero head dim makes the scale infinite *and* makes both
+    // `dim / lanes` and `dim % lanes` zero, so no dq element is ever written and
+    // the tensor reads back as the zeros `Tensor.init` handed it, and a ragged
+    // split leaves a query head with no kv head. `src/attention.zig` lines 71-73.
+    if (cfg.n_kv_heads == 0 or cfg.head_dim == 0 or cfg.n_heads % cfg.n_kv_heads != 0) {
+        return error.InvalidHeadConfig;
+    }
+    // And the shapes, which is the forward's second refusal: every `k` and `v`
+    // row the loop below reaches is indexed by a `s` running to `q.rows - 1`, so
+    // a `k` shorter than `q` reads past its own buffer inside `rowConst` rather
+    // than coming back as an error. `src/attention.zig` lines 74-79.
+    if (k.rows != v.rows or k.rows != q.rows or
+        k.cols != cfg.n_kv_heads * cfg.head_dim or
+        v.cols != k.cols or q.cols != cfg.n_heads * cfg.head_dim)
+    {
+        return error.DimensionMismatch;
+    }
     const dim = cfg.head_dim;
     const group = cfg.n_heads / cfg.n_kv_heads;
     // Four of the six loops below are unrolled this many ways, and it is the
@@ -824,7 +859,14 @@ fn ropeBackward(dout: Tensor, din: *Tensor, pos: usize, theta: f64, head_dim: us
 ///     d x[i]  = (d n[i] - n[i] * (d n . n) / d) / rms,  d n[i] = g[i] * w[i]
 ///
 /// The mean is over d, not over the batch, and eps keeps the division finite at
-/// a zero row, which is the shape a zero norm weight leaves behind.
+/// a zero INPUT row.
+///
+/// An earlier version of this sentence said the zero row was "the shape a zero
+/// norm weight leaves behind", which is wrong and was worth correcting rather
+/// than deleting: a zero weight leaves a zero OUTPUT row (`y = n * 0 = 0`), and
+/// `rms` here is computed from `x`, the input, which a zero weight does not
+/// touch at all. The zero weight case is a real degenerate path and `norm_test`
+/// and `autograd_test` both cover it, but it is not what eps is for.
 ///
 /// `x` is the norm's input, `g` is the gradient of the norm's output, `dw`
 /// accumulates and `dx` is written whole.

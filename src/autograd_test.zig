@@ -497,9 +497,9 @@ fn finalHidden(allocator: std.mem.Allocator, p: model.Params, cfg: model.Config,
         defer k.deinit();
         var v = try tensor.matmul(attn_in, l.wv);
         defer v.deinit();
-        var qp = try rope.forward(allocator, q, 0, 500000, cfg.head_dim);
+        var qp = try rope.forward(allocator, q, 0, model.rope_theta, cfg.head_dim);
         defer qp.deinit();
-        var kp = try rope.forward(allocator, k, 0, 500000, cfg.head_dim);
+        var kp = try rope.forward(allocator, k, 0, model.rope_theta, cfg.head_dim);
         defer kp.deinit();
         var ctx = try attention.forward(allocator, qp, kp, v, .{
             .n_heads = cfg.n_heads,
@@ -856,4 +856,169 @@ test "autograd: gradcheck covers grouped-query attention" {
     var p = try liveParams(std.testing.allocator, gqa);
     defer p.deinit();
     try gradcheck.checkAll(std.testing.allocator, gqa, p, tok, tgt);
+}
+
+/// A tensor whose values vary with the index.
+///
+/// A constant fill is not usable here, and the reason is worth one sentence
+/// because it is silent: with constant q, k, v and dout, `d p[s]` is the same
+/// number for every `s`, the softmax Jacobian `d p[s] - sum_j p[j] d p[j]`
+/// cancels it to zero, and all three gradients come back exactly zero. The
+/// refusal cases do not care, but the arm after them runs the valid path and
+/// would be asserting that zero is what this function produces.
+fn ramped(allocator: std.mem.Allocator, rows: usize, cols: usize, phase: f32) !Tensor {
+    var t = try Tensor.init(allocator, rows, cols);
+    errdefer t.deinit();
+    for (t.data, 0..) |*v, i| {
+        const x: f32 = @floatFromInt(i % 7);
+        v.* = phase * (x - 3.0) / 8.0;
+    }
+    return t;
+}
+
+test "autograd: attentionBackward refuses the four requests attention.forward refuses" {
+    // This function is the reference `src/cuda/attn_twin.zig` grades two CUDA
+    // backward kernels against, so a request it cannot answer has to come back
+    // as an error. A `dq` of silent zeros would read as a passing gate.
+    //
+    // Each case is one refusal `attention.forwardWith` already makes, on the same
+    // terms and in the same order, and each is asserted alone so a missing one
+    // names itself rather than hiding behind the case before it.
+    const allocator = std.testing.allocator;
+    const t_count: usize = 4;
+    const wide: usize = 8; // n_heads * head_dim, and n_kv_heads * head_dim
+
+    var q = try ramped(allocator, t_count, wide, 0.5);
+    defer q.deinit();
+    var k = try ramped(allocator, t_count, wide, 0.25);
+    defer k.deinit();
+    var v = try ramped(allocator, t_count, wide, -0.25);
+    defer v.deinit();
+    var dout = try ramped(allocator, t_count, wide, 1.0);
+    defer dout.deinit();
+
+    // A zero kv head count. `group = n_heads / n_kv_heads` divides by zero.
+    try std.testing.expectError(error.InvalidHeadConfig, autograd.attentionBackward(allocator, q, k, v, dout, .{
+        .n_layers = 1,
+        .n_heads = 2,
+        .n_kv_heads = 0,
+        .head_dim = 4,
+        .n_ctx = t_count,
+        .vocab_size = 0,
+        .ffn_mult = 0,
+    }));
+
+    // A zero head dim. The scale is infinite and, worse, both `dim / lanes` and
+    // `dim % lanes` are zero, so the `dq` split below writes no element at all and
+    // the tensor reads back as the zeros `Tensor.init` handed it. The tensors
+    // above stay eight wide precisely so that tensor has something in it to be
+    // wrong about.
+    try std.testing.expectError(error.InvalidHeadConfig, autograd.attentionBackward(allocator, q, k, v, dout, .{
+        .n_layers = 1,
+        .n_heads = 2,
+        .n_kv_heads = 2,
+        .head_dim = 0,
+        .n_ctx = t_count,
+        .vocab_size = 0,
+        .ffn_mult = 0,
+    }));
+
+    // A ragged group split: three query heads over two kv heads. `kv = h / group`
+    // then names a kv head that does not exist for h = 2.
+    try std.testing.expectError(error.InvalidHeadConfig, autograd.attentionBackward(allocator, q, k, v, dout, .{
+        .n_layers = 1,
+        .n_heads = 3,
+        .n_kv_heads = 2,
+        .head_dim = 4,
+        .n_ctx = t_count,
+        .vocab_size = 0,
+        .ffn_mult = 0,
+    }));
+
+    // Fewer key rows than query rows. Every `k` and `v` row is reached with an `s`
+    // running to `q.rows - 1`, so this reads past `k` inside `rowConst` instead of
+    // coming back as an error.
+    var short_k = try ramped(allocator, t_count - 1, wide, 0.25);
+    defer short_k.deinit();
+    try std.testing.expectError(error.DimensionMismatch, autograd.attentionBackward(allocator, q, short_k, v, dout, .{
+        .n_layers = 1,
+        .n_heads = 2,
+        .n_kv_heads = 2,
+        .head_dim = 4,
+        .n_ctx = t_count,
+        .vocab_size = 0,
+        .ffn_mult = 0,
+    }));
+
+    // And the same call on the geometry they all agree with still runs, so none of
+    // the four refusals above is the function having stopped working.
+    var ok = try autograd.attentionBackward(allocator, q, k, v, dout, .{
+        .n_layers = 1,
+        .n_heads = 2,
+        .n_kv_heads = 2,
+        .head_dim = 4,
+        .n_ctx = t_count,
+        .vocab_size = 0,
+        .ffn_mult = 0,
+    });
+    defer ok.deinit();
+    try expectDiffers(ok.dq.data, ok.dk.data);
+}
+
+/// A model of the same head geometry and width as `tiny`, with no layers at all.
+const no_layers = model.Config{
+    .n_layers = 0,
+    .n_heads = 2,
+    .n_kv_heads = 2,
+    .head_dim = 4,
+    .n_ctx = 32,
+    .vocab_size = 16,
+    .ffn_mult = 1,
+};
+
+/// `no_layers` with a parameter set to match. `model.initParams` cannot produce
+/// one: `model.validate` refuses `n_layers == 0`, which is the right rule for a
+/// model a training run drives and the wrong rule for a cache a caller hands
+/// `backwardFrom` directly. That is the gap under test, so the fixture is built
+/// here rather than taken from the model.
+fn zeroLayerParams(allocator: std.mem.Allocator) !model.Params {
+    return .{
+        .tok_embed = try Tensor.init(allocator, no_layers.vocab_size, model.dModel(no_layers)),
+        // The empty slice literal, which is what `Params.deinit` itself assigns on
+        // its way out, so freeing it is a no-op and no allocator sees a request
+        // it never answered.
+        .layers = &.{},
+        .final_norm = try Tensor.init(allocator, 1, model.dModel(no_layers)),
+    };
+}
+
+test "autograd: backwardFrom refuses a cache with no blocks in it" {
+    // `check` compares `g.layers.len` to `p.layers.len`, and `backwardFrom` then
+    // compares `c.blocks.len` to the same thing. A zero-layer config with a
+    // zero-layer parameter set and a zero-block cache passes all three and reaches
+    // `c.blocks[c.blocks.len - 1]` with nothing in the slice: a bounds panic in
+    // Debug, an out-of-bounds read in ReleaseFast. The six-argument `backward`
+    // never reached it because `model.forwardWith` validates the config first;
+    // `backwardFrom` is `pub`, runs no forward pass, and owns the check itself.
+    const allocator = std.testing.allocator;
+    var p = try zeroLayerParams(allocator);
+    defer p.deinit();
+    var g = try autograd.zeroGrads(allocator, p);
+    defer g.deinit();
+    var dl = try ramped(allocator, tok.len, no_layers.vocab_size, 0.125);
+    defer dl.deinit();
+    var cache = try autograd.Cache.init(allocator, p, no_layers, tok);
+    defer cache.deinit();
+    try std.testing.expectEqual(@as(usize, 0), cache.blocks.len);
+
+    try std.testing.expectError(error.DimensionMismatch, autograd.backwardFrom(allocator, p, &g, no_layers, tok, dl, &cache));
+    // And the good call after it still works, so the guard refused the empty cache
+    // rather than this path.
+    var p1 = try liveParams(allocator, tiny);
+    defer p1.deinit();
+    var g1 = try autograd.zeroGrads(allocator, p1);
+    defer g1.deinit();
+    var dl1 = try dlogitsOf(allocator, tiny, p1, tok, tgt);
+    defer dl1.deinit();
+    try autograd.backward(allocator, p1, &g1, tiny, tok, dl1);
 }

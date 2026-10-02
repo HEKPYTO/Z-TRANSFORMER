@@ -7,6 +7,15 @@ const mlp = @import("mlp.zig");
 const attention = @import("attention.zig");
 const Tensor = tensor.Tensor;
 
+// The CUDA half of the attention seam. Container scope because `@import` is.
+// It costs a CPU build nothing, and the reason is narrower than it looks: an
+// `extern fn` becomes a link-time requirement the moment the function CALLING it
+// is analysed, so importing this file is free and naming one of its entry points
+// is not. Exactly two places name one -- `cudaForward` below and the `deinit`
+// the forward pass defers -- and both are behind `cuda_attn`. Read that constant
+// before moving either of them out from under it.
+const device = @import("cuda/device.zig");
+
 /// Public because the parity exporter writes it into the config the
 /// external side builds its reference model from. A harness that hardcoded
 /// 500000 next to a model that changed it would fail on RoPE and read as a
@@ -91,6 +100,40 @@ pub fn defaultConfig() Config {
         .ffn_mult = 4,
     };
 }
+
+/// Run the attention forward on `src/cuda/attn_kernels.cu` instead of on the CPU.
+///
+/// A source constant and not a build option, and the reason is not that a build
+/// option would need carrying on many modules. It could not reach this file at
+/// all: `build.zig` imports `src/model.zig` for this very constant and
+/// `src/main.zig` for the committed curve's digest, so an `@import` of a
+/// generated options module here is a COMPILE ERROR in the build script, which
+/// cannot import from the graph it is in the middle of defining. The option would
+/// therefore also have to ride on the library and on every executable and test
+/// module that transitively contains this file, and the first one added later
+/// without it names a missing module rather than a flag. One edit here, and
+/// `build.zig` reads the result instead of guessing at it.
+///
+/// It has to be comptime, and that is the safety property rather than a style
+/// choice. An `extern fn` becomes a link-time requirement the moment the function
+/// calling it is ANALYSED, so a runtime `if` is enough to put `zt_attn_forward`
+/// and `cudaFree` into `tests.o` and take `zig build test` down on every host
+/// with no CUDA toolchain -- which is every GitHub runner. Zig does not analyse
+/// the untaken arm of a comptime-known `if`, so `false` below means none of the
+/// three call sites is ever analysed and a CPU build cannot name either symbol.
+/// Every one of them says `if (comptime cuda_attn)`, including the `defer` that
+/// frees the holder: that one was a runtime `if (dev)`, which happens to be
+/// elided for a different reason, and which no reader can tell apart from the
+/// spelling that really does put `cudaFree` in the binary.
+///
+/// The price, stated rather than discovered. A tree with this left `true` fails
+/// `zig build verify` at the LINK step, naming `zt_attn_forward` and `cudaFree`.
+/// That is the designed failure, it is immediate, and
+/// `zig build cuda-attn-check` prints the line to edit when it is asked on a tree
+/// where the flag is off. `false` everywhere but a build that links the object.
+/// The CPU path is byte for byte what it was -- the same `attention.forwardWith`
+/// on the same tensors -- which is what `outputs/loss.csv` is a digest of.
+pub const cuda_attn: bool = false;
 
 pub const Layer = struct {
     attn_norm: Tensor, // [d]
@@ -255,6 +298,34 @@ pub fn forwardWith(
         .head_dim = cfg.head_dim,
     };
 
+    // One device holder for the whole pass rather than one per layer. The shape
+    // is the same at every layer, `cudaMalloc` synchronises, and the shape is
+    // fixed for the entire run, so there is nothing between two layers for a
+    // holder to be reused across. Eleven allocations per forward pass rather
+    // than forty-four, and eleven per pass is what `device.zig`'s own header
+    // says a training step needs.
+    //
+    // `null` on the CPU path and still `null` when this returns.
+    //
+    // The `comptime` is on BOTH lines and not only on the initialiser, and the
+    // `defer` is the one that was load-bearing. As a runtime `if (dev) |*buf|`
+    // its payload is `buf.deinit()`, which is `cudaFree`, and that is what put
+    // `undefined symbol: cudaFree referenced by tests.o:cuda.device.Attn.deinitPartial`
+    // into a build that links no CUDA object. It happens not to fire, because
+    // `dev` is a comptime-known `null` here and Zig tracks that through the local
+    // -- a property of the compiler's local tracking rather than a promise this
+    // file makes, and the reader cannot see any difference between that spelling
+    // and the one that really does link the symbol. A comptime `if` is one the
+    // language does promise.
+    //
+    // Unwrapping rather than testing is safe under the same guard: it is false in
+    // exactly the builds where `dev` is `null`.
+    var dev: ?device.Attn = if (comptime cuda_attn)
+        try device.Attn.init(t_count, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim)
+    else
+        null;
+    defer if (comptime cuda_attn) dev.?.deinit();
+
     for (p.layers, 0..) |l, layer| {
         var attn_in = try norm.forward(allocator, x, l.attn_norm);
         defer attn_in.deinit();
@@ -281,7 +352,20 @@ pub fn forwardWith(
         if (sink) |s| s.put(s, .k_rope, layer, k_pos);
         // v is not rotated, so it goes to attention as projected.
 
-        var ctx = try attention.forwardWith(allocator, q_pos, k_pos, v, attn_cfg, sink, layer);
+        // THE SEAM. Both arms compute the same function and return the same
+        // shape; only `comptime cuda_attn` above chooses, for the reason that
+        // constant's own comment gives.
+        //
+        // The CUDA arm does not fill `sink`. `attn_probs` is the one
+        // intermediate a training step does not read -- `autograd.zig` rebuilds
+        // the softmax row from `q_pos` and `k_pos` rather than storing the matrix
+        // -- so there is nothing to hand over, and the kernel does not produce
+        // one. The parity exporter is the only reader and it is a CPU tool
+        // against a CPU reference, which is the right place for it to stay.
+        var ctx = if (comptime cuda_attn)
+            try cudaForward(&dev.?, q_pos, k_pos, v, attn_cfg)
+        else
+            try attention.forwardWith(allocator, q_pos, k_pos, v, attn_cfg, sink, layer);
         defer ctx.deinit();
         if (sink) |s| s.put(s, .attn_ctx, layer, ctx);
         var proj = try tensor.matmul(ctx, l.wo);
@@ -323,6 +407,55 @@ pub fn forwardWith(
     x.deinit();
     acc.deinit();
     return logits;
+}
+
+/// `attention.forwardWith` on `src/cuda/attn_kernels.cu`, host-resident.
+///
+/// It needs no guard of its own. Zig analyses a function body only when
+/// something calls it, and `forwardWith` calls this one inside
+/// `if (comptime cuda_attn)` -- which is what keeps its `extern fn` calls, and
+/// therefore `zt_attn_forward`, out of a binary that links no CUDA object. An
+/// `extern fn` that survives into a binary is an undefined symbol on every host
+/// that does not link the object.
+///
+/// Host-resident on purpose, and not as a fallback: every tensor crosses the bus
+/// twice per call -- q, k and v up, the context down -- which is exactly what
+/// the PCIe floor in `src/cuda/README.md` measures a GPU attention against, and
+/// that floor is what says the remaining 92.7% of the step is the CPU. This is
+/// the first version of the path, not the fast one, and nothing here claims
+/// otherwise.
+fn cudaForward(a: *device.Attn, q: Tensor, k: Tensor, v: Tensor, cfg: attention.Config) !Tensor {
+    // The CPU twin's own shape contract, restated rather than assumed. `upload`
+    // bounds its source by `len <=` the device buffer, so a `q` carrying too FEW
+    // columns passes every check below and silently attends to a truncated head.
+    if (cfg.n_kv_heads == 0 or cfg.head_dim == 0 or cfg.n_heads % cfg.n_kv_heads != 0) {
+        return error.InvalidHeadConfig;
+    }
+    if (k.rows != v.rows or k.rows != q.rows or
+        k.cols != cfg.n_kv_heads * cfg.head_dim or
+        v.cols != k.cols or q.cols != cfg.n_heads * cfg.head_dim)
+    {
+        return error.DimensionMismatch;
+    }
+
+    try a.upload(a.q, q.data);
+    try a.upload(a.k, k.data);
+    try a.upload(a.v, v.data);
+    // group_q 1 and a cap of 64 are the configuration every published row in
+    // src/cuda/README.md was measured at, and `zt_attn_tile` is
+    // `min(dim, max_tile)`, so 64 reproduces the table exactly at head_dim 32
+    // and at Llama-3's 128.
+    try a.forward(1, 64);
+
+    var out = try Tensor.init(q.allocator, q.rows, cfg.n_heads * cfg.head_dim);
+    errdefer out.deinit();
+    // This copy is what waits for the kernel, and that is load-bearing rather
+    // than incidental: both launchers in attn_kernels.cu return as soon as the
+    // launch is accepted, and a pageable device-to-host `cudaMemcpy` is the
+    // synchronising point. Moving either launch off the default stream makes
+    // this a race, and the result would be a wrong answer rather than an error.
+    try a.download(out.data, a.out);
+    return out;
 }
 
 fn addInto(out: *Tensor, base: Tensor, branch: Tensor) !void {

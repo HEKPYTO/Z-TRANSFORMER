@@ -100,7 +100,7 @@ pub fn forwardWith(
     // Deliberately not zeroed, and the reason is worth writing down because the
     // safety is invisible from any one call site: this buffer is reused for every
     // position, and only `0..t + 1` is written for position `t`. Nothing has ever
-    // read past `t + 1` because three separate bounds agree on it — the score dot,
+    // read past `t + 1` because four separate bounds agree on it — the score dot,
     // the exp loop and the `v` sum. A fourth loop that walked the full row would
     // read last position's values and nothing would say so. Zeroing it per
     // position would cost a memset in the innermost loop of the forward pass, so

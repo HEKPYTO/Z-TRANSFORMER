@@ -30,11 +30,13 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends time
-      - run: zig build verify
-      # The only property the step graph cannot assert about itself. The test
-      # runs inside `verify` are part of its output, so a silent `verify` is a
-      # silent test run.
-      - name: a passing verify run is silent
+      # The only property the step graph cannot assert about itself, and it is
+      # asserted on the SAME run that gates. `verify` runs a full 123-step
+      # training pass and both test binaries, and this used to invoke it twice --
+      # once bare to fail the build, then again to capture the output -- so
+      # every CI run paid for the whole gate twice to check something the first
+      # run's own transcript already showed. One invocation gates and captures.
+      - name: verify passes and is silent
         run: |
           set -e
           log=$(mktemp)

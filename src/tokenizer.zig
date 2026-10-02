@@ -58,6 +58,12 @@ pub const Tokenizer = struct {
         try vocab.ensureTotalCapacity(allocator, byte_vocab_size);
         for (0..byte_vocab_size) |b| {
             const one = try allocator.alloc(u8, 1);
+            // `one` is in no list until the append below, so the errdefer over
+            // `vocab.items` cannot see it and a failing `append` leaks it. The
+            // `ensureTotalCapacity` above reserves all 256 slots, so today the
+            // append never grows the list and cannot fail; this is the guard
+            // for the day it can, and it costs one errdefer.
+            errdefer allocator.free(one);
             one[0] = @intCast(b);
             try vocab.append(allocator, one);
         }

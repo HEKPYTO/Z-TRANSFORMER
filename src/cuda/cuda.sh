@@ -77,15 +77,20 @@ else
         return 1 2>/dev/null || exit 1
     fi
     CUDA_ARCH=$(printf '%s' "$_cuda_cap" | tr -d '.' | sed 's/^/sm_/')
-    unset _cuda_cap
     case "$CUDA_ARCH" in
         sm_[0-9][0-9]*) ;;
         *)
+            # `$_cuda_cap` is still set here on purpose. This branch exists to name a
+            # capability it could not read, and both callers run under `set -u`, so
+            # unsetting the variable above this point turned the diagnostic into an
+            # unbound-variable abort -- the message written to explain the failure was
+            # itself the failure. The unset moved below the case for that reason.
             echo "cuda: could not read a compute capability out of '$_cuda_cap'." >&2
             echo "  Expected something like 8.6." >&2
             return 1 2>/dev/null || exit 1
             ;;
     esac
+    unset _cuda_cap
 fi
 
 # One container, one command, run as the person who typed this.

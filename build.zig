@@ -22,6 +22,15 @@ const lib_source = @import("src/lib.zig");
 /// only in principle.
 const main_source = @import("src/main.zig");
 
+/// The model's source, read for ONE constant: whether the attention forward runs
+/// on `src/cuda/attn_kernels.cu` or on the CPU. The build script has to know,
+/// because the object that makes a CUDA call resolvable is linked by two named
+/// steps and by nothing else, and both of those have to refuse rather than build
+/// something that links an object no code references. Imported rather than
+/// parsed out of the text, for the reason `main_source` above is: two spellings
+/// of one flag is a flag that will be wrong in one of them.
+const model_source = @import("src/model.zig");
+
 /// The corpus and the digest `data/README.md` documents for it. A corpus that
 /// changes silently turns every number derived from it into a lie.
 const corpus_path = "data/tinyshakespeare.txt";
@@ -174,7 +183,13 @@ pub fn build(b: *std.Build) void {
     const corpus = addDigestCheck(b, "corpus", corpus_path, corpus_sha256);
     // The committed curve, checked where a reader will already be looking: the
     // gate that already checks the corpus it was derived from.
-    const loss_csv = addDigestCheck(b, "committed loss curve", loss_csv_path, loss_csv_sha256);
+    // The label is this long on purpose. `addDigestCheck` is generic, so a failure
+    // here printed "digest check failed" and two hex strings -- and a reader who had
+    // legitimately changed the arithmetic could not tell from that whether the
+    // committed FILE was stale or the CODE was. It names the owner of the claim
+    // and the command that re-derives it, because those are the two things a
+    // reader in that position needs and neither was in the output.
+    const loss_csv = addDigestCheck(b, "committed loss curve (owned by src/main.zig:csv_sha256; re-derive with 'zig build train', which is the gate that checks the CODE still produces these bytes -- this one checks only that the FILE is unchanged)", loss_csv_path, loss_csv_sha256);
     // Its own step, deliberately not reached from `verify`, for the reason on
     // `removed_report_sha256`. `check.sh` runs it.
     const parity_digest_step = b.step("removed-digest", "Check tools/removed/report.csv: the projection everywhere, the bytes where the environment matches the committed report");
@@ -310,7 +325,20 @@ pub fn build(b: *std.Build) void {
     // can check without installing anything. `sh tools/removed/check.sh` checks
     // the report it just wrote, and `zig build removed-digest` is the step it
     // calls to do it.
-    const verify_step = b.step("verify", "Check fmt, tests in Debug and ReleaseFast, the banner, the corpus digest, the committed loss curve, the training run's peak memory, and the scale tables in src/README.md");
+    // The description below names all ten sub-checks, and it used to name
+    // seven. It listed neither `tools/symbols.sh` nor `tools/removed/report.csv`,
+    // so `zig build --list-steps` understated the gate by two and a reader
+    // weighing a green run against a shorter list than the one that ran was
+    // reading a stale copy. `README.md` already named all ten, which is how only
+    // this one went stale.
+    //
+    // It now also names the ONE thing the gate does not do, because that list has
+    // no other place to say it and `verify` is silent on success: the CUDA
+    // attention comparison needs a CUDA toolchain and a GitHub runner has none,
+    // so it lives in `zig build cuda-attn-check` and a green `verify` says
+    // nothing at all about it. A gate whose omissions are unstated is how a
+    // reader concludes a check happened.
+    const verify_step = b.step("verify", "Check fmt, the test suite in Debug, the test suite in ReleaseFast, the version banner, the corpus digest, the committed loss curve, the scale tables in src/README.md, the symbol table in src/README.md, tools/removed/report.csv, and the training run's peak memory -- but NOT the CUDA attention comparison, which needs a CUDA toolchain and is 'zig build cuda-attn-check'");
 
     // `b.graph.zig_exe` rather than `zig` off `PATH`, so the formatter that
     // decides whether the tree is formatted is the same compiler running the
@@ -389,7 +417,7 @@ pub fn build(b: *std.Build) void {
 
     // Nothing in this graph reached `src/cuda/` until now, which `AGENTS.md`
     // said out loud: a change there was unchecked until a person ran
-    // `sh src/cuda/run-norm.sh` on an NVIDIA host. This compiles the two `.cu`
+    // `sh src/cuda/run-norm.sh` on an NVIDIA host. This compiles three CUDA sources
     // files, so a syntax or type error in them is caught by the build system.
     //
     // Deliberately NOT in `verify`, and the reason is the same one that keeps
@@ -435,6 +463,113 @@ pub fn build(b: *std.Build) void {
     cuda_check.setCwd(b.path("."));
     const cuda_check_step = b.step("cuda-check", "Compile src/cuda/*.cu with the pinned toolchain, or fail loudly if there is none");
     cuda_check_step.dependOn(&cuda_check.step);
+
+    // The CUDA attention kernels, reachable from a training step. This is the
+    // third of the three pieces `src/cuda/device.zig`'s header names: the C
+    // entry points exist, the Zig binding for them exists, and until now nothing
+    // linked the two.
+    //
+    // Two steps rather than one, and the split is what keeps `verify` green on a
+    // runner with no CUDA toolchain. `cuda-attn-check` builds the gate in
+    // `src/train.zig` -- the smallest tree with both halves of the seam in it --
+    // and `cuda-train` builds the training binary. Neither is a dependency of
+    // anything: `train`, `bench`, `peak-rss` and `verify` all go through
+    // `train_exe`, which links no object and no CUDA runtime, so every one of
+    // them is the build it was before this and `outputs/loss.csv` is reproduced
+    // by the same bytes.
+    //
+    // BOTH STEPS FAIL while `src/model.zig:cuda_attn` is false, rather than
+    // building something that links an object nothing calls. That build would
+    // compile, run a whole 123-step training pass on the CPU and exit 0 -- a
+    // green that checked nothing, which is the defect this repository keeps
+    // finding in its own gates, and which `run-attn.sh` writes a paragraph about
+    // when `ATTN_GROUP_Q` is set on the host instead of inside the container.
+    // The two descriptions name the one thing each step needs that is not in the
+    // graph. `cuda-attn-check` builds a binary that LINKS against `libcudart` and
+    // then RUNS, so it needs the pinned 12.6.3 runtime copied out of the pinned
+    // image -- `src/cuda/README.md` has the recipe -- on BOTH `LIBRARY_PATH`, which
+    // the linker reads, and `LD_LIBRARY_PATH`, which the loader reads and
+    // `LIBRARY_PATH` does not feed. Without the second the step fails with a
+    // message about a missing shared library on a machine that has it, which is
+    // the worst shape a missing-argument error has.
+    const cuda_check_desc = "Grade the CUDA attention forward against the CPU one at a real step's scale (needs the pinned libcudart on LIBRARY_PATH *and* LD_LIBRARY_PATH; recipe in src/cuda/README.md)";
+    const cuda_train_desc = "Train with the CUDA attention forward (needs the pinned libcudart on LIBRARY_PATH *and* LD_LIBRARY_PATH; recipe in src/cuda/README.md)";
+    if (model_source.cuda_attn) {
+        const nvcc = cudaAttnObject(b);
+
+        // `src/train.zig` as its own test root. Rooted at `src/tests.zig` it
+        // would also re-run the other 209 tests against a CUDA-linked binary,
+        // which is a different and much slower check than the one this step is
+        // named for -- and the one gate here is the only test in the tree that
+        // needs a device.
+        const cuda_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/train.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+                .link_libc = true,
+            }),
+        });
+        linkCudaAttn(cuda_tests.root_module);
+        cuda_tests.step.dependOn(&nvcc.step);
+        const cuda_test_run = b.addRunArtifact(cuda_tests);
+        b.step("cuda-attn-check", cuda_check_desc).dependOn(&cuda_test_run.step);
+
+        const cuda_train_exe = b.addExecutable(.{
+            .name = "ztransformer-cuda-train",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+                .link_libc = true,
+            }),
+        });
+        linkCudaAttn(cuda_train_exe.root_module);
+        cuda_train_exe.step.dependOn(&nvcc.step);
+        const cuda_train_run = b.addRunArtifact(cuda_train_exe);
+        cuda_train_run.addArg("train");
+        // `settleCsv` refuses to promote a curve that is not the committed bytes
+        // and exits 1, so without this every run of this step would fail on a
+        // difference that is the point: the kernel computes the same function in
+        // a different order and a different last bit, which is the whole subject
+        // of `train.zig`'s `divergence`. Nothing is promoted by it either way --
+        // the committed curve is still only replaced on a digest match -- and the
+        // reader gets the curve and the divergence printed alongside it. The
+        // same variable `dbg-train` sets, for the same reason.
+        cuda_train_run.setEnvironmentVariable("ZTRANSFORMER_ACCEPT_LOSS_DIFFERENCE", "1");
+        cuda_train_run.step.dependOn(&corpus.step);
+        b.step("cuda-train", cuda_train_desc).dependOn(&cuda_train_run.step);
+    } else {
+        const off = b.addSystemCommand(&.{
+            "sh",
+            "-c",
+            \\echo "src/model.zig has cuda_attn = false, so no binary in this build calls" >&2
+            \\echo "src/cuda/attn_kernels.cu and this step would link an object nothing" >&2
+            \\echo "references. That is a training run on the CPU and a green result." >&2
+            \\echo >&2
+            \\echo "  edit src/model.zig: pub const cuda_attn: bool = true;" >&2
+            \\echo "  zig build cuda-attn-check   # the gate" >&2
+            \\echo "  zig build cuda-train        # a training run" >&2
+            \\echo "  edit it back to false, and 'git diff src/model.zig' is how you" >&2
+            \\echo "  check -- not 'git checkout', which would take your other" >&2
+            \\echo "  edits to that file with it" >&2
+            \\echo >&2
+            \\echo "It is a source constant and not -D because it has to be comptime," >&2
+            \\echo "and a build option could not reach src/model.zig anyway: this file" >&2
+            \\echo "imports it." >&2
+            \\echo >&2
+            \\echo "Leaving it TRUE is the mirror image and it is worse -- then" >&2
+            \\echo "'zig build test' fails at the LINK step on zt_attn_forward and" >&2
+            \\echo "cudaFree, on every host with no CUDA toolchain, which is every" >&2
+            \\echo "GitHub runner. Both halves of that are in src/model.zig's own" >&2
+            \\echo "comment on cuda_attn."
+            \\exit 1
+            ,
+        });
+        off.setCwd(b.path("."));
+        b.step("cuda-attn-check", cuda_check_desc).dependOn(&off.step);
+        b.step("cuda-train", cuda_train_desc).dependOn(&off.step);
+    }
 
     // Every `module.Symbol` row in src/README.md's tables names a declaration the
     // code actually makes pub. The drift is not hypothetical: 6c2a9c5 had to
@@ -486,12 +621,13 @@ pub fn build(b: *std.Build) void {
         \\# writer's casing, not a contract this gate asserts, so a one-character
         \\# change to `fail` turned the gate into a no-op. And a readable but EMPTY
         \\# file satisfied `-r` while grep found no failing row in nothing, so an
-        \\# empty export was green too. So there are three tests and they fail
-        \\# closed: unreadable or absent, near-empty, and a failing row. What
-        \\# they do NOT catch is a partial export that keeps several rows and
-        \\# drops the rest -- nothing here compares the row count to 204 -- and
-        \\# the digest check that would catch that is deliberately out of
-        \\# `verify`, so this gate is narrower than the failure it names.
+        \\# empty export was green too. So there are four tests and they fail
+        \\# closed: unreadable or absent, near-empty, the wrong number of
+        \\# lines, and a failing row. The count was the fourth because the
+        \\# first three all accept a partial export, and the digest check that
+        \\# would also catch that is deliberately out of `verify`, so this gate
+        \\# is the only thing standing between a truncated report and a green
+        \\# run.
         \\if [ ! -r "$1" ]; then
         \\  echo "tools/removed/report.csv is missing or unreadable, so there is" >&2
         \\  echo "no committed comparison for this gate to inspect. A gate that" >&2
@@ -503,6 +639,24 @@ pub fn build(b: *std.Build) void {
         \\  echo "empty or truncated rather than a comparison. Readable is not" >&2
         \\  echo "populated, and the failing-row grep below finds nothing in" >&2
         \\  echo "nothing, so without this both tests pass a zero-byte report." >&2
+        \\  exit 1
+        \\fi
+        \\# The count, because the three tests above all accept a partial
+        \\# export. Drop the last eighty rows of a real one and the file is
+        \\# still readable, still over three lines and still carries no
+        \\# failing row, so a hand-truncated report passed a gate written to
+        \\# catch a corrupt one. 207 lines is one header, 204 tensor rows --
+        \\# six cases of 34, being 16 per-layer kinds over two layers plus
+        \\# final_norm and logits -- one argmax row and one summary row. It
+        \\# is a TOTAL line count because the repository quotes two narrower
+        \\# counts elsewhere, 204 tensor rows and 206 rows of data, and a
+        \\# reader who reaches for either of those weakens the gate.
+        \\if [ "$(grep -c . "$1")" -ne 207 ]; then
+        \\  echo "tools/removed/report.csv holds $(grep -c . "$1") lines where 207" >&2
+        \\  echo "are: one header, 204 tensor rows, one argmax row, one summary" >&2
+        \\  echo "row. A truncated export keeps several clean rows, so the" >&2
+        \\  echo "failing-row grep finds nothing in them and the tests above" >&2
+        \\  echo "pass it. Re-run: sh tools/removed/check.sh" >&2
         \\  exit 1
         \\fi
         \\if grep -qi fail "$1"; then
@@ -528,6 +682,87 @@ pub fn build(b: *std.Build) void {
     _ = banner_run.captureStdOut(.{});
     banner_run.expectStdOutEqual(b.fmt("{s} {s}\n", .{ lib_source.name(), lib_source.version }));
     verify_step.dependOn(&banner_run.step);
+}
+
+/// `src/cuda/attn_kernels.cu`, compiled into an object the build graph links.
+///
+/// `attn_kernels.cu` and NOT `attn.cu`, and that is the whole of the difference:
+/// `attn.cu` is the benchmark harness, it `#include`s this file and defines
+/// `main`, so linking it fails at `multiple definition of 'main'` -- a message
+/// that names neither of the two files it could have meant. `attn_kernels.cu`
+/// carries its own `#include`s, holds no `main`, and compiles to exactly the six
+/// `zt_attn_*` entry points.
+///
+/// The flags and the toolchain are NOT restated. `src/cuda/cuda.sh` is sourced
+/// and `cuda()` is called, exactly as `cuda-check` above does, so the
+/// architecture derivation, the `-Werror -fPIC` set and the pinned image keep
+/// one owner and this cannot compile something the published table was never
+/// measured from. `CUDA_ROOT_DIR` is exported for the reason that header gives:
+/// a sourced file sees the CALLER's `$0`, which here is `sh`, so without it the
+/// container bind-mounts a directory that is not this one.
+///
+/// The object lands under `.zig-cache/cuda/`, which is gitignored and which
+/// `run-attn.sh`'s EXIT trap does not remove -- it deletes
+/// `.zig-cache/cuda/attn`, the sibling. It is written by the container under the
+/// host's own uid, for the reason `cuda.sh`'s `--user` comment gives.
+fn cudaAttnObject(b: *std.Build) *std.Build.Step.Run {
+    const nvcc = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        \\set -eu
+        \\CUDA_ROOT_DIR=$PWD
+        \\export CUDA_ROOT_DIR
+        \\. src/cuda/cuda.sh
+        \\cuda_pull
+        \\flags=$(cuda_nvcc_flags)
+        \\mkdir -p .zig-cache/cuda
+        \\cuda "nvcc $flags -c -o .zig-cache/cuda/attn_kernels.o src/cuda/attn_kernels.cu"
+        ,
+    });
+    nvcc.setCwd(b.path("."));
+    return nvcc;
+}
+
+/// The compiled kernels and the runtime they resolve against, on one module.
+///
+/// `cudart` is `-lcudart`, and WHICH one is the entire point. the CUDA host
+/// carries a CUDA 13.4 toolkit and `ldconfig` resolves its `libcudart.so` to
+/// `/usr/local/cuda/targets/x86_64-linux/lib/`, so a linker there finds `-lcudart`
+/// with no help at all -- while the object above was built by the pinned 12.6.3
+/// image. Linking the host's copy would put two toolchains in one build, the
+/// condition `AGENTS.md` refuses, and it would do so invisibly: nothing fails and
+/// every number still prints.
+///
+/// The pinned runtime therefore has to be copied out of the image first, and
+/// `src/cuda/README.md` carries that recipe -- `cp -P` the `libcudart.so*`
+/// chain into a directory and put it on `LIBRARY_PATH`. It is NOT in `cuda.sh`,
+/// because every script here links inside the container and this is the first
+/// one that links outside it. Stated here rather than assumed, and nothing in
+/// this repository can check it: the copy-out is outside the build graph, so the
+/// one thing that would catch a wrong `LIBRARY_PATH` is a reader who runs the
+/// recipe.
+///
+/// TWO VARIABLES, NOT ONE, and the README's recipe as written is only half of it.
+/// `LIBRARY_PATH` is what the LINKER reads, and it is enough to get past the link;
+/// the steps built above then RUN, and the LOADER resolves `libcudart.so.12` from
+/// its own search path, which `LIBRARY_PATH` does not feed. Without
+/// `LD_LIBRARY_PATH` the gate fails as
+/// `error while loading shared libraries: libcudart.so.12: cannot open shared
+/// object file` -- a message about a missing library rather than about a missing
+/// loader variable, on a machine that demonstrably has the library. So a reader
+/// needs both, and the fact that is not in the README is the reason it is here.
+///
+/// `dl` is on `nvcc`'s own link line, because the runtime reaches the driver with
+/// `dlopen`. glibc 2.34 folded `libdl` into libc, so it is redundant on a host
+/// that new and required on one that is older, and it costs nothing either way.
+///
+/// `link_libc` is set on the modules themselves rather than here, and it is not
+/// optional: the entry points print their refusals with `fprintf` and abort with
+/// `exit`.
+fn linkCudaAttn(m: *std.Build.Module) void {
+    m.addObjectFile(m.owner.path(".zig-cache/cuda/attn_kernels.o"));
+    m.linkSystemLibrary("cudart", .{});
+    m.linkSystemLibrary("dl", .{});
 }
 
 /// One test binary, in one optimize mode, as a run step.
@@ -578,6 +813,13 @@ fn addTests(
 /// of the second so neither side can differ by a trailing newline. It keys on
 /// the three header lines rather than on line numbers, so a row moving or a
 /// column appearing reads as a diff rather than a misread.
+///
+/// A `cmp` on two empty files exits 0, and keying on header LINES is what makes
+/// that reachable: rename one of the three in `src/scale.zig`, delete the block
+/// from `src/README.md`, and both extractions come back empty while this check
+/// passes. So the tool side carries a line-count floor before the comparison.
+/// The README side needs no floor of its own, because a file with no block in
+/// it is 29 lines short of a file with one, and `cmp` already fails on that.
 fn addScaleTableCheck(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step.Run {
     const run = b.addRunArtifact(exe);
     run.addArg("scale-profile");
@@ -596,6 +838,26 @@ fn addScaleTableCheck(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.St
         \\  on && /^$/ {on=0; next}
         \\  on {print}
         \\' "$tool" > "$t"
+        \\# A floor on the tool side, before the `cmp`, because `cmp -s` exits 0
+        \\# on two empty files. Delete the block in src/README.md, rename one
+        \\# header line in src/scale.zig, and the extraction finds neither table:
+        \\# the comparison then succeeds on nothing at all. That is the same
+        \\# defect as the `sed` pipeline the other platform had, where an empty
+        \\# derivation becomes a silently wrong `-arch` flag. The README side
+        \\# needs no floor of its own, because emptying it alone leaves 29 lines
+        \\# to diff against and `cmp` already fails. 29 today: three headers, 24
+        \\# rows and two blank separators. The threshold is 20, well clear of
+        \\# zero and well under the real value, so adding a shape to a table
+        \\# does not require editing this check.
+        \\if [ "$(wc -l < "$t")" -lt 20 ]; then
+        \\  echo "zig build scale-profile printed $(wc -l < "$t") lines of table" >&2
+        \\  echo "where src/README.md's block has 29, so this check would be" >&2
+        \\  echo "comparing an empty extraction against an empty one and" >&2
+        \\  echo "passing. A header line in src/scale.zig that no longer matches" >&2
+        \\  echo "the three this awk keys on is the cause. Run" >&2
+        \\  echo "'zig build scale-profile' and read what it prints." >&2
+        \\  rm -f "$t" "$r"; exit 1
+        \\fi
         \\awk '
         \\  /<!-- scale-profile:begin -->/ {on=1; next}
         \\  /<!-- scale-profile:end -->/ {on=0; next}
@@ -663,11 +925,14 @@ fn addScaleTableCheck(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.St
 /// repository does not ship a gate that cannot fail. `ci.yml` installs `time` so
 /// that does not happen on a clean runner.
 ///
-/// The only silent exit is a platform that is neither, and it is silent on
-/// purpose. A line there would break the silence contract on a machine nobody
-/// runs CI on, in exchange for telling a developer on that platform that this
-/// gate does not cover their host. Two platforms is where the measurements were
-/// taken and where the build runs; that is the whole of the claim.
+/// The only silent exit was a platform that is neither, and it was silent on
+/// purpose and wrong. The reason given was that a line there breaks the silence
+/// contract CI asserts on every run -- but that contract is about a PASSING run,
+/// and this branch turned a run that measured nothing into a passing one, so the
+/// silence was the defect rather than the design. It now fails, in the same
+/// shape as the missing-`time` case above, and the check is cheap: all three
+/// jobs in `ci.yml` are `ubuntu-latest` and the only other platform anyone
+/// builds this on is Darwin, so the branch is unreachable rather than a new red.
 fn addPeakRssCheck(b: *std.Build, train_exe: *std.Build.Step.Compile) *std.Build.Step.Run {
     const check = b.addSystemCommand(&.{
         "sh",
@@ -698,12 +963,22 @@ fn addPeakRssCheck(b: *std.Build, train_exe: *std.Build.Step.Compile) *std.Build
         \\  how="/usr/bin/time -f, ReleaseFast ztransformer-train, ru_maxrss in KiB"
         \\  ;;
         \\*)
-        \\  # Neither platform this repository is built on. Silent is deliberate,
-        \\  # and it is the one place in this file that is: a line here breaks
-        \\  # `verify`'s silence contract, which CI asserts on every run, and a
-        \\  # measurement that cannot be taken here must not become a CI failure
-        \\  # on a platform nobody runs CI on. Darwin and Linux both measure.
-        \\  rm -f "$t"; exit 0
+        \\  # Neither platform this repository is built on, so there is no
+        \\  # /usr/bin/time invocation to make and no number to compare. It
+        \\  # fails anyway, for the reason the Linux case above gives: a gate
+        \\  # that cannot run is a claim. This branch used to `rm -f "$t"; exit
+        \\  # 0`, justified by `verify`'s silence contract -- which is a claim
+        \\  # about a PASSING run, and this branch was how a run that measured
+        \\  # nothing passed. The silence was the defect, not the design. And it
+        \\  # is unreachable rather than a new red: all three jobs in ci.yml are
+        \\  # ubuntu-latest, and Darwin is the only other platform this is built
+        \\  # on, so both of them take a branch above.
+        \\  echo "zig build peak-rss: $(uname -s) is neither Darwin nor Linux, so" >&2
+        \\  echo "peak memory is UNCHECKED here, and a gate that cannot run is" >&2
+        \\  echo "a claim. The two platforms this gate measures are the two this" >&2
+        \\  echo "repository is built on. Add a branch to the case above before" >&2
+        \\  echo "trusting this gate anywhere else." >&2
+        \\  rm -f "$t"; exit 1
         \\  ;;
         \\esac
         \\if [ "$st" -ne 0 ]; then

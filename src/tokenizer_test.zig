@@ -266,3 +266,19 @@ test "decode rejects a token id past the vocabulary" {
     try std.testing.expectError(error.TokenOutOfRange, tk.decode(gpa, &.{256}));
     try std.testing.expectError(error.TokenOutOfRange, tk.decode(gpa, &.{ 65, std.math.maxInt(u32) }));
 }
+
+fn initRelease(allocator: std.mem.Allocator) !void {
+    var tk = try Tokenizer.init(allocator);
+    tk.deinit();
+}
+
+test "an allocation failure in init leaks nothing" {
+    // `init` makes 257 allocations -- the list's capacity, then one single byte
+    // slice per value -- and each byte slice is in no list until the `append`
+    // that follows it, where the errdefer over `vocab.items` cannot reach it.
+    // This walks every one of those allocations, fails it in turn, and requires
+    // the error to surface rather than be swallowed. It is a live gate and not a
+    // formality: dropping the errdefer over `vocab.items` makes it report
+    // `MemoryLeakDetected`.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, initRelease, .{});
+}

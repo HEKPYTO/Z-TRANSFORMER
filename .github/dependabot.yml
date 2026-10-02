@@ -4,3 +4,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  # The pins in tools/removed/requirements.txt are load-bearing, not a working set:
+  # reference-library v5 moved rope_theta into rope_parameters, so an unpinned install
+  # silently compares against theta=10000 and fails on RoPE while looking like a
+  # numerics bug. That is what this entry exists to catch before a human does.
+  - package-ecosystem: pip
+    directory: /tools/removed
+    schedule:
+      interval: weekly

@@ -13,10 +13,25 @@
 //! every row carries its OWN geometry rather than a shared one. The first five
 //! rows are the shipped configuration, because the question this answers starts
 //! with whether a kernel beats the CPU at the shape the project actually runs.
-//! The last two are Llama-3's -- 32 heads over 8 kv heads at head_dim 128 --
+//! The next two are Llama-3's -- 32 heads over 8 kv heads at head_dim 128 --
 //! because a kernel only ever run at head_dim 32 has not been shown to run at the
 //! width the goal names, and at that width the tile has to be narrower than the
 //! head or the shared-memory ask exceeds what a block will be granted.
+//!
+//! The last four are the WIDTHS, and they exist because the kernel used to refuse
+//! them. `zt_attn_dim_ok` demanded a power of two, so head_dims of 96, 192 and 80
+//! were turned away for a property no loop reads -- and those are Phi-3's head,
+//! DeepSeek-V2 and V3's MLA head, and a family of 80-wide ones. A width guard that
+//! rejects three shipping models is a defect that only shows up when someone tries
+//! to run one, so the widths are in the manifest and graded like any other row.
+//! `phi3-T512` is there because one context length cannot show that a new width
+//! behaves: `ctx256` and `ctx512` at head_dim 32 differ, and so do `llama3-T256`
+//! and `llama3-T512`.
+//!
+//! `gemma2-T256` is also the shared-memory case. At head_dim 256 the tile the
+//! benchmark asks for wants more per-block memory than an sm_86 will opt into, so
+//! the launcher narrows the tile rather than ending the process, and this row is
+//! what decides whether a run at a narrower tile is allowed to count.
 //!
 //! Nothing here is a gate. The parity decision is `attn.cu`'s, and it is the only
 //! thing in the pair that decides anything.
@@ -40,14 +55,15 @@ const Tensor = attention.Tensor;
 /// against each other without either being re-derived. `iters` is the GPU repeat
 /// count `attn.cu` times; it falls with T because the kernel is quadratic.
 ///
-/// The last two rows are not the shipped geometry and they are the reason this
-/// table has a geometry column at all. The goal names Llama-3, whose attention is
-/// 32 heads over 8 kv heads at head_dim 128, and at that width a tile of 128 asks
-/// a block for 130 KiB of shared memory -- past what an sm_86 block will opt into.
-/// A kernel only ever run at head_dim 32 has not been shown to run at the width
-/// the project is about, so these rows run it there. The CPU reference is
+/// The rows past the first five are not the shipped geometry and they are the
+/// reason this table has a geometry column at all. The goal names Llama-3, whose
+/// attention is 32 heads over 8 kv heads at head_dim 128, and at that width a tile
+/// of 128 asks a block for 130 KiB of shared memory -- past what an sm_86 block
+/// will opt into. A kernel only ever run at head_dim 32 has not been shown to run
+/// at the width the project is about, so these rows run it there. The last four
+/// add the widths the power-of-two guard used to refuse, and the CPU reference is
 /// `attention.forward` unchanged, because it is written against whatever geometry
-/// it is handed.
+/// it is handed and holds no opinion about powers of two either.
 const shapes = [_]struct {
     tag: []const u8,
     T: usize,
@@ -63,6 +79,17 @@ const shapes = [_]struct {
     .{ .tag = "ctx4096", .T = 4096, .n_heads = 4, .n_kv_heads = 2, .head_dim = 32, .iters = 20 },
     .{ .tag = "llama3-T256", .T = 256, .n_heads = 32, .n_kv_heads = 8, .head_dim = 128, .iters = 50 },
     .{ .tag = "llama3-T512", .T = 512, .n_heads = 32, .n_kv_heads = 8, .head_dim = 128, .iters = 10 },
+    // Phi-3: 32 heads over 8 kv heads at head_dim 96. Two context lengths, because
+    // one cannot show that a width behaves rather than happening to.
+    .{ .tag = "phi3-T256", .T = 256, .n_heads = 32, .n_kv_heads = 8, .head_dim = 96, .iters = 50 },
+    .{ .tag = "phi3-T512", .T = 512, .n_heads = 32, .n_kv_heads = 8, .head_dim = 96, .iters = 10 },
+    // DeepSeek's MLA head width, with no GQA on it: 16 heads over 16 kv heads, so
+    // the group is 1 and the two collapses GQA and the correct kernel part company
+    // for a different reason than at every other row.
+    .{ .tag = "mla-T256", .T = 256, .n_heads = 16, .n_kv_heads = 16, .head_dim = 192, .iters = 50 },
+    // Gemma-2's head width, and the widest this kernel accepts. The tile that the
+    // rest of the table asks for does not fit a block here.
+    .{ .tag = "gemma2-T256", .T = 256, .n_heads = 8, .n_kv_heads = 4, .head_dim = 256, .iters = 50 },
 };
 
 /// How long to keep calling `forward` before believing the clock, and the cap.
@@ -87,8 +114,11 @@ pub fn main(init: std.process.Init) !void {
     // rather than the op.
     const gpa = init.gpa;
 
-    // The first five rows are the shipped geometry and the last two are not, so
-    // the table is checked against the config rather than assumed to be it.
+    // The first five rows are the shipped geometry and every row after them is
+    // not, so the table is checked against the config rather than assumed to be it.
+    // Sliced to five on purpose: the point of the check is that the SHIPPED rows
+    // are the shipped geometry, and widening the slice would quietly make it a
+    // claim about the other six.
     const shipped = attention.defaultConfig();
     for (shapes[0..5]) |s| {
         if (s.n_heads != shipped.n_heads or s.n_kv_heads != shipped.n_kv_heads or
@@ -174,6 +204,39 @@ pub fn main(init: std.process.Init) !void {
             .vocab_size = 0,
             .ffn_mult = 0,
         };
+        // The CPU backward is timed here, and this is the ONLY place in the
+        // repository where its cost is measured. It matters because the backward
+        // is what decides whether moving attention to the GPU is worth anything
+        // at the shape this project actually trains at: the forward is 2.6% of a
+        // step on the 32-core host, so the backward's multiple of it is the whole
+        // question. Every other figure for it in this repository was an estimate
+        // ("about four times the work"), and an estimate cannot decide a
+        // go/no-go.
+        //
+        // Reported as a MINIMUM, for the reason the forward's timing above gives:
+        // on a shared host contention and frequency scaling only make a call
+        // slower, so the fastest call observed is the closest estimate of the
+        // unloaded cost. A mean would flatter the kernel whenever the host is
+        // busy, which is the direction this number must not be wrong in -- it
+        // would understate how much there is to win.
+        var bwd_us: f64 = 0;
+        {
+            var bcalls: usize = 0;
+            var bbest_ns: u64 = std.math.maxInt(u64);
+            while (bcalls < 3) : (bcalls += 1) {
+                var warm_b = try autograd.attentionBackward(gpa, q, k, v, dout, mcfg);
+                warm_b.deinit();
+            }
+            bcalls = 0;
+            while (bcalls < 3) : (bcalls += 1) {
+                const tb0 = Io.Clock.awake.now(init.io);
+                var g = try autograd.attentionBackward(gpa, q, k, v, dout, mcfg);
+                g.deinit();
+                const dtb: u64 = @intCast(tb0.untilNow(init.io, .awake).toNanoseconds());
+                if (dtb < bbest_ns) bbest_ns = dtb;
+            }
+            bwd_us = @as(f64, @floatFromInt(bbest_ns)) / 1000.0;
+        }
         var bwd = try autograd.attentionBackward(gpa, q, k, v, dout, mcfg);
         defer bwd.deinit();
 
@@ -185,8 +248,8 @@ pub fn main(init: std.process.Init) !void {
         try manifest.appendSlice(gpa, try std.fmt.allocPrint(scratch, "{s} {d} {d} {d} {d} {d} {d:.6}\n", .{
             s.tag, s.T, s.n_heads, s.n_kv_heads, s.head_dim, s.iters, cpu_us,
         }));
-        std.debug.print("attn: {s} T={d} {d}/{d} heads dim {d} cpu {d:.2} us over {d} calls\n", .{
-            s.tag, s.T, s.n_heads, s.n_kv_heads, s.head_dim, cpu_us, calls,
+        std.debug.print("attn: {s} T={d} {d}/{d} heads dim {d} cpu {d:.2} us over {d} calls" ++ "   cpu_backward {d:.2} us\n", .{
+            s.tag, s.T, s.n_heads, s.n_kv_heads, s.head_dim, cpu_us, calls, bwd_us,
         });
     }
 
