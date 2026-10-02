@@ -424,6 +424,21 @@ pub fn forwardWith(
 /// that floor is what says the remaining 92.7% of the step is the CPU. This is
 /// the first version of the path, not the fast one, and nothing here claims
 /// otherwise.
+/// The `ATTN_CORRUPT_KEY` offset, read once. `null` when the variable is unset,
+/// unparseable, or exactly zero -- an unparseable value must not silently mean
+/// "off", or a typo would turn the demonstration of a working gate into a
+/// demonstration of nothing.
+fn corrupt_key_offset() ?f32 {
+    // `std.c.getenv`, not `std.process.Environ`: this repository links libc and
+    // builds for POSIX only, and the `.cu` files read `ATTN_BROKEN` and friends the
+    // same way. Reaching for the `Environ` type would mean threading a map through
+    // `forwardWith` for one debug knob.
+    const raw = std.c.getenv("ATTN_CORRUPT_KEY") orelse return null;
+    const v = std.fmt.parseFloat(f32, std.mem.span(raw)) catch return null;
+    if (v == 0) return null;
+    return v;
+}
+
 fn cudaForward(a: *device.Attn, q: Tensor, k: Tensor, v: Tensor, cfg: attention.Config) !Tensor {
     // The CPU twin's own shape contract, restated rather than assumed. `upload`
     // bounds its source by `len <=` the device buffer, so a `q` carrying too FEW
@@ -439,7 +454,24 @@ fn cudaForward(a: *device.Attn, q: Tensor, k: Tensor, v: Tensor, cfg: attention.
     }
 
     try a.upload(a.q, q.data);
-    try a.upload(a.k, k.data);
+    // The deliberate-corruption knob, and the reason this repository's gates are
+    // believed: a gate nobody has watched fail is not a gate. `ATTN_CORRUPT_KEY`
+    // adds a small offset to ONE element of the uploaded keys, on the device side
+    // only, so the CPU reference in the gate still reads the clean `k_pos`. The
+    // model then disagrees with `attention.forward` and `zig build cuda-attn-check`
+    // exits 1. The knob is read once per process, it defaults to off, and with it
+    // off this upload is the plain one -- the same pattern `run-attn.sh` uses for
+    // `ATTN_BROKEN`, so there is nothing new to learn to run it.
+    //
+    //     ATTN_CORRUPT_KEY=0.05 zig build cuda-attn-check   # must exit 1
+    if (corrupt_key_offset()) |off| {
+        var damaged = try q.allocator.dupe(f32, k.data);
+        defer q.allocator.free(damaged);
+        damaged[0] += off;
+        try a.upload(a.k, damaged);
+    } else {
+        try a.upload(a.k, k.data);
+    }
     try a.upload(a.v, v.data);
     // group_q 1 and a cap of 64 are the configuration every published row in
     // src/cuda/README.md was measured at, and `zt_attn_tile` is

@@ -47,8 +47,17 @@ pub const Row = struct {
     train_loss: f64,
     /// Validation loss of the most recent epoch end, so the last row of every
     /// epoch carries the number measured after it and the rows before the first
-    /// epoch ends read 0 because nothing has been measured yet.
-    val_loss: f64,
+    /// epoch ends are `null`.
+    ///
+    /// `null`, not `0`. It used to be an `f64` initialised to 0, and every row
+    /// logged before the first epoch ended printed `0.000000` -- a file in
+    /// which "the validation loss was exactly zero" and "nothing has been
+    /// measured yet" are the same bytes, so a reader cannot tell which of the
+    /// two it is looking at. `writeCsv` prints an empty field for `null` and
+    /// `cell` reads one back, so the file says what it means. A measured `0.0`
+    /// still prints `0.000000` and still parses as a number, which is the whole
+    /// difference.
+    val_loss: ?f64,
     lr: f32,
 };
 
@@ -162,7 +171,9 @@ pub fn run(
     // `Result.train_loss` reports, and the epoch's, which the log column carries.
     var run_loss_sum: f64 = 0;
     var epoch_loss_sum: f64 = 0;
-    var val_loss: f64 = 0;
+    // `null` until the first epoch ends, so a row logged before that carries
+    // "not measured" and not a zero.
+    var val_loss: ?f64 = null;
     var in_epoch: usize = 0;
 
     for (0..cfg.epochs) |_| {
@@ -245,7 +256,10 @@ pub fn run(
 
     return .{
         .train_loss = run_loss_sum / @as(f64, @floatFromInt(step)),
-        .val_loss = val_loss,
+        // The run's own number rather than the rows': the `epochs == 0` guard at
+        // the top means the loop above ran and measured at least once, so this
+        // is not an `orelse` that could hand back a zero the loop never took.
+        .val_loss = val_loss.?,
         .steps = step,
         .params = params,
         .rows = try rows.toOwnedSlice(allocator),
@@ -258,9 +272,13 @@ pub fn run(
 pub const csv_header = "step,train_loss,val_loss,lr";
 
 /// A step, and the three numbers logged at it in the order `csv_header` names.
+///
+/// `values[1]` is optional because the column can carry an empty field. The
+/// other two are logged on every row, so their cells are never `null` and
+/// unwrapping them is not a guess.
 const Cell = struct {
     step: usize,
-    values: [3]f64,
+    values: [3]?f64,
 };
 
 /// Which logged column a disagreement was found in. The order is `csv_header`'s,
@@ -304,10 +322,25 @@ pub const Divergence = struct {
 /// Measures how far `fresh` is from `committed`, cell by cell.
 ///
 /// `error.CurveShape` when the two are not the same shape of file: a different
-/// header, a different number of rows, a field that is not a number. All three
-/// are refused rather than tolerated, because a curve this cannot read is not
-/// one it can measure, and reading past the end of a row is how a difference
-/// gets attributed to the wrong column and reported as rounding.
+/// header, a different number of rows, a field that is not a number, or one
+/// cell that was measured on one side and not on the other. All four are
+/// refused rather than tolerated, because a curve this cannot read is not one
+/// it can measure, and reading past the end of a row is how a difference gets
+/// attributed to the wrong column and reported as rounding.
+///
+/// THE UNMEASURED CELL, which is the fourth refusal and the only one this
+/// signature could not have had before `val_loss` became optional. Two cells
+/// that were both never measured agree, and contribute a difference of zero
+/// like any other pair of equal numbers. One that was measured and one that was
+/// not have no difference between them to report: there is no number on one
+/// side of the subtraction, and treating the absent one as 0 would be to read
+/// a file this module has already refused to read. That is the defect this
+/// closes, and it is why the answer is an error rather than a sentinel. A
+/// sentinel would have to be a number, every caller would have to know to
+/// disregard it, and a caller that did not would report a run that measured
+/// its validation loss at some point in one curve and never in the other as
+/// agreeing to within a rounding error -- which is exactly the claim the
+/// `0.000000` file used to make, one layer down.
 ///
 /// Nothing allocates: both curves are read into fixed arrays, and `max_rows` is
 /// refused rather than grown, so a longer curve fails instead of being silently
@@ -322,22 +355,35 @@ pub fn divergence(committed: []const u8, fresh: []const u8) !Divergence {
     var max_loss: f64 = 0;
     for (a[0..n]) |c| {
         steps = @max(steps, c.step + 1);
-        // The two loss columns, not `lr`: the budget is in loss units.
-        max_loss = @max(max_loss, @abs(c.values[0]), @abs(c.values[1]));
+        // The two loss columns, not `lr`: the budget is in loss units. A cell
+        // that was never measured is not a magnitude, so it does not raise the
+        // scale of the curve; a curve with nothing measured in it is smaller
+        // than one that read a number.
+        max_loss = @max(
+            max_loss,
+            @abs(c.values[0].?),
+            if (c.values[1]) |v| @abs(v) else 0.0,
+        );
     }
 
     var worst: Divergence = .{
         .absolute = 0,
         .step = a[0].step,
         .column = .train_loss,
-        .committed = a[0].values[0],
-        .fresh = a[0].values[0],
+        .committed = a[0].values[0].?,
+        .fresh = a[0].values[0].?,
         .steps = steps,
         .max_loss = max_loss,
     };
     for (a[0..n], b[0..n]) |ca, cb| {
         for (ca.values, cb.values, 0..) |va, vb, i| {
-            const d = @abs(va - vb);
+            if ((va == null) != (vb == null)) return error.CurveShape;
+            // Both unmeasured is agreement, the same as two equal numbers:
+            // there is a magnitude on neither side to subtract. Unwrapping
+            // here panicked on every curve whose `val_loss` is empty, which
+            // is four of the five rows the shipped run writes.
+            if (va == null) continue;
+            const d = @abs(va.? - vb.?);
             if (d > worst.absolute) {
                 worst.absolute = d;
                 worst.step = ca.step;
@@ -346,8 +392,8 @@ pub fn divergence(committed: []const u8, fresh: []const u8) !Divergence {
                     1 => .val_loss,
                     else => .lr,
                 };
-                worst.committed = va;
-                worst.fresh = vb;
+                worst.committed = va.?;
+                worst.fresh = vb.?;
             }
         }
     }
@@ -382,9 +428,20 @@ fn cell(line: []const u8) !Cell {
     var c: Cell = undefined;
     c.step = std.fmt.parseInt(usize, fields.next() orelse return error.CurveShape, 10) catch
         return error.CurveShape;
-    for (&c.values) |*v| {
-        v.* = std.fmt.parseFloat(f64, fields.next() orelse return error.CurveShape) catch
-            return error.CurveShape;
+    for (&c.values, 0..) |*v, i| {
+        const text = fields.next() orelse return error.CurveShape;
+        // An empty field is "not measured", and it is `val_loss` alone that is
+        // allowed to be one: every row is logged with a train loss and a rate,
+        // so an empty field in either of those is a malformed row rather than
+        // a measurement that was not taken, and reading it as the latter would
+        // accept a curve whose losses were never written. A measured zero is
+        // `0.000000`, which is a number, and it comes back as one -- the empty
+        // field is a different thing and not another spelling of it.
+        if (i == 1 and text.len == 0) {
+            v.* = null;
+            continue;
+        }
+        v.* = std.fmt.parseFloat(f64, text) catch return error.CurveShape;
     }
     // A fourth field means the header and the rows disagree about the shape,
     // which is the one case where reading the first four and moving on would
@@ -416,10 +473,21 @@ pub fn writeCsv(path: []const u8, rows: []const Row) !void {
     const w = &out.interface;
     try w.print(csv_header ++ "\n", .{});
     for (rows) |row| {
-        try w.print("{d},{d:.6},{d:.6},{d:.8}\n", .{
+        // The empty field, and the reason `writeCsv` builds the column rather
+        // than printing the optional: a row logged before the first epoch end
+        // has no validation measurement, and `0.000000` would be a claim that
+        // it measured exactly zero. A measured zero still prints `0.000000`,
+        // so the two are different bytes. One format string for both, so the
+        // column count cannot depend on which of the two a row carries.
+        var val: [64]u8 = undefined;
+        const val_text = if (row.val_loss) |v|
+            try std.fmt.bufPrint(&val, "{d:.6}", .{v})
+        else
+            "";
+        try w.print("{d},{d:.6},{s},{d:.8}\n", .{
             row.step,
             row.train_loss,
-            row.val_loss,
+            val_text,
             row.lr,
         });
     }

@@ -876,7 +876,7 @@ fn ramped(allocator: std.mem.Allocator, rows: usize, cols: usize, phase: f32) !T
     return t;
 }
 
-test "autograd: attentionBackward refuses the four requests attention.forward refuses" {
+test "autograd: attentionBackward refuses five requests, four of them the forward refuses too" {
     // This function is the reference `src/cuda/attn_twin.zig` grades two CUDA
     // backward kernels against, so a request it cannot answer has to come back
     // as an error. A `dq` of silent zeros would read as a passing gate.
@@ -950,8 +950,24 @@ test "autograd: attentionBackward refuses the four requests attention.forward re
         .ffn_mult = 0,
     }));
 
+    // The fifth refusal, and the only one the forward has no counterpart for: a
+    // `dout` narrower than one head row. Every `dq` write reaches
+    // `dout.rowConst(t)[h * dim ..][0..dim]`, so this reads past `dout` inside
+    // `rowConst` instead of returning an error.
+    var narrow_dout = try ramped(allocator, t_count, wide - 1, 1.0);
+    defer narrow_dout.deinit();
+    try std.testing.expectError(error.DimensionMismatch, autograd.attentionBackward(allocator, q, k, v, narrow_dout, .{
+        .n_layers = 1,
+        .n_heads = 2,
+        .n_kv_heads = 2,
+        .head_dim = 4,
+        .n_ctx = t_count,
+        .vocab_size = 0,
+        .ffn_mult = 0,
+    }));
+
     // And the same call on the geometry they all agree with still runs, so none of
-    // the four refusals above is the function having stopped working.
+    // the refusals above is the function having stopped working.
     var ok = try autograd.attentionBackward(allocator, q, k, v, dout, .{
         .n_layers = 1,
         .n_heads = 2,

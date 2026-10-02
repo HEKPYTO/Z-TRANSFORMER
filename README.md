@@ -13,11 +13,14 @@ could scale up, and the differences are these. The feed-forward width is `ffn_mu
 `ffn_mult` an integer, so it is 4x where Llama-3 is 3.5x rounded to a multiple of 256 — the rule
 cannot express Llama-3's at all. There is no RoPE scaling, so long context is out. The embeddings
 are tied, where Llama-3 8B's are not. Everything is f32, not bf16. A KV cache exists
-(`src/kv_cache.zig`) and nothing decodes through it: there is no generation loop, and the forward
-kernel takes a `q_offset` and an `n_keys`, and both are exercised only at `q_offset` 0
-across the whole `T`, which is the training shape, so nothing yet calls them with a cache. A training batch is
+(`src/kv_cache.zig`) and a greedy generation loop decodes through it (`src/decode.zig`), on the CPU
+and on the GPU: `decode.cudaAttnStep` derives `q_offset = pos`, `n_keys = pos + 1` and `t = 1` from the
+cache itself, so the forward kernel's offset is exercised at every real decode position rather than only at
+`q_offset` 0 across the whole `T`, and `zig build cuda-attn-check` grades that path against the CPU
+`attnStep` over a cache filling one position at a time. A training batch is
 still correct — `rope.forward` derives row `r`'s angle from `pos + r`, so positions run `0..T-1` —
-but there is no way to start that at an offset, which is exactly what the cache needs. At the 8B shape this
+and that derivation is the one `decode.zig` reaches for at a nonzero `pos`, which is what a cache needs.
+At the 8B shape this
 does not run: the tied head is 5.6% of a step there,
 and the logits tensor alone is `T * vocab` f32, which is 4.2 GB at T=8192 and `vocab = 128256`, of
 which a backward pass holds two. `zig build scale-profile` prints what the formulas behind those
@@ -70,32 +73,51 @@ own CPU twin rather than against a hand-written expectation:
 cuda-attn-check` grades that path against `attention.forward` on a real step's tensors. It is a
 relative gate, `max|a-b| <= 1e-4 * max|b|`, because a real step's gradients are orders of magnitude
 smaller than the synthetic inputs the benchmark uses; the observed ratio is `3.79e-08`, so the gate
-sits about 2600x above the noise, and a deliberate `+0.05` on one uploaded key makes it fail.
+sits about 2600x above the noise. That gate has been watched fail, by the same pattern
+`run-attn.sh` uses for its four broken variants: `ATTN_CORRUPT_KEY=0.05 zig build cuda-attn-check`
+perturbs one uploaded key on the device side only and must exit 1, printing
+`differs by 2.366975e-4 against a reference of at most 7.8568566e-1, which is 3.0126233e-4 times
+the relative gate of 1e-4`. With the variable unset, or set to something unparseable, the upload is
+the plain one and the gate passes — a typo must not read as corruption.
 
 **It is not Llama-3-shaped.** `head_dim` must be even and in `[32, 256]`; nothing requires a power
-of two, and eleven benchmark shapes cover `head_dim` 32, 96 (Phi-3), 128 (Llama-3), 192 (DeepSeek
-MLA) and 256 (Gemma-2). At 256 the shared-memory request does not fit, so the kernel narrows its
-own tile and runs; before that it killed the process outright on a width its own predicate accepted.
+of two, and eleven benchmark shapes cover `head_dim` 32, 96, 128 (Llama-3), 192 and 256. 96, 192
+and 256 are also the head widths Phi-3, DeepSeek-V2/V3 and Gemma-2 ship, and what runs at them is
+this repository's plain attention -- grouped-query, or MHA where the group is 1 -- with none of the
+rest of those models: no sliding window, no LongRoPE, no GeGLU, no logit softcapping, no latent
+attention. At 256 the shared-memory request does not fit, so the kernel narrows its own tile and
+runs; before that it killed the process outright on a width its own predicate accepted.
 
 ### What is not claimed
 
-**The measured ratio, three runs of `sh src/cuda/run-attn.sh` on the generalised kernel, idle GPU, one host.** Minimum first, because that is this repository's rule for a shared host:
+**The measured ratio: three invocations of `sh src/cuda/run-attn.sh` on the CUDA host, GPU idle, measured `2026-10-03`.** Minimum first, because that is this repository's rule for a shared host.
 
-| shape | min of 3 | max of 3 |
-|---|---|---|
-| `ctx256` | 68.9x | 108.0x |
-| `ctx512` | 140.3x | 143.0x |
-| `ctx1024` | 162.4x | 163.4x |
-| `ctx2048` | 165.1x | 167.8x |
-| `ctx4096` | 166.9x | 169.4x |
-| `llama3-T256` | 68.1x | 108.1x |
-| `llama3-T512` | 71.1x | 133.5x |
-| `phi3-T256` | 55.4x | 104.6x |
-| `phi3-T512` | 59.5x | 108.9x |
-| `mla-T256` | 102.6x | 106.6x |
-| `gemma2-T256` | 98.1x | 100.2x |
+| shape | min of 3 | max of 3 | spread |
+|---|---|---|---|
+| `ctx256` | 57.9x | 105.6x | **1.82x** |
+| `ctx512` | 133.6x | 137.5x | 1.03x |
+| `ctx1024` | 162.0x | 164.4x | 1.01x |
+| `ctx2048` | 162.2x | 166.2x | 1.02x |
+| `ctx4096` | 168.1x | 168.8x | 1.00x |
+| `llama3-T256` | 106.2x | 107.2x | 1.01x |
+| `llama3-T512` | 127.3x | 131.0x | 1.03x |
+| `gqa-96-T256` | 100.8x | 103.6x | 1.03x |
+| `gqa-96-T512` | 109.8x | 110.2x | 1.00x |
+| `mha-192-T256` | 104.4x | 105.3x | 1.01x |
+| `gqa-256-T256` | 99.6x | 100.8x | 1.01x |
 
-**That is the whole claim: 55x to 169x per call, and no floor.** The five shapes that swing -- `ctx256`, `llama3-T256`, `llama3-T512`, `phi3-T256`, `phi3-T512` -- read 1.48x to 1.86x across the three runs on the CPU column while the kernel column held to 1.03x at every one of them. The six stable shapes hold their CPU column to 1.01x. It is not `T` (`ctx256` swings and `ctx512` does not), not `head_dim` (32 and 96 swing, 128, 192 and 256 do not) and not `n_heads` (`ctx256` has 4 and swings; `mla-T256` has 16 and does not). **The unstable set does not correlate with anything this repository measures**, so the mechanism is unidentified and no ratio at those five shapes is quoted to better than an order of magnitude.
+**That is the whole claim: 57x to 168x per call, and no floor.** Exactly one shape swings across the
+three runs: `ctx256`, at 1.82x. The other ten hold between 1.00x and 1.03x.
+
+That is not a rounding difference and it is not noise, and the committed sweep says why.
+`outputs/bench/ctx256-sweep.csv` is ten runs of the CPU twin at that one shape: three land at
+6070.021 to 6088.290 us and seven at 10583.812 to 10875.440 us, each cluster internally tight, with
+**nothing at all between them** and a **1.7384x** gap. **70% of single runs land in the higher mode**,
+so one sample here is a 1.74x coin toss. The minimum is the only safe statistic at this shape, and
+even the minimum of three catches the low mode only 65.7% of the time by that distribution. What
+flips it -- core placement, thread affinity, a competing process -- is not identified. **The
+bimodality is this shape's, not the benchmark's**, which is the one thing the ten-run sweep settles
+that three invocations could not.
 
 **The backward publishes no speedup ratio at all.** `attn_twin.zig` times the CPU backward and
 writes it to the manifest, but the benchmark prints only the kernel's own `bwd_us`, and the CPU
@@ -113,10 +135,12 @@ CUDA kernel against this repository's own CPU twin. The eighteen per-tensor gate
 about the second, and the Llama-3 block-parity claim rests entirely on the `oracle.txt` gates.
 
 No checkpoint is written: a run leaves a loss curve and no model. The table above is the whole
-interface a reader needs, and `build.zig` declares four steps beyond it, none of which a reader needs to run:
+interface a reader needs, and `build.zig` declares five steps beyond it, none of which a reader needs to run:
 `zig build dbg-train`, a Debug `train` binary for reproducing a checked-build failure;
 `zig build removed-digest`, the report gate that `sh tools/removed/check.sh` runs over the report it
-has just written; and the two CUDA steps `zig build cuda-attn-check` and `zig build cuda-train`,
+has just written; `zig build table-block-check`, which breaks the gate that holds the scale tables in
+`src/README.md` four ways on purpose and fails unless all four are caught, and prints what each one
+produced; and the two CUDA steps `zig build cuda-attn-check` and `zig build cuda-train`,
 which are the ones that link `attn_kernels.o`. Both of the CUDA pair **exit 1 while `cuda_attn` is
 false**, naming the line to edit, rather than skipping: a green that checked nothing is worse than
 a refusal. `removed-digest` is one command doing two checks, and which of them ran is printed on every
@@ -152,25 +176,39 @@ as one seed, one build configuration, one host, and `src/README.md` documents wh
 sits. Two runs at seed 7 in ReleaseFast on this host produce a byte-identical `outputs/loss.csv`.
 
 Both halves of that are commands rather than sentences. `zig build verify` checks the committed
-curve against its digest, so `f1dd5444 5064810c 28002dca caf23b4b c82bb1e6 ecfa28f5 ed91e7fa 4518f792`
+curve against its digest, so `7d7bcbd8 f7a2e67a d9b29c34 4d60a3d9 5e37bc14 e85ba379 f52adb4f 72cb6160`
 is what is in the tree. `zig build train` writes `outputs/loss.pending.csv` and renames it over
 `outputs/loss.csv` only when those bytes match, so a run on a host with a different libm reports the
 difference, leaves the committed curve alone, and **exits 1** -- the env var named in the next sentence is what turns that into an exit 0 without promoting anything. An earlier version of this line said it still exited 0, which is what the env var does and not what the default does, and it is the line a reader on a second machine follows. It is a different libm, not a broken
 build, and the run says so in those words.
 
+Worth being plain about what `verify` does *not* do, because it is the obvious thing to assume. It
+hashes the committed file; it does not compare that file against a curve freshly produced at the
+shipped shape. `zig build determinism` narrows that gap without closing it — it runs two short passes
+and requires them to agree with each other, so it catches a build whose output is no longer a
+function of its input. It cannot catch a change that is deterministic and merely different: editing
+`optim.AdamW.beta1` leaves every run agreeing perfectly on a curve that is no longer the committed
+one. The gate for that remains `zig build train`, and reproducibility stays a host-relative pair —
+baseline against change on the same machine — rather than a digest any host can be checked against.
+Its peak-memory check does run a full 123-step pass, but with the accepting env var set, so `verify`
+stays green on a host where `zig build train` refuses.
+
 Source lives in `src/`. Everything the repository generates lands in `outputs/`. Apache-2.0 licensed.
 
-One measured training result is committed, and it is the whole of that kind. Two different checks
+One measured training result is committed, and it is the whole of that kind. Three different checks
 cover it and they are not the same check, which an earlier version of this paragraph ran together.
 `zig build verify` fails if the committed `outputs/loss.csv` is not byte-for-byte the file these two
-numbers were read from, so the curve cannot be edited out from under the paragraph. It does **not**
-check that the code still produces that file: `verify` compares the file against a constant, so
-changing `optim.AdamW.beta1` leaves it green. The gate for *that* is `zig build train`, which re-runs
+numbers were read from, so the curve cannot be edited out from under the paragraph. Beside it,
+`zig build determinism` runs the training twice at 30 steps and requires byte-identical curves, which
+catches an output that is no longer a function of its input — an uninitialised read, an iteration
+order, a race. Neither of those **not** checks that the code still produces that file: both compare
+against something stable while the curve itself is never freshly derived at the shipped shape, so
+changing `optim.AdamW.beta1` leaves both green. The gate for *that* is `zig build train`, which re-runs
 the training and refuses to promote a curve that differs — and it is a manual, single-host command,
 because a different libm legitimately produces different bytes and making it a CI gate would leave
 the job permanently red for a reason unrelated to the code. The default
 `zig build train` ends at a
-train loss of 5.593455 and a validation loss of 5.154903; both are the last row of the committed
+train loss of 5.596625 and a validation loss of 5.155396; both are the last row of the committed
 `outputs/loss.csv`, and the validation number is measured on held-out tokens the training batcher
 never touches. That run is a 64 KiB single-epoch smoke run over 123 windows. It shows the loop runs
 to completion and the loss falls, and it is not a benchmark, not a throughput figure, and not a

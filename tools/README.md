@@ -297,3 +297,54 @@ be checked without editing the real one.
 It reads one shape — a first cell of exactly `` `module.Symbol` `` — because that is the only one the
 tables use. A row written differently is not seen, which is a hole in the check rather than in the
 README, and the failure mode is silence, so a reformat of the tables is the thing to re-run it after.
+
+## Quoted tables
+
+`sh tools/table-block.sh <tool-output> <readme> <block> <floor> <header>...` fails unless the tables a
+tool prints are byte-for-byte the tables a README quotes between `<!-- <block>:begin -->` and
+`<!-- <block>:end -->`. `zig build verify` runs it on the `scale-profile` block in `src/README.md`,
+with a floor of 20 and the three header lines `zig build scale-profile` prints. That call site is the
+only implementation, so protecting a second table is one more call in `build.zig` rather than a
+second copy of fifty lines of shell. It exits 0 silently, or 1 with both markers named and a
+`diff -u` of the two sides.
+
+| | |
+|---|---|
+| Why a script | `sh tools/table-block-check.sh` has to break this check on purpose and watch it fail, and a gate that lives as a string inside `build.zig` can only be broken by running a build. |
+| Floor | `cmp -s` exits 0 on two empty files, so an extraction below the floor is refused before the comparison. 20 against a real 29: adding a row does not require editing the call, and the failure names the block rather than reporting a bare line count. |
+| Markers | Tested for before the block is extracted. A deleted marker extracts as empty and would otherwise fail with a diff that says nothing about which of the two happened. |
+| Not checked | The prose around the block, and the length of the README side: an emptied block is still diffed against a non-empty tool extraction, so `cmp` fails on it without a floor of its own. Only the fenced lines between the markers are compared. |
+| Byte identity | The check asserts equality, so the tool must write no timestamp, no address and no float whose formatting can drift. `scale-profile` writes none; a tool that did would need a projection in the README rather than a transcript. |
+
+`sh tools/table-block-check.sh`, or `zig build table-block-check`, is the negative control: it breaks
+that check three ways — a digit edited by hand, a marker deleted, a tool that prints nothing — plus
+the case where the two sides match, which is what stops a harness that fails everything from reading
+as a control. It also asserts that the missing-marker failure NAMES the missing marker, because with
+a non-empty tool side a deleted marker and a drifted digit both exit 1 and the exit code alone cannot
+tell them apart. Every case prints its output and its exit code. It is outside `verify` because it
+prints: CI asserts that a passing `zig build verify` writes no bytes to either stream, and this
+step's entire output is the evidence that the three broken tables were caught.
+
+## Host state
+
+`sh tools/host-clean.sh`, or `zig build host-check`, refuses when this host is in a state that would
+contaminate a timing, and names which condition failed. Four: GPU utilisation, GPU memory, load
+average, and a resident training or benchmark process. Thresholds are `MAX_GPU_UTIL` 5%,
+`MAX_GPU_MEM_MIB` 1536, `MAX_LOAD` 8, and a reader who disagrees changes one number and says so in
+the commit.
+
+It exists because the generated-block check above has a limit worth stating plainly. **A table can
+only be a verified block if the tool that prints it is deterministic.** `scale-profile` is: it is
+Config arithmetic, it writes no timestamp, and two runs are byte-identical. `attn-bench`, `bench` and
+`run-attn.sh` are not, because each prints a time, and a time is a property of the machine and the
+hour. Comparing those blocks byte-for-byte would either be permanently red or, worse, pass by
+rounding. So the rule "no benchmark number is ever typed by hand" holds where it can hold — the
+arithmetic projections — and for the timings what holds instead is a committed transcript plus a
+host that refuses to produce a contaminated one.
+
+| | |
+|---|---|
+| Unreadable GPU | `nvidia-smi` returning nothing is a **refusal**, not a clean bill of health. `[ "" -gt 5 ]` is a comparison error, an error inside an `if` condition is false, and all four checks would pass on a card the script never read. |
+| VRAM ceiling | Above this host's resting desktop baseline rather than at zero. A GUI session moves between roughly 250 and 1050 MiB depending on what is drawn, so a ceiling below that reports a clean host as busy whenever a window repaints. |
+| Sibling match | The pattern names the training and benchmark binaries, not `zig build`, because this runs from inside a build step and would otherwise match its own parent. |
+| Necessary, not sufficient | The `ctx256` bimodality in `outputs/bench/ctx256-sweep.csv` was measured on a host this script calls clean, and is still a 1.7384x gap with nothing between two tight clusters. A green `host-check` says the machine was idle, not that the number is reproducible; the sweep says which statistic to trust. |

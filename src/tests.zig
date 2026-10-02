@@ -23,6 +23,7 @@ comptime {
     _ = @import("data_test.zig");
     _ = @import("optim_test.zig");
     _ = @import("model_test.zig");
+    _ = @import("decode_test.zig");
     _ = @import("autograd_test.zig");
     _ = @import("gradcheck_test.zig");
     _ = @import("scale_test.zig");

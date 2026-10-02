@@ -29,22 +29,45 @@ test "adamw step 1 update is lr times g over g plus eps" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.099999999), -p.at(0, 0), 1e-7);
 }
 
-test "adamw step 1 is unchanged by a zero weight decay" {
-    // Same gradient and rate as the previous test, weight_decay now set to 0.0
-    // explicitly instead of left out of the call. The decoupled term is
-    // lr * 0 * p = 0, so the parameter has to land on the same
-    // 0.1 / 1.00000001 = 0.099999999 the pure gradient step produced.
-    var p = try Tensor.init(std.testing.allocator, 1, 1);
-    defer p.deinit();
+test "adamw a non-zero weight decay adds to the gradient rather than replacing it" {
+    // THE CONTRAST the previous version of this test claimed to be and was not:
+    // it passed `0.0` for `weight_decay` exactly as the test above it did, with
+    // the same `p`, `g` and `lr`, so the two were the same test written twice and
+    // neither could fail on anything the other missed. A zero decay over a
+    // parameter that starts at zero is `lr * 0 * 0 = 0` -- nothing, by
+    // construction, whatever the implementation does with the term.
+    //
+    // So `p` starts at 1, which is the only reason there is anything to decay,
+    // and the same step runs at both values:
+    //   wd = 0.0:  p = 1 - 0.1 * 1 / 1.00000001        = 0.90000000
+    //   wd = 0.1:  p = 1 - 0.1 * 1 / 1.00000001 - 0.1 * 0.1 * 1
+    //                                        = 0.89000000
+    // The two differ by the decay term and nothing else, so an implementation
+    // that dropped `weight_decay` whenever a gradient was present would land on
+    // the first figure here and fail. The zero-gradient decay test below covers
+    // the other side of the pair, where the gradient term is 0 and only the
+    // decay is left; between them the two terms are never both live anywhere
+    // else in this file.
+    var p0 = try Tensor.init(std.testing.allocator, 1, 1);
+    defer p0.deinit();
+    var p1 = try Tensor.init(std.testing.allocator, 1, 1);
+    defer p1.deinit();
     var g = try Tensor.init(std.testing.allocator, 1, 1);
     defer g.deinit();
+    p0.set(0, 0, 1);
+    p1.set(0, 0, 1);
     g.set(0, 0, 1);
 
-    var opt = try optim.AdamW.init(std.testing.allocator, p);
-    defer opt.deinit();
-    try opt.step(&p, g, 0.1, 0.0);
+    var no_decay = try optim.AdamW.init(std.testing.allocator, p0);
+    defer no_decay.deinit();
+    var with_decay = try optim.AdamW.init(std.testing.allocator, p1);
+    defer with_decay.deinit();
 
-    try std.testing.expectApproxEqAbs(@as(f32, 0.099999999), -p.at(0, 0), 1e-7);
+    try no_decay.step(&p0, g, 0.1, 0.0);
+    try with_decay.step(&p1, g, 0.1, 0.1);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), p0.at(0, 0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.89), p1.at(0, 0), 1e-6);
 }
 
 test "adamw eps damps a gradient small enough to reach it" {

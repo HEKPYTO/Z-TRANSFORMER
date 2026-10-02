@@ -20,15 +20,22 @@
 //!
 //! The last four are the WIDTHS, and they exist because the kernel used to refuse
 //! them. `zt_attn_dim_ok` demanded a power of two, so head_dims of 96, 192 and 80
-//! were turned away for a property no loop reads -- and those are Phi-3's head,
-//! DeepSeek-V2 and V3's MLA head, and a family of 80-wide ones. A width guard that
-//! rejects three shipping models is a defect that only shows up when someone tries
-//! to run one, so the widths are in the manifest and graded like any other row.
-//! `phi3-T512` is there because one context length cannot show that a new width
-//! behaves: `ctx256` and `ctx512` at head_dim 32 differ, and so do `llama3-T256`
-//! and `llama3-T512`.
+//! were turned away for a property no loop reads, and those are widths shipping
+//! models use -- Phi-3's, DeepSeek-V2's and V3's, and a family of 80-wide ones. A
+//! width guard that turns away three shipping widths is a defect that only shows
+//! up when someone tries to run at one, so the widths are in the manifest and
+//! graded like any other row.
 //!
-//! `gemma2-T256` is also the shared-memory case. At head_dim 256 the tile the
+//! What those models put on top of a head width is NOT here, and the tags say that
+//! instead of borrowing a model's name: `gqa-96-T256`/`gqa-96-T512` is plain
+//! grouped-query attention at 96 with none of Phi-3's sliding window or LongRoPE,
+//! `mha-192-T256` is plain MHA at 192 with no latent attention of any kind, and
+//! `gqa-256-T256` is GQA at 256 with none of Gemma-2's GeGLU, logit softcapping or
+//! alternating local and global attention. `gqa-96-T512` is there because one
+//! context length cannot show that a new width behaves: `ctx256` and `ctx512` at
+//! head_dim 32 differ, and so do `llama3-T256` and `llama3-T512`.
+//!
+//! `gqa-256-T256` is also the shared-memory case. At head_dim 256 the tile the
 //! benchmark asks for wants more per-block memory than an sm_86 will opt into, so
 //! the launcher narrows the tile rather than ending the process, and this row is
 //! what decides whether a run at a narrower tile is allowed to count.
@@ -79,17 +86,29 @@ const shapes = [_]struct {
     .{ .tag = "ctx4096", .T = 4096, .n_heads = 4, .n_kv_heads = 2, .head_dim = 32, .iters = 20 },
     .{ .tag = "llama3-T256", .T = 256, .n_heads = 32, .n_kv_heads = 8, .head_dim = 128, .iters = 50 },
     .{ .tag = "llama3-T512", .T = 512, .n_heads = 32, .n_kv_heads = 8, .head_dim = 128, .iters = 10 },
-    // Phi-3: 32 heads over 8 kv heads at head_dim 96. Two context lengths, because
-    // one cannot show that a width behaves rather than happening to.
-    .{ .tag = "phi3-T256", .T = 256, .n_heads = 32, .n_kv_heads = 8, .head_dim = 96, .iters = 50 },
-    .{ .tag = "phi3-T512", .T = 512, .n_heads = 32, .n_kv_heads = 8, .head_dim = 96, .iters = 10 },
-    // DeepSeek's MLA head width, with no GQA on it: 16 heads over 16 kv heads, so
-    // the group is 1 and the two collapses GQA and the correct kernel part company
-    // for a different reason than at every other row.
-    .{ .tag = "mla-T256", .T = 256, .n_heads = 16, .n_kv_heads = 16, .head_dim = 192, .iters = 50 },
-    // Gemma-2's head width, and the widest this kernel accepts. The tile that the
-    // rest of the table asks for does not fit a block here.
-    .{ .tag = "gemma2-T256", .T = 256, .n_heads = 8, .n_kv_heads = 4, .head_dim = 256, .iters = 50 },
+    // head_dim 96 at 32 heads over 8 kv heads: group 4, at two context lengths,
+    // because one cannot show that a width behaves rather than happening to.
+    // 96 is Phi-3's head width and that is all that is borrowed -- this is plain
+    // GQA at 96, and Phi-3's sliding window and LongRoPE are not implemented
+    // anywhere in this repository, so the tag names the geometry instead.
+    .{ .tag = "gqa-96-T256", .T = 256, .n_heads = 32, .n_kv_heads = 8, .head_dim = 96, .iters = 50 },
+    .{ .tag = "gqa-96-T512", .T = 512, .n_heads = 32, .n_kv_heads = 8, .head_dim = 96, .iters = 10 },
+    // head_dim 192 at 16 heads over 16 kv heads, so the group is 1 and this is
+    // plain MHA -- there is no grouped-query attention on this row to collapse.
+    // That is also why it is the one row where ATTN_BROKEN=2, which pins every
+    // query to kv head 0, is not the defect it is everywhere else: at a group of 1
+    // the correct kernel already reads kvh = h, so 15 of the 16 heads are sent to
+    // the wrong kv head rather than to a shared one. It is still caught, and this
+    // row is why "caught at every shape" and "caught for the reason the variant
+    // injects" are two different claims. 192 is DeepSeek-V2's and V3's MLA head
+    // WIDTH; the latent attention that architecture is built on is not here and
+    // nothing in this repository implements it.
+    .{ .tag = "mha-192-T256", .T = 256, .n_heads = 16, .n_kv_heads = 16, .head_dim = 192, .iters = 50 },
+    // head_dim 256 at 8 heads over 4 kv heads: group 2, and the widest this kernel
+    // accepts. The tile that the rest of the table asks for does not fit a block
+    // here. 256 is Gemma-2's head width; this row is GQA at 256 and none of
+    // Gemma-2's GeGLU, logit softcapping or alternating local and global attention.
+    .{ .tag = "gqa-256-T256", .T = 256, .n_heads = 8, .n_kv_heads = 4, .head_dim = 256, .iters = 50 },
 };
 
 /// How long to keep calling `forward` before believing the clock, and the cap.

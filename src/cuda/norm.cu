@@ -343,6 +343,22 @@ static int readManifest(const char *dir, Shape *out, int max) {
         out[n] = s;
         n++;
     }
+    // A shape past `max` was dropped by the loop condition and the caller then
+    // measured `n` shapes and printed OK. One more line than the table holds is
+    // exactly the case where the caller has to hear about it: the summary reports a
+    // peak over the shapes it saw, and the one it did not see may be the largest.
+    // `norm_twin.zig` writes 18 lines against a `MAX_SHAPES` of 64, so this is
+    // unreachable today -- which is why it is a refusal rather than a resizable
+    // table. Nothing would be gained by growing the table and a caller that outgrows
+    // it has learned something real about the binary it is measuring.
+    if (n == max && fgets(line, (int)sizeof line, f) != NULL) {
+        fprintf(stderr,
+                "norm: FAIL %s holds more than the %d shapes this binary was built for, so "
+                "the one it dropped is not measured\n",
+                path, max);
+        fclose(f);
+        return -1;
+    }
     fclose(f);
     if (n == 0) {
         fprintf(stderr, "norm: FAIL %s is empty\n", path);

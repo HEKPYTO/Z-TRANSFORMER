@@ -57,14 +57,27 @@ test "verdict picks the side the ratio implies" {
 }
 
 test "the head geometry the tool reports is the shipped one" {
-    // attn-bench prints columns computed from this, so if it ever stopped being
-    // the model's geometry the table would be measuring a shape nothing runs.
+    // LITERALS, and that is the whole point of the rewrite. `attention.defaultConfig`
+    // is DEFINED as three fields copied out of `model.defaultConfig`
+    // (`src/attention.zig:24-27`), so the earlier version of this test compared
+    // a struct against the three fields it was built from and could not fail --
+    // a value against itself, the identical mistake this file's own header
+    // records for `rope_theta` in `src/rope_test.zig:4-22`. Nothing in the tree
+    // pinned 4 / 2 / 32 anywhere: `model_test.zig` pins `n_layers`, `n_ctx` and
+    // `n_heads % n_kv_heads == 0`, and `dModel` only pins the product. A silent
+    // edit to the shipped split left the whole sweep measuring a shape nothing
+    // runs, and this is the assertion that now says so.
     const cfg = attention.defaultConfig();
-    const m = @import("model.zig").defaultConfig();
-    try std.testing.expectEqual(m.n_heads, cfg.n_heads);
-    try std.testing.expectEqual(m.n_kv_heads, cfg.n_kv_heads);
-    try std.testing.expectEqual(m.head_dim, cfg.head_dim);
+    try std.testing.expectEqual(@as(usize, 4), cfg.n_heads);
+    try std.testing.expectEqual(@as(usize, 2), cfg.n_kv_heads);
+    try std.testing.expectEqual(@as(usize, 32), cfg.head_dim);
     // GQA, not MHA: the floor is smaller than a full head count would give, and
     // that is the whole reason kv heads exist.
     try std.testing.expect(cfg.n_heads > cfg.n_kv_heads);
+    // And the shape the bench builds its tensors from is the shape these three
+    // fields make, which is what "the tool reports the shipped geometry" means:
+    // `print` allocates `cfg.n_heads * cfg.head_dim` columns for q, so a split
+    // that disagreed with its own arithmetic would be caught here too.
+    try std.testing.expectEqual(@as(usize, 128), cfg.n_heads * cfg.head_dim);
+    try std.testing.expectEqual(@as(usize, 64), cfg.n_kv_heads * cfg.head_dim);
 }

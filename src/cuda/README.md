@@ -327,10 +327,10 @@ head this repository has been asked to grade. Relaxing either end wants a measur
 and an unmeasured widening of a guard is how a correctness range becomes a performance
 claim nobody made.
 
-**A power of two was required until this section, and requiring one refused three
-shipping models.** The old guard tested `(dim & (dim - 1)) != 0` and so turned away
-**96** (Phi-3), **192** (DeepSeek-V2 and V3's MLA) and **80** -- a head width several
-families ship -- while the loops that would have run at those widths need nothing of the
+**A power of two was required until this section, and requiring one turned away three
+shipping head widths.** The old guard tested `(dim & (dim - 1)) != 0` and so turned away
+**96** (Phi-3's head width), **192** (DeepSeek-V2's and V3's MLA head width) and **80**, a width
+several families ship, while the loops that would have run at those widths need nothing of the
 kind: `i += dim` and `c = threadIdx.x % dim` are exact for any `dim`. The guard was left
 over from when the tile was pinned to `dim` and the block had to divide a warp, and the
 file's own comment said so while the code did the opposite. The predicate over the
@@ -386,16 +386,16 @@ is a row rather than a claim. From the run above:
 library entry points, one launch per manifest shape at T=8:
   ctx256       head_dim 32   tile 32/32   8704/8960   bytes  forward 0  backward 0
   llama3-T256  head_dim 128  tile 64/64  66816/67584  bytes  forward 0  backward 0
-  phi3-T256    head_dim 96   tile 64/64  50304/50944  bytes  forward 0  backward 0
-  phi3-T512    head_dim 96   tile 64/64  50304/50944  bytes  forward 0  backward 0
-  mla-T256     head_dim 192  tile 64/64  99840/100864 bytes  forward 0  backward 0
-  gemma2-T256  head_dim 256  tile 48/48  99904/101120 bytes  forward 0  backward 0
+  gqa-96-T256  head_dim 96   tile 64/64  50304/50944  bytes  forward 0  backward 0
+  gqa-96-T512  head_dim 96   tile 64/64  50304/50944  bytes  forward 0  backward 0
+  mha-192-T256 head_dim 192  tile 64/64  99840/100864 bytes  forward 0  backward 0
+  gqa-256-T256 head_dim 256  tile 48/48  99904/101120 bytes  forward 0  backward 0
 ```
 
-Two rows are worth reading twice. `mla-T256` asks **99840** of the 101376 available, so it
-runs at the cap on 1536 bytes of margin and is the shape most likely to need the scan on a
-card with a smaller ceiling. `gemma2-T256` is the only row where the scan moved anything,
-and it moved it from 64 to 48.
+Two rows are worth reading twice. `mha-192-T256` asks **99840** of the 101376 available,
+so it runs at the cap on 1536 bytes of margin and is the shape most likely to need the
+scan on a card with a smaller ceiling. `gqa-256-T256` is the only row where the scan moved
+anything, and it moved it from 64 to 48.
 
 At `head_dim` 256 the scan lands on **tile 48** -- 99904 bytes forward, 101120 for the
 backward's kernel A -- inside the 101376 an sm_86 grants, with 1472 bytes to spare. The
@@ -464,14 +464,14 @@ carrying its `[dq/dk/dv ...]` signature and the `...and all four signatures diff
 backward table is printed in full further down, minus those three columns.
 
 ```
+Withdrawn -- this block held a transcript whose timing columns no longer
+describe any run in this repository. It is kept as the shape of the output,
+with every number removed, because inventing a replacement transcript from a
+run whose log was not kept would be exactly the defect this directory exists
+to stop.
+
 shape          ctx     cpu_us   kernel_us   max_abs     gate   used    ratio  parity  argmax
-ctx256          256   10884.32     103.442  5.960e-08     1e-04  0.060%    105.2x  ok   argmax 517
-ctx512          512   46742.28     328.468  5.960e-08     1e-04  0.060%    142.3x  ok   argmax 517
-ctx1024        1024  189429.92    1177.853  5.960e-08     1e-04  0.060%    160.8x  ok   argmax 517
-ctx2048        2048  761452.22    4653.296  5.960e-08     1e-04  0.060%    163.6x  ok   argmax 517
-ctx4096        4096 3080129.43   18625.433  5.960e-08     1e-04  0.060%    165.4x  ok   argmax 517
-llama3-T256     256  337659.88    3167.307  7.451e-08     1e-04  0.075%    106.6x  ok   argmax 76157
-llama3-T512     512 1551863.40   11817.677  7.451e-08     1e-04  0.075%    131.3x  ok   argmax 76157
+        ... 11 rows, the timing and ratio columns deliberately absent ...
 attn: OK
 attn: proving the parity gate can fail
 attn: broken variant 1 was caught, as it must be
@@ -479,6 +479,21 @@ attn: broken variant 2 was caught, as it must be
 attn: broken variant 3 was caught, as it must be
 attn: broken variant 4 was caught, as it must be
 ```
+
+**The numbers live in the root `README.md`**, which carries the minimum of three
+invocations measured `2026-10-03`: **57.9x to 168.8x** per call across the eleven
+shapes, with `ctx256` the only shape that swings (1.82x) and the other ten holding
+between 1.00x and 1.03x. This block's previous contents quoted `105.2x` at
+`ctx256` and a `10884.32 us` CPU call, both from an earlier session on this host.
+Those are not wrong as history; they are withdrawn as current, because a reader
+comparing them against the root table would be comparing two sessions and
+calling the difference a regression.
+
+That gap is itself the honest state of this directory: **no committed transcript
+of the current benchmark run exists yet.** The ten-run `ctx256` sweep at
+`outputs/bench/ctx256-sweep.csv` is committed and is what `host-clean.sh` and the
+minimum-of-three rule exist to serve; the full eleven-row transcript is the part
+still outstanding.
 
 Two shapes' worth of geometry are in that table on purpose. The first five are this model's own
 configuration; the last two are Llama-3's, 32 heads over 8 kv heads at `head_dim` 128, because a
@@ -488,48 +503,69 @@ kernel only ever run at `head_dim` 32 has not been shown to run at the width the
 
 The table above stops at seven rows because its timing columns are published and **the
 `cpu_us` and `kernel_us` figures from the run that added these widths are deliberately
-not recorded** -- the forward's CPU column at the shipped window is bimodal on this host
-and one `sh src/cuda/run-attn.sh` I ran read `ctx256` at 10817.89, 10726.48 and 5931.76
-us across three invocations, so a timing taken alongside a parity change would be read as
-a speedup claim that run cannot support. (The same three invocations read the *kernel*
-at 99.977, 102.592 and 105.126 us, which is the shape of the disagreement the published
-ratio rests on.) What that run *is* evidence for is parity, and parity is reproduced here
-in full.
+not recorded** -- the forward's CPU column at the shipped window is bimodal on this
+host, and a timing taken alongside a parity change would be read as a speedup claim
+that run cannot support. What that run *is* evidence for is parity, and parity is
+reproduced here in full.
+
+**The bimodality is measured, not asserted.** Ten runs of the CPU twin on this host,
+each writing its own manifest, put `ctx256` in one of two clusters with nothing
+between them. The ten samples are committed at `outputs/bench/ctx256-sweep.csv`:
+
+| mode | samples | range (`cpu_us`) | internal spread |
+|---|---|---|---|
+| low | 3 of 10 | 6070.021 – 6088.290 | **0.30%** |
+| high | 7 of 10 | 10583.812 – 10875.440 | **2.76%** |
+
+The gap between them is **1.7384x**, and not one of the ten samples lands inside it.
+Each mode is internally tight and the two are far apart, which is the whole point:
+noise does not leave a gap. **70% of single runs land in the high mode**, so one
+untimed sample at this shape is a 1.74x coin toss in either direction.
+
+That is what makes the minimum the only safe statistic here rather than a
+convention, and it also bounds what the minimum can promise. Taking the minimum of
+three catches the low mode only when at least one of the three lands there, which
+this distribution puts at 1 - 0.7^3 = **65.7%**: a third of min-of-3 tables at this
+shape would still report the high mode. What flips it -- core placement, thread
+affinity, a competing process -- is not identified, and nothing here claims it is.
+The kernel column over the same runs is the steadier one, which is the opposite
+assignment from what the ratio would suggest.
 
 Measured `2026-10-02` on that same card, same pinned container, same host, one
 `sh src/cuda/run-attn.sh` at the default tile cap of 64:
 
 | shape | `head_dim` | heads/kv | ctx | tile | `max_abs` | gate | used | parity |
 |---|---|---|---|---|---|---|---|---|
-| `phi3-T256` | 96 | 32/8 | 256 | 64 | `5.960e-08` | `1e-4` | **0.060%** | ok |
-| `phi3-T512` | 96 | 32/8 | 512 | 64 | `5.960e-08` | `1e-4` | **0.060%** | ok |
-| `mla-T256` | 192 | 16/16 | 256 | 64 | `1.043e-07` | `1e-4` | **0.104%** | ok |
-| `gemma2-T256` | 256 | 8/4 | 256 | **48** | `7.451e-08` | `1e-4` | **0.075%** | ok |
+| `gqa-96-T256` | 96 | 32/8 | 256 | 64 | `5.960e-08` | `1e-4` | **0.060%** | ok |
+| `gqa-96-T512` | 96 | 32/8 | 512 | 64 | `5.960e-08` | `1e-4` | **0.060%** | ok |
+| `mha-192-T256` | 192 | 16/16 | 256 | 64 | `1.043e-07` | `1e-4` | **0.104%** | ok |
+| `gqa-256-T256` | 256 | 8/4 | 256 | **48** | `7.451e-08` | `1e-4` | **0.075%** | ok |
 
 And the backward, same run, same three separate gates:
 
 | shape | `head_dim` | `max_abs_dq` | `max_abs_dk` | `max_abs_dv` | worst, % of `1e-5` |
 |---|---|---|---|---|---|
-| `phi3-T256` | 96 | `1.118e-08` | `4.098e-08` | `4.768e-07` | **4.77%** |
-| `phi3-T512` | 96 | `1.118e-08` | `4.843e-08` | `5.960e-07` | **5.96%** |
-| `mla-T256` | 192 | `2.235e-08` | `3.725e-08` | `2.384e-07` | **2.38%** |
-| `gemma2-T256` | 256 | `2.095e-08` | `3.725e-08` | `4.768e-07` | **4.77%** |
+| `gqa-96-T256` | 96 | `1.118e-08` | `4.098e-08` | `4.768e-07` | **4.77%** |
+| `gqa-96-T512` | 96 | `1.118e-08` | `4.843e-08` | `5.960e-07` | **5.96%** |
+| `mha-192-T256` | 192 | `2.235e-08` | `3.725e-08` | `2.384e-07` | **2.38%** |
+| `gqa-256-T256` | 256 | `2.095e-08` | `3.725e-08` | `4.768e-07` | **4.77%** |
 
 **The comparison that matters is with the seven rows above, and it is close.** The new
 forward rows read 0.060% to 0.104% of the gate against 0.060% and 0.075% on the two old
-widths: `phi3` at 96 is *exactly* as tight as `head_dim` 32, `gemma2` at 256 exactly as
-tight as Llama-3's 128, and `mla` at 192 is the one new row looser than anything
+widths: `gqa-96` at 96 is *exactly* as tight as `head_dim` 32, `gqa-256` at 256 exactly as
+tight as Llama-3's 128, and `mha-192` at 192 is the one new row looser than anything
 published, 1.4x the old worst and still **9.6x** inside the gate. The new backward rows
 read 2.38% to 5.96% against a published spread of 2.38% to 8.34%, so all four are
 **tighter than the worst row already in the table**. No gate was moved to make any of this
 pass; `ATTN_TOL` and `ATTN_BWD_TOL` are the same two numbers as before the change.
 
 Two details in that table are the change showing through rather than the arithmetic.
-`mla-T256` runs 16 heads over 16 kv heads, so its GQA group is **1** and it is the one row
-where the "collapse GQA to kv head 0" variant fails for a different reason than at every
-other shape. And `gemma2-T256` is the only row that does not run at the cap: **tile 48**,
-99904 bytes, inside the 101376 an sm_86 grants. It is in the table because a width that
-runs is worth more than a width that refuses.
+`mha-192-T256` runs 16 heads over 16 kv heads, so its group is **1** and there is no
+grouped-query attention on it to collapse: it is the one row where the "collapse GQA to kv
+head 0" variant is a different defect than at every other shape, because the correct
+kernel already reads one kv head per query head there. And `gqa-256-T256` is the only row
+that does not run at the cap: **tile 48**, 99904 bytes, inside the 101376 an sm_86 grants.
+It is in the table because a width that runs is worth more than a width that refuses.
 
 **The seven published rows did not move.** Same run, and every figure is the digit the
 table above already published: `5.960e-08` at `argmax` 517 for the five `head_dim` 32 rows,

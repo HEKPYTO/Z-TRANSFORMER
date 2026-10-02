@@ -194,13 +194,26 @@ pub const Cache = struct {
         self.len += 1;
     }
 
+    /// Whether another position would not fit.
+    ///
+    /// An empty `layers` is FULL rather than an error or a read: `deinit` empties
+    /// the slice, and both this and `bytes` below used to index `layers[0]`
+    /// straight after it, which Safe panics on and ReleaseFast reads past the end
+    /// of. An empty cache has nowhere to put a position, so `true` is the answer
+    /// that keeps a caller from asking one, and neither is `pub` API that any
+    /// in-tree caller reaches after `deinit` -- which is exactly why it was
+    /// undefended.
     pub fn full(self: *const Cache) bool {
+        if (self.layers.len == 0) return true;
         return self.len >= self.layers[0].k.rows;
     }
 
     /// Bytes held, for the same reason `zig build`'s peak-RSS gate exists: a number
     /// that should match a documented figure, checked rather than assumed.
+    ///
+    /// Zero on a deinit'd cache, for the reason `full` gives.
     pub fn bytes(self: *const Cache) usize {
+        if (self.layers.len == 0) return 0;
         const l = &self.layers[0];
         return self.layers.len * (l.k.data.len + l.v.data.len) * @sizeOf(f32);
     }
@@ -213,22 +226,23 @@ pub const Cache = struct {
 const testing = std.testing;
 
 test "the shipped shape holds 524288 bytes, which is what scale.zig costs" {
-    // `scale.zig:199` is `kv_cache = l * kv * t * 2 * 4` with `kv =
-    // n_kv_heads * head_dim`. This is a TRANSCRIPTION of that formula, not a call
-    // into `scale.zig`, so the two are not independent derivations and this test
-    // does NOT catch an edit to `scale.zig` alone. What it does catch is this file's
-    // arithmetic drifting from the cost model -- which is the failure that matters,
-    // because the model is what a reader budgets against.
+    // A `Cache`, built at the shipped shape, asked what it holds. The earlier
+    // version of this test built none and called no `bytes()`: it transcribed
+    // `scale.zig:199` (`kv_cache = l * kv * T * 2 * 4`, `kv = n_kv_heads *
+    // head_dim`) into three local constants and asserted that the arithmetic
+    // worked. No edit to this file could fail it, which the comment at the time
+    // admitted while the test's NAME and the file header's claim ("A test below
+    // pins this file's own arithmetic to that number, so the two cannot drift")
+    // said otherwise. What it can now reach is `Cache.bytes` on the real
+    // allocation, at the shape `scale.zig` costs.
     //
-    // An earlier version of this test claimed two independent derivations agreed.
-    // It did not, and the comment said so until an audit caught the overstatement.
-    const n_layers = 4;
-    const n_kv_heads = 2;
-    const head_dim = 32;
-    const n_ctx = 256;
-    const width = n_kv_heads * head_dim;
-    const scale_kv_cache = n_layers * width * n_ctx * 2 * @sizeOf(f32);
-    try testing.expectEqual(@as(usize, 524288), scale_kv_cache);
+    // Still not a call into `scale.zig`, so an edit to `scale.zig` alone still
+    // passes this. The 524288 below is transcribed from it and is what a reader
+    // budgets against; what this file can drift from is its own arithmetic, and
+    // that is now the thing under test.
+    var c = try Cache.init(testing.allocator, 4, 256, 2 * 32);
+    defer c.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 524288), c.bytes());
 }
 
 test "a cache refuses to grow past n_ctx" {
@@ -319,4 +333,24 @@ test "bytes matches n_layers * n_ctx * width * 2 * sizeof(f32)" {
     var c = try Cache.init(testing.allocator, 3, 16, 5);
     defer c.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 3 * 16 * 5 * 2 * @sizeOf(f32)), c.bytes());
+}
+
+test "a deinit'd cache answers full and bytes instead of indexing an empty slice" {
+    // `deinit` sets `layers = &.{}`, and `full` and `bytes` both read `layers[0]`.
+    // Called after it they indexed a zero-length slice: Safe panics on the bounds
+    // check and ReleaseFast reads past the end, which is the release the test
+    // binary also runs in. Neither has an in-tree caller that does this, which is
+    // why the gap was open; both are `pub`, so a caller outside the tree can.
+    // `testing.allocator` is what makes a leak in the half-built fixture fail too.
+    var c = try Cache.init(testing.allocator, 2, 4, 8);
+    c.deinit(testing.allocator);
+
+    // Full, because a cache with no layers has nowhere to put a position. Zero
+    // bytes, because it holds nothing.
+    try testing.expect(c.full());
+    try testing.expectEqual(@as(usize, 0), c.bytes());
+    // And they are still answerable twice over, so nothing here caches a stale
+    // answer or frees a second time.
+    try testing.expect(c.full());
+    try testing.expectEqual(@as(usize, 0), c.bytes());
 }

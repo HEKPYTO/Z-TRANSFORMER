@@ -341,8 +341,11 @@ __global__ void fusedAttnForward(const float *__restrict__ q, // [T, n_heads*dim
     }
 
     // `last` is at least 1 for every query a live thread owns, and the tile
-    // carrying its own key contributes exp(0) = 1, so the denominator is >= 1 and
-    // this cannot divide by zero.
+    // carrying its own key -- index `q_offset + t`, not `t`, which is exactly what
+    // the `q_offset` parameter changed -- contributes exp(0) = 1, so the
+    // denominator is >= 1 and this cannot divide by zero. That holds BECAUSE the
+    // launcher refuses `n_keys <= q_offset + T - 1`; without that refusal `last`
+    // could be 0 and this would be 0 divided by 0.
     if (live) {
         out[(size_t)t * (size_t)n_heads * dim + (size_t)h * dim + c] = acc / lrun;
     }
@@ -823,24 +826,17 @@ int zt_attn_forward(const float *q, const float *k, const float *v, float *out, 
         return 1;
     }
     // A decode call passes q_offset = pos and n_keys = however much cache exists. A
-    // refusal here rather than a clamp, because the two ways this can be wrong are
-    // both silent: n_keys below q_offset + T would mask every key away, and
-    // q_offset below 0 would let a query see keys before it was generated.
-    if (q_offset < 0 || n_keys < 1) {
+    // refusal here rather than a clamp, because every way this can be wrong is
+    // silent. `q_offset` below 0 would let a query see keys before it was generated.
+    // `n_keys` at or below `q_offset + T - 1` -- not enough keys to cover the LAST
+    // query -- masks every score to -inf, so `mrun` stays -inf, `lrun` stays 0, and
+    // the `acc / lrun` below stores NaN while this entry point returns 0. That is the
+    // failure this comment already named and the check did not perform, so it performs
+    // it now. The bound is `q_offset + T > n_keys`, not `>=`: with exactly
+    // `q_offset + T` keys the last query's own key sits at `q_offset + T - 1` and IS
+    // visible, and refusing that would refuse the ordinary training shape.
+    if (q_offset < 0 || n_keys < 1 || q_offset + T > n_keys) {
         fprintf(stderr, "zt_attn: q_offset %d, n_keys %d is not launchable.\n", q_offset, n_keys);
-        return 1;
-    }
-    if (!zt_attn_dim_ok(dim)) {
-        fprintf(stderr, "zt_attn: head_dim %d is refused. It must be even and in [%d, %d].\n", dim,
-                MIN_DIM, MAX_DIM);
-        fprintf(stderr,
-                "       Even, because the staged K and V rows are padded to a stride of dim + 1\n");
-        fprintf(stderr,
-                "       and that stride spreads a warp over 32 banks only while it is coprime\n");
-        fprintf(stderr, "       with 32. A power of two is not required, and the old check that\n");
-        fprintf(stderr,
-                "       demanded one refused 96, 192 and 80 -- Phi-3, DeepSeek's MLA, and a\n");
-        fprintf(stderr, "       family of 80-wide heads -- for nothing this file's loops read.\n");
         return 1;
     }
     if (max_tile < 1) {

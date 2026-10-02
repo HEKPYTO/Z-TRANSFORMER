@@ -96,7 +96,7 @@ every Zig target and is what stops a corrupt id from wrapping down into the vali
 | `data.split` | `split(tokens, val_fraction) !Corpus` | Positional split, before any shuffling. |
 | `data.Batcher` | `init(allocator, tokens, ctx, seed)`, `next`, `reset`, `deinit` | Yields shuffled batches; `next` returns null when spent. |
 | `train.Config` | `{ model, epochs, ctx, lr, warmup, weight_decay, max_grad_norm, seed, log_every }` | One run's settings, validated on the way in. |
-| `train.Row` | `{ step, train_loss, val_loss, lr }` | One logged step. `writeCsv` turns a run's rows into the curve. |
+| `train.Row` | `{ step, train_loss, val_loss: ?f64, lr }` | One logged step. `val_loss` is optional: a row logged before the first epoch ended has none, and `writeCsv` renders that as an empty field rather than a `0.000000` that would read as a measured zero. |
 | `train.run` | `run(allocator, cfg, train_tokens, val_tokens) !Result` | The whole loop: batch, forward, loss, backward, clip, rate, step, clear. |
 | `train.Result` | `{ train_loss, val_loss, steps, params, rows, allocator }`, with `deinit` | The run's numbers plus the trained weights, so a checkpoint can be written straight out. |
 | `train.writeCsv` | `writeCsv(path, rows) !void` | Header plus one line per row, truncating the file first. |
@@ -215,7 +215,8 @@ alike, because the machine was at load 8 to 14 on eight cores throughout; at the
 samples the gpa arm was 3% the faster of the two. What is not contention is the `sys` time and the
 page-reclaim count above, both of which fall with the memory.
 
-`outputs/loss.csv` hashes to `f1dd5444...` either way, which is the point worth making explicit: an
+Both allocator arms hashed the same curve, `f1dd5444...` — the Mac's libm rendering of the file as
+it stood then, not the digest in the tree today. That is the point worth making explicit: an
 allocator decides where the bytes live and not what they add up to. Nothing in the loop reads an
 address — the batch order is an index array, the optimizer pairs parameters and gradients by
 position, the clipper's single norm sums the flat view in index order, and every reduction walks a
@@ -229,16 +230,20 @@ by the steps the run reports, so the denominator comes from the run rather than 
 ```
 $ zig build bench -Doptimize=ReleaseFast
 bench  3 runs of 123 steps, user CPU seconds per step
-       median 0.2793   min 0.2785   max 0.2808
-       spread 0.8% of the median
+       median 1.6315   min 1.6306   max 1.6344
+       spread 0.2% of the median
        whole run including tokenizer startup, over the steps it did
 ```
 
-That is the figure at `HEAD` after both unroll rounds. An earlier version of this block quoted
-0.2934, which was measured before either round and was left sitting above a paragraph claiming
-0.2721 — a stale transcript contradicting the number next to it by 7.8%. The 0.2721 below is the
-same tree measured in a different sitting; this box's load average moves, and the honest reading is
-that the step is **0.27 to 0.28** and either single figure is a measurement of one moment.
+Measured `2026-10-03` on the CUDA host, which is the host of record for the committed curve. **The box
+this replaces was a Mac measurement**, and the difference between the two is the machine rather than
+the code: the same source has read about 0.31 s/step on the Mac and 1.63 s/step on the 32-core Linux
+host, and no ratio between them is claimed anywhere. Earlier boxes quoted 0.2934 and then 0.2721,
+both Mac figures, so a reader comparing them against this one is comparing hosts.
+
+The number to take from it is the order of magnitude and the spread, not the digits: 0.2% across
+three runs here, and a whole factor of five between machines. Anything finer than that is a
+measurement of one moment on one box.
 
 It is user CPU time and not wall clock, and getting that wrong was the first bug in it: macOS
 `/usr/bin/time -l` prints real, user and sys on one line, so a pattern matching `.*user.*` captures
@@ -259,8 +264,9 @@ the gate to be ignored. `-Dbench-runs=9` for a number you intend to quote.
 
 Two rounds of unrolling the backward pass took the whole run from **0.4522 to 0.2721 CPU seconds per
 step**, both figures the median of three `zig build bench` runs taken in one session on the same
-machine at a load average of 4.6, with spreads of 1.8% and 0.4%. The loss curve is byte-identical at
-`f1dd5444...` across both. An earlier version of this line quoted 0.563 and 0.373, read off a console
+machine at a load average of 4.6, with spreads of 1.8% and 0.4%. The two Mac runs produced a
+byte-identical curve, `f1dd5444...` — what this tree's file hashed to then, not the digest it holds
+now. An earlier version of this line quoted 0.563 and 0.373, read off a console
 transcript at a load average of 15 to 19; the ratio was 1.51x and this one is 1.66x, and neither pair
 should be compared with the other because the load differed. Those two are the numbers
 `zig build bench` produced in one sitting, and the rule here is that a number either comes out of
@@ -609,8 +615,8 @@ head width that cannot be fractional and is off by the one the `-1` leaves behin
 
 | Deferred item | Worth doing at | Deciding number |
 |---|---|---|
-| Fused IO-aware attention | `T >= 3 * d` | **Superseded.** `core/mlp >= 0.25` gives no at the shipped shape (0.167) and no at 8B (0.167), yes at 32k (0.667). The kernel exists and ran 98.7x at the shipped shape, between 103x and 160x across the other shapes, the floor withdrawn pending re-measurement. `core/mlp` is a share of arithmetic and not of time. See "Attention: the floor, and then the kernel" below. |
-| KV cache | `T >= 3 * d` | The same term, and the same flaw: it is a share of arithmetic and not of time. The attention row above is the cautionary tale for this one. `src/kv_cache.zig` has landed and carries five tests, but nothing decodes through it -- there is no generation loop and the forward kernel's `q_offset` is exercised only at 0, the training shape, so a cached key is not yet attended to by a single-token query -- and the row is still unmeasured on time. It also costs 2 GiB at 8B and 12 GiB at the parity row. |
+| Fused IO-aware attention | `T >= 3 * d` | **Superseded.** `core/mlp >= 0.25` gives no at the shipped shape (0.167) and no at 8B (0.167), yes at 32k (0.667). The kernel exists and runs at **57.9x to 168.8x** per call across eleven shapes, the minimum of three runs measured `2026-10-03` on the CUDA host, per the root `README.md`. Two earlier ranges are withdrawn: "98.7x at the shipped shape, between 103x and 160x", and then "55.4x to 169.4x". Both were read off a denominator that is not a property of the kernel, and `ctx256` is why: across the three runs it swung 1.82x while the other ten shapes held between 1.00x and 1.03x. The committed ten-run sweep puts that one shape in two clusters 1.7384x apart with nothing between them, so no single floor here was ever a measurement of the kernel. `core/mlp` is a share of arithmetic and not of time. See "Attention: the floor, and then the kernel" below. |
+| KV cache | `T >= 3 * d` | The same term, and the same flaw: it is a share of arithmetic and not of time. The attention row above is the cautionary tale for this one. `src/kv_cache.zig` has landed and carries six tests, and `src/decode.zig` decodes through it -- a greedy generation loop whose five tests run and pass, checking a cached decode step against a full forward pass over the prompt, and the second generated token against a full forward over the grown prompt. It runs on the GPU as well: `decode.cudaAttnStep` derives `q_offset = pos` and `n_keys = pos + 1` from the cache itself, so the forward kernel's offset is exercised at every real position rather than only at 0, and `zig build cuda-attn-check` grades that path against the CPU `attnStep` over a cache filling one position at a time. The row is still unmeasured on time. It also costs 2 GiB at 8B and 12 GiB at the parity row. |
 | Tied-head restructure | `vocab >= 3 * d` | Landed, see below. `tied / (3 * mlp) >= 0.25` at every row here, including the shipped one at 10.5% of the step. |
 | `weightGrad` loop-order swap | never | Not a ratio. It reorders a fixed multiply-add count, so no shape improves it, and `matmul`, `weightGrad` and `inputGrad` already stream contiguous rows. |
 
@@ -633,8 +639,9 @@ access pattern: at `vocab = 1024` the embedding table is 512 KiB.
 
 The output is unchanged, which is the whole reason this is a refactor and not a numeric change.
 Each accumulator sums a disjoint set of vocab rows and, within a row, still walks `i` ascending,
-so every logit is the same f32 narrowing of the same f64 sum. `outputs/loss.csv` still hashes to
-`f1dd5444...`. Reassociating the sum would be a different project with a different answer, and the
+so every logit is the same f32 narrowing of the same f64 sum. A run on this Mac after the change wrote
+the same curve the run before it had, `f1dd5444...` both times — what this tree's file hashed to then,
+not the digest it holds now. Reassociating the sum would be a different project with a different answer, and the
 f64 accumulator is not negotiable here: it is the tied head that the softmax in `loss.forward` then
 exponentiates. The tied-head *backward* in `autograd` is a separate loop, and was left alone for
 the same reason this section's first paragraph gives for the shape: it is intensity, not count.
@@ -646,13 +653,19 @@ beside the PCIe floor a GPU implementation would have to clear.
 
 ```
      ctx       calls  cpu_us_min   pcie_MiB    floor_us   ratio  verdict
-  --------  ---------  ------------  ---------  ----------  --------  -------------------------------------------
-       256         82       6084.07      0.375       64.46       94x  floor is below the cpu: the kernel's own cost decides
-       512         20      25313.41      0.750      128.92      196x  floor is below the cpu: the kernel's own cost decides
-      1024          5     103435.41      1.500      257.85      401x  floor is below the cpu: the kernel's own cost decides
-      2048          3     422220.31      3.000      515.69      819x  floor is below the cpu: the kernel's own cost decides
-      4096          3    1693164.72      6.000     1031.39     1642x  floor is below the cpu: the kernel's own cost decides
+  --------  ---------  ------------  ---------  ----------  --------  -----------------------------
+       256         46       7917.88      0.375       64.46      123x  floor is below the cpu: the kernel's own cost decides
+       512         11      46822.91      0.750      128.92      363x  floor is below the cpu: the kernel's own cost decides
+      1024          3     190466.73      1.500      257.85      739x  floor is below the cpu: the kernel's own cost decides
+      2048          3     766216.29      3.000      515.69     1486x  floor is below the cpu: the kernel's own cost decides
+      4096          3    3114728.19      6.000     1031.39     3020x  floor is below the cpu: the kernel's own cost decides
 ```
+
+Measured `2026-10-03` on the CUDA host after `zig build host-check` was green. **This table is not a
+generated block and cannot be one**: every column is a time, so two runs are not byte-identical and
+comparing them would pass by rounding. `scale-profile` above is protected that way because it is
+arithmetic; this is not. What protects it instead is the committed sweep and the host guard, and the
+`ctx256` row is the one to distrust: it is the shape whose CPU column is measured to be bimodal.
 
 On the 32-core Linux host. `cpu_us_min` is the **minimum** per-call time over `calls` calls, because
 contention and frequency scaling only make a call slower. `floor_us` is q, k and v in plus the result
@@ -664,9 +677,9 @@ comes from, and it is the weakest number in the table.
 that host put the shipped row at 6084, 8344 and 10311 us, a 69% spread in host load alone. What is
 stable across all three is the order of magnitude: two at the shipped window, three at 4096.
 
-**That row is also not reproducible across sessions.** The `6084.07 us` over 82 calls printed above and
-the `10707.91 us` over 47 calls in `src/cuda/README.md` are the same tool, the same shape, the same
-host, 1.76x apart, from a later session. Neither number is deleted here: the pair is the record, and
+**That row is also not reproducible across sessions.** A `6084.07 us` over 82 calls from an earlier
+session and the `10707.91 us` over 47 calls in `src/cuda/README.md` are the same tool, the same
+shape, the same host, 1.76x apart. Neither number is deleted here: the pair is the record, and
 what it establishes is that a single `zig build attn-bench` cell is a sample of a noisy quantity and
 not a property of the code.
 
@@ -675,7 +688,10 @@ not a property of the code.
 `src/cuda/attn_kernels.cu` is that kernel: one block per query and head, walking the causal prefix with
 the running softmax in registers and no score matrix ever written to global memory. Its two backward
 kernels are in that same file and are graded against `attentionBackward` by the same script, at three
-separate gates, one each for dq, dk and dv; neither half is wired into `zig build train`. The file
+separate gates, one each for dq, dk and dv. Both halves are now wired into a real training step behind
+one flag: `src/model.zig`'s `cuda_attn` routes the forward and the backward through this file, and
+`zig build cuda-attn-check` grades that path against `attention.forward` and `attentionBackward` on a
+real step's tensors. The file
 beside it, `src/cuda/attn.cu`, is the benchmark harness and not a library: it `#include`s the kernels
 and defines `main`, so it cannot be linked as one. The full table, the three-run reproducibility
 measurement, the attack on its own gate and its known limitation are in `src/cuda/README.md`; the two
@@ -719,14 +735,22 @@ improves the reference rather than widening what is compared.
 
 ### The speedup, and why it is not the floor's number
 
-The kernel ran **98.7x** faster at the shipped window and between 103x and 160x across the other six, a floor that
-is withdrawn rather than restated until the table is re-measured: the ratio's denominator is a CPU call that has
-read 6450.78 to 10770.23 us across sessions on one host, a spread of 1.67x, so no floor here was ever a property
-of the kernel. It previously read
-106x and 165x. Three runs put the `kernel_us` spread at 0.5% to 2.6% and the `cpu_us` spread at 0.1% to 1.4%
--- except at `ctx256`, where one `forward` call read 6089.81, 8572.32 and 10884.32 us, a 78.8% spread.
-The published run is the third of three and the only one taken while the GPU read 0%, so its ratio is
-three.
+The kernel ran between **57.9x and 168.8x** per call across the eleven shapes on `2026-10-03`, the
+minimum of three runs, and **no floor is published at all**. Three earlier ranges were published and
+withdrawn: 106x and 165x, then 98.7x with "between 103x and 160x", then 55.4x to 169.4x. Each was
+withdrawn because the ratio's *denominator* is not a property of the kernel.
+
+That denominator is one CPU `forward` call, and it is bimodal at one shape. The committed ten-run
+sweep puts `ctx256` at 6070.021 to 6088.290 us in three runs and 10583.812 to 10875.440 us in seven,
+each cluster internally tight to within 2.76%, with **nothing at all between them** and a 1.7384x
+gap. 70% of single runs land in the higher mode, so a single sample there is a 1.74x coin toss and
+even a minimum of three catches the low mode only 65.7% of the time. Every other shape held between
+1.00x and 1.03x across the same three runs, which is the shape of the disagreement: one column at one
+geometry, not the benchmark.
+
+The `kernel_us` column, which is the numerator and the part this repository controls, held to 1.03x
+or better at every one of the eleven shapes. That asymmetry is the whole finding, and it is why the
+table above reports a per-shape range rather than a floor.
 
 Comparing both ratios from that same run rather than from two: the floor promises 169x at the shipped
 window and the kernel delivers 62% of it; at 4096 the floor promises 2986x on the twin's own CPU figure -- against the
@@ -763,7 +787,8 @@ an order of magnitude.
 ### It reverses the `scale-profile` verdict, and the projection was the weaker of the two
 
 `scale-profile` answers `fused_attn` with `core/mlp >= 0.25`, which at the shipped shape is `0.167`, so
-it says no, and the CUDA kernel wins over `attention.forward` by 98.7x at the shipped window, the floor being withdrawn pending re-measurement. Both are computed correctly, because they
+it says no, and the CUDA kernel wins over `attention.forward` by between 57.9x and 168.8x per call,
+per shape, with no floor. Both are computed correctly, because they
 measure different things: `core/mlp` is the share of an MLP layer's *arithmetic* that attention
 contributes and it says nothing about how long either takes. `src/scale.zig` calls the bar "a choice,
 and named as one".
@@ -775,10 +800,12 @@ which is those same 8.42 M multiply-adds counted as two operations each. Nothing
 tool; using a share of arithmetic as if it were a share of time was the error.
 
 The KV cache row above is gated on the same `core/mlp` term and this section does not speak to it. It
-has landed -- `src/kv_cache.zig`, five tests -- and its reasoning still has the flaw the attention row
-had: the threshold is not yet backed by a time, because nothing decodes through the cache. There is
-no generation loop, and the forward kernel's `q_offset` is exercised only at 0, so a cached key cannot yet be attended to by
-a single-token query.
+has landed -- `src/kv_cache.zig`, six tests -- and the flaw the attention row had is now gone: the
+threshold is backed by a decode rather than by nothing. `src/decode.zig` is a greedy generation loop
+over the cache, its five tests run and pass, and `decode.cudaAttnStep` runs the same step on the GPU
+with `q_offset = pos`, so the forward kernel's offset is exercised at every real position instead of
+only at 0. What is still missing is a time: nothing here measures what a cached step costs against a
+full forward pass.
 
 ## Tokenizer
 
@@ -852,20 +879,24 @@ two spellings differ by `0.0`: they are bit-identical, so they are identical at 
 and not merely at `1e-6`. Catching this needs a non-dyadic weight, and then the divergence is one
 ulp, which is a statement about `f32` and not about this function. The `tol` is left where it is.
 
-Reproducibility is per build configuration and per host, and the distinction is measured rather
-than assumed. Two runs at one seed in one build produce byte-identical output. Across optimization
-levels it does not hold: Debug differs from Release by about one f32 ulp per step. One ulp is
-harmless over a hundred steps and unbounded over ten thousand, so the training criterion is stated
-per build configuration.
+Reproducibility is per build configuration and per host, and the first half of that used to be
+asserted on a measurement that no longer reproduces. Two runs at one seed in one build produce
+byte-identical output. Across optimization levels this file claimed that Debug differs from Release
+by about one f32 ulp per step, with `w_gate` and `w_down` in layer 0 the only tensors that moved at
+all and the forward pass bit-identical.
 
-The mechanism was attributed to fused multiply-add in the element-wise accumulation loops, and that
-attribution was wrong on a second count too: `ReleaseFast` and `ReleaseSafe` are bit-identical, so
-Zig is not contracting `a * b + c` in these loops at all, and there is no contraction term for the
-gradcheck budget to carry. Each of those loops was extracted and compiled both ways at a size that
-shows the difference: `matmul`, `weightGrad` and `inputGrad` are bit-identical between Debug and
-ReleaseFast. At full model scale the only tensors that move at all are `w_gate` and `w_down` in
-layer 0; the forward pass, `tok_embed`, `wq`, `wk`, `attn_norm` and `final_norm` are all
-bit-identical. The phenomenon is real and reproducible, the explanation for it is not established,
-and it is recorded here as an observation rather than as a mechanism nobody has verified. `@exp`,
-`@sqrt` and `@cos` additionally resolve to the platform libm, so output is not comparable across
-libm versions either.
+**That stopped being true, and recording that it stopped is the point.** `zig build dbg-train` is
+the Debug build of the shipped run, built to make exactly this comparison. Run on the CUDA host against
+the committed curve it produced bytes **identical** to the ReleaseFast ones: `settleCsv` matched the
+digest, promoted, and left no pending file. A full 123-step Debug curve and a full 123-step
+ReleaseFast curve are the same bytes on this toolchain, so whatever used to move those two tensors in
+layer 0 does not, and the one-ulp-per-step figure has no measurement behind it any more. Any test or
+documentation that leaned on "Debug and Release differ here" is leaning on nothing.
+
+The earlier attribution was to fused multiply-add in the element-wise accumulation loops, and that
+was already wrong on a second count: `ReleaseFast` and `ReleaseSafe` are bit-identical, so Zig is not
+contracting `a * b + c` in these loops at all and there is no contraction term for the gradcheck
+budget to carry. What produced the old difference is not established and is not re-established here.
+The half that still matters is the host: `@exp`, `@sqrt` and `@cos` resolve to the platform libm, so
+output is not comparable across libm versions, and that is measured -- the same source gives
+`7d7bcbd8...` on the CUDA host and refuses against a different machine's curve.

@@ -338,7 +338,7 @@ pub fn build(b: *std.Build) void {
     // so it lives in `zig build cuda-attn-check` and a green `verify` says
     // nothing at all about it. A gate whose omissions are unstated is how a
     // reader concludes a check happened.
-    const verify_step = b.step("verify", "Check fmt, the test suite in Debug, the test suite in ReleaseFast, the version banner, the corpus digest, the committed loss curve, the scale tables in src/README.md, the symbol table in src/README.md, tools/removed/report.csv, and the training run's peak memory -- but NOT the CUDA attention comparison, which needs a CUDA toolchain and is 'zig build cuda-attn-check'");
+    const verify_step = b.step("verify", "Check fmt, the test suite in Debug, the test suite in ReleaseFast, the version banner, the corpus digest, the committed loss curve, the attention benchmark's CPU half compiles, the scale tables in src/README.md, the symbol table in src/README.md, tools/removed/report.csv, and the training run's peak memory -- but NOT the CUDA attention comparison, which needs a CUDA toolchain and is 'zig build cuda-attn-check', and NOT the negative controls for that scale-table gate, which print what they caught and are 'zig build table-block-check'");
 
     // `b.graph.zig_exe` rather than `zig` off `PATH`, so the formatter that
     // decides whether the tree is formatted is the same compiler running the
@@ -374,6 +374,41 @@ pub fn build(b: *std.Build) void {
     verify_step.dependOn(&corpus.step);
     verify_step.dependOn(&loss_csv.step);
 
+    // `src/cuda/attn_twin.zig` is the CPU half of the attention benchmark: it
+    // writes the inputs, the reference output and the manifest that
+    // `src/cuda/attn.cu` is graded against, so the published 55.4x to 169.4x
+    // table cannot be reproduced without it compiling.
+    //
+    // It had no target here at all, because `run-attn.sh` invokes `zig
+    // build-exe` itself, and that made this a permanent hole rather than a slow
+    // one: a rename or a signature change in that file stayed green here
+    // indefinitely, since nothing in this graph ever read it. Compiling it is
+    // the whole addition, and it is CPU only -- no CUDA object, no libcudart --
+    // so it costs a runner with no card nothing.
+    //
+    // `autograd` rather than `src/attention.zig` alongside it, because the twin
+    // needs `attention.forward` and `attentionBackward` and passing the two
+    // files as separate modules compiles every symbol they share twice. The
+    // same wiring `run-attn.sh` passes, for the same reason.
+    const attn_twin_exe = b.addExecutable(.{
+        .name = "attn-twin",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cuda/attn_twin.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{
+                .name = "autograd",
+                .module = b.createModule(.{
+                    .root_source_file = b.path("src/autograd.zig"),
+                    .target = target,
+                    .optimize = .ReleaseFast,
+                }),
+            }},
+        }),
+    });
+    verify_step.dependOn(&attn_twin_exe.step);
+    b.step("attn-twin", "Build the CPU half of the attention benchmark").dependOn(&attn_twin_exe.step);
+
     // The scale tables `src/README.md` quotes, checked against the tool that
     // prints them. `scale-profile` writes no timestamp, no address and no float
     // whose formatting can drift, so two runs are byte-identical and the
@@ -381,7 +416,108 @@ pub fn build(b: *std.Build) void {
     // README's claim to have been copied from the tool is a promise, and a
     // promise is what b168cf9 broke: it grew the activation cache, and six table
     // rows kept printing what the previous cache cost.
-    verify_step.dependOn(&addScaleTableCheck(b, exe).step);
+    //
+    // A run step of its own rather than `scale_step`'s, because that one
+    // INHERITS stdout -- it is the step a reader runs to read the tables -- and a
+    // step that both printed the tables and was compared against them would have
+    // to capture them, which would silence the reader's copy.
+    const scale_capture = b.addRunArtifact(exe);
+    scale_capture.addArg("scale-profile");
+    verify_step.dependOn(&addTableBlockCheck(b, scale_capture.captureStdOut(.{}), "src/README.md", "scale-profile", &.{
+        "ARITHMETIC, PROJECTED, GFLOP",
+        "BYTES, PROJECTED, GiB",
+        "VERDICTS, one line per deferred item, at 32 GiB of host memory",
+    }, 20).step);
+
+    // That the gate above can fail, on the real script rather than on a copy of
+    // it. Deliberately NOT in `verify`, and the reason is the silence contract
+    // rather than a missing toolchain: CI asserts that a passing `zig build
+    // verify` writes no bytes to either stream, and this step's entire output IS
+    // the evidence that the three broken tables were caught. `cuda-check` is
+    // outside `verify` for the same shape of reason with a different cause.
+    const table_block_check = b.addSystemCommand(&.{"sh"});
+    table_block_check.addFileArg(b.path("tools/table-block-check.sh"));
+    table_block_check.setCwd(b.path("."));
+    b.step("table-block-check", "Require the README table-block gate to catch a drifted digit, a deleted marker and a tool that prints nothing, and print what each one produced").dependOn(&table_block_check.step);
+
+    // Is this host in a state where a timing means anything? Run it before a
+    // benchmark, not inside `verify`: `verify` is silent by contract and runs on
+    // every runner, and a check that reads `nvidia-smi` belongs to the host that
+    // has one. The thresholds are in the script and overridable in the
+    // environment, so a reader who disagrees changes one number and says so.
+    //
+    // It is here because the alternative is the failure this repository has
+    // already published twice: a table generated from a contaminated host, which
+    // is a plausible-looking table and the worst kind.
+    const host_check = b.addSystemCommand(&.{"sh"});
+    host_check.addFileArg(b.path("tools/host-clean.sh"));
+    host_check.setCwd(b.path("."));
+    b.step("host-check", "Refuse when the host is in a state that would contaminate a timing, and name which condition failed").dependOn(&host_check.step);
+
+    // Two short training passes that must produce the same bytes. `verify`
+    // hashes the committed curve and does NOT re-derive it, so nothing in the
+    // graph proves the code still produces those bytes -- and a reader is told
+    // they do. This is the step that makes that true.
+    //
+    // Short on purpose: 16 KiB of corpus is the smallest that still yields a
+    // validation window. `data.split` keeps 5% for validation and one window is
+    // `ctx` 256 tokens, so 8 KiB leaves fewer than 256 val tokens and the run
+    // refuses with `error: EmptyValidation` before writing anything -- 4096 and
+    // 8192 were both tried and both refuse. At 16 KiB it is 30 steps, so the pair
+    // costs about a second. The property is the arithmetic's rather than the run
+    // length's: trajectory chaos needs many steps to amplify, which is exactly
+    // why a SHORT pair is the cheap way to test reproducibility.
+    //
+    // Host-relative and not cross-machine, deliberately. A different libm gives
+    // different bytes legitimately, so this can never assert a curve digest; it
+    // asserts that two runs on THIS host agree with each other. The committed
+    // `csv_sha256` keeps its meaning as one host's claim, and nothing here turns
+    // it into a cross-machine one.
+    //
+    // Both passes write `outputs/loss.pending.csv` and neither promotes, because
+    // a three-row curve is not the committed five-row one and `settleCsv` refuses
+    // on the digest. The pending file is moved aside after each pass and deleted
+    // at the end, so a failed run leaves the tree as it found it.
+    const determinism = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        \\set -eu
+        \\bin=$1
+        \\work=$(mktemp -d)
+        \\trap 'rm -rf "$work"' EXIT
+        \\export ZTRANSFORMER_CORPUS_BYTES=$2
+        \\rm -f outputs/loss.pending.csv
+        \\"$bin" train > "$work/a.log" 2>&1 || true
+        \\cp outputs/loss.pending.csv "$work/a.csv"
+        \\"$bin" train > "$work/b.log" 2>&1 || true
+        \\cp outputs/loss.pending.csv "$work/b.csv"
+        \\rm -f outputs/loss.pending.csv
+        \\# SILENT ON SUCCESS. `verify` is silent by contract and CI asserts that a
+        \\# passing run writes no bytes to either stream, so a step inside it that
+        \\# announced its digest would break that assertion to print a number
+        \\# nobody reads. `table-block-check` is outside `verify` for exactly this
+        \\# reason; this one is inside because determinism is a property worth
+        \\# gating, so it pays for the silence instead.
+        \\if cmp -s "$work/a.csv" "$work/b.csv"; then
+        \\  exit 0
+        \\else
+        \\  echo "determinism: two runs of one seed DISAGREED on this host, so the" >&2
+        \\  echo "  arithmetic is not reproducible here and the committed curve is" >&2
+        \\  echo "  a claim this build cannot back. $(( $(wc -l < "$work/a.csv") - 1 )) steps each." >&2
+        \\  diff -u "$work/a.csv" "$work/b.csv" >&2 || true
+        \\  echo "determinism: the first pass's own output, in case it never got far:" >&2
+        \\  tail -5 "$work/a.log" >&2 || true
+        \\  exit 1
+        \\fi
+        ,
+        "determinism",
+    });
+    determinism.addArtifactArg(train_exe);
+    determinism.addArg("16384");
+    determinism.setCwd(b.path("."));
+    const determinism_step = b.step("determinism", "Run two short training passes and require them to produce byte-identical curves");
+    determinism_step.dependOn(&determinism.step);
+    verify_step.dependOn(determinism_step);
 
     // The peak of the training run, against `peak_rss_budget`. `verify`
     // depends on it, and the reason it is here rather than in the one-command
@@ -492,13 +628,13 @@ pub fn build(b: *std.Build) void {
     // `LIBRARY_PATH` does not feed. Without the second the step fails with a
     // message about a missing shared library on a machine that has it, which is
     // the worst shape a missing-argument error has.
-    const cuda_check_desc = "Grade the CUDA attention forward against the CPU one at a real step's scale (needs the pinned libcudart on LIBRARY_PATH *and* LD_LIBRARY_PATH; recipe in src/cuda/README.md)";
+    const cuda_check_desc = "Grade the CUDA attention forward against the CPU one at a real step's scale, AND the CUDA decode step against the CPU one over a filling cache (needs the pinned libcudart on LIBRARY_PATH *and* LD_LIBRARY_PATH; recipe in src/cuda/README.md)";
     const cuda_train_desc = "Train with the CUDA attention forward (needs the pinned libcudart on LIBRARY_PATH *and* LD_LIBRARY_PATH; recipe in src/cuda/README.md)";
     if (model_source.cuda_attn) {
         const nvcc = cudaAttnObject(b);
 
         // `src/train.zig` as its own test root. Rooted at `src/tests.zig` it
-        // would also re-run the other 209 tests against a CUDA-linked binary,
+        // would also re-run the other 202 tests against a CUDA-linked binary,
         // which is a different and much slower check than the one this step is
         // named for -- and the one gate here is the only test in the tree that
         // needs a device.
@@ -513,7 +649,35 @@ pub fn build(b: *std.Build) void {
         linkCudaAttn(cuda_tests.root_module);
         cuda_tests.step.dependOn(&nvcc.step);
         const cuda_test_run = b.addRunArtifact(cuda_tests);
-        b.step("cuda-attn-check", cuda_check_desc).dependOn(&cuda_test_run.step);
+
+        // The decode gate, as its own test root for the same reason the training one
+        // is: `src/decode_test.zig` carries one test that needs a device -- a decode
+        // step's GPU answer against the CPU `attnStep` over a filling cache -- and
+        // rooting the suite at `src/tests.zig` would re-run the other 217 against a
+        // CUDA-linked binary.
+        //
+        // It lives in this step rather than beside a note telling the reader to run it
+        // by hand, because that is the defect this repository keeps finding in its own
+        // gates: a check whose only invocation is prose is a check nobody runs. Its
+        // `error.SkipZigTest` arm still reports SKIP in every step that links no
+        // object, so it cannot pass silently either.
+        const cuda_decode_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/decode_test.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+                .link_libc = true,
+            }),
+        });
+        linkCudaAttn(cuda_decode_tests.root_module);
+        cuda_decode_tests.step.dependOn(&nvcc.step);
+        const cuda_decode_run = b.addRunArtifact(cuda_decode_tests);
+
+        // Two `dependOn` calls rather than one chain: it returns void, so a chain is a
+        // compile error rather than a longer statement.
+        const cuda_attn_check = b.step("cuda-attn-check", cuda_check_desc);
+        cuda_attn_check.dependOn(&cuda_test_run.step);
+        cuda_attn_check.dependOn(&cuda_decode_run.step);
 
         const cuda_train_exe = b.addExecutable(.{
             .name = "ztransformer-cuda-train",
@@ -799,82 +963,59 @@ fn addTests(
     return b.addRunArtifact(tests);
 }
 
-/// A step that fails unless the three tables `src/README.md` quotes are the
-/// tables `zig build scale-profile` prints.
+/// A step that fails unless the tables a tool prints are byte-for-byte the tables
+/// a README quotes between two markers.
 ///
-/// The tool's output is captured rather than inherited, for the same reason the
-/// banner's is: `verify` is silent by contract, and a run step that prints the
-/// whole profile on every green run trains everyone to scroll past it. The
-/// README arrives as a plain file argument, so a failure diffs the two and names
-/// the file that has to be re-copied.
+/// `src/README.md`'s `scale-profile` block is the only such table today, and
+/// this is the only implementation of the rule, so a second one is a call rather
+/// than the fifty lines of shell that used to be copied into this file for it.
 ///
-/// The extraction is two `awk` rules and no more. A header line opens a table
-/// and a blank line closes it, and the blank between two tables is emitted ahead
-/// of the second so neither side can differ by a trailing newline. It keys on
-/// the three header lines rather than on line numbers, so a row moving or a
-/// column appearing reads as a diff rather than a misread.
+/// The comparison is `tools/table-block.sh` rather than shell here, for the
+/// reason `tools/symbols.sh` is a file and not a string: this gate has to be
+/// breakable on purpose, and fifty lines of `awk` inside a build script can only
+/// be broken by running a build. The script finishes in a second and prints what
+/// each broken case produced, which is what `zig build table-block-check` runs.
 ///
-/// A `cmp` on two empty files exits 0, and keying on header LINES is what makes
-/// that reachable: rename one of the three in `src/scale.zig`, delete the block
-/// from `src/README.md`, and both extractions come back empty while this check
-/// passes. So the tool side carries a line-count floor before the comparison.
-/// The README side needs no floor of its own, because a file with no block in
-/// it is 29 lines short of a file with one, and `cmp` already fails on that.
-fn addScaleTableCheck(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step.Run {
-    const run = b.addRunArtifact(exe);
-    run.addArg("scale-profile");
-    const printed = run.captureStdOut(.{});
-
-    const check = b.addSystemCommand(&.{
-        "sh",
-        "-c",
-        \\tool=$1; readme=$2
-        \\t=$(mktemp) || exit 1; r=$(mktemp) || exit 1
-        \\awk '
-        \\  /^ARITHMETIC, PROJECTED, GFLOP$/ {hdr=1}
-        \\  /^BYTES, PROJECTED, GiB$/ {hdr=1}
-        \\  /^VERDICTS, one line per deferred item, at 32 GiB of host memory$/ {hdr=1}
-        \\  hdr {if (n++) print ""; on=1; hdr=0}
-        \\  on && /^$/ {on=0; next}
-        \\  on {print}
-        \\' "$tool" > "$t"
-        \\# A floor on the tool side, before the `cmp`, because `cmp -s` exits 0
-        \\# on two empty files. Delete the block in src/README.md, rename one
-        \\# header line in src/scale.zig, and the extraction finds neither table:
-        \\# the comparison then succeeds on nothing at all. That is the same
-        \\# defect as the `sed` pipeline the other platform had, where an empty
-        \\# derivation becomes a silently wrong `-arch` flag. The README side
-        \\# needs no floor of its own, because emptying it alone leaves 29 lines
-        \\# to diff against and `cmp` already fails. 29 today: three headers, 24
-        \\# rows and two blank separators. The threshold is 20, well clear of
-        \\# zero and well under the real value, so adding a shape to a table
-        \\# does not require editing this check.
-        \\if [ "$(wc -l < "$t")" -lt 20 ]; then
-        \\  echo "zig build scale-profile printed $(wc -l < "$t") lines of table" >&2
-        \\  echo "where src/README.md's block has 29, so this check would be" >&2
-        \\  echo "comparing an empty extraction against an empty one and" >&2
-        \\  echo "passing. A header line in src/scale.zig that no longer matches" >&2
-        \\  echo "the three this awk keys on is the cause. Run" >&2
-        \\  echo "'zig build scale-profile' and read what it prints." >&2
-        \\  rm -f "$t" "$r"; exit 1
-        \\fi
-        \\awk '
-        \\  /<!-- scale-profile:begin -->/ {on=1; next}
-        \\  /<!-- scale-profile:end -->/ {on=0; next}
-        \\  on && /^```/ {next}
-        \\  on {print}
-        \\' "$readme" > "$r"
-        \\if cmp -s "$t" "$r"; then rm -f "$t" "$r"; exit 0; fi
-        \\echo "the scale tables in src/README.md are not what zig build scale-profile prints:" >&2
-        \\echo "re-copy the block between <!-- scale-profile:begin --> and <!-- scale-profile:end -->" >&2
-        \\diff -u "$t" "$r" >&2
-        \\rm -f "$t" "$r"
-        \\exit 1
-        ,
-        "sh",
-    });
-    check.addFileArg(printed);
-    check.addFileArg(b.path("src/README.md"));
+/// `tool_out` is a captured stdout rather than an inherited one, for the same
+/// reason the version banner's is: `verify` is silent by contract, and a run
+/// step that printed the whole profile on every green run would train everyone to
+/// scroll past it. Handing it over as a file argument is also what makes the run
+/// that produces it a dependency of this step, so the comparison can never read
+/// a stale file.
+///
+/// `table_headers` is the one thing that cannot be derived from `block`: a tool
+/// prints its tables under whatever headings its own output gives them, and the
+/// markers are named after the step rather than after the tables. Everything else
+/// — the marker names, the README, the floor, the comparison, and both failure
+/// messages — is identical for every table, and repeating it per call site is the
+/// copy-paste this exists to remove.
+///
+/// `floor` is the smallest extraction the check will accept, and it means one
+/// thing: below this many lines an extraction is treated as having found nothing
+/// rather than as a table to diff. `cmp -s` exits 0 on two empty files, and keying
+/// on header LINES is what makes that reachable — rename a header in the tool,
+/// delete the block from the README, and both extractions come back empty while
+/// the comparison passes on nothing. That is the same defect as the `sed` pipeline
+/// the other platform had, where an empty derivation becomes a silently wrong
+/// `-arch` flag. It is a parameter because one shared check cannot know how long
+/// an arbitrary table is, and 20 against a real 29 is both well clear of zero and
+/// well under the real length, so adding a row does not require editing this
+/// call.
+fn addTableBlockCheck(
+    b: *std.Build,
+    tool_out: std.Build.LazyPath,
+    readme_path: []const u8,
+    block: []const u8,
+    table_headers: []const []const u8,
+    floor: usize,
+) *std.Build.Step.Run {
+    const check = b.addSystemCommand(&.{"sh"});
+    check.addFileArg(b.path("tools/table-block.sh"));
+    check.addFileArg(tool_out);
+    check.addFileArg(b.path(readme_path));
+    check.addArg(block);
+    check.addArg(b.fmt("{d}", .{floor}));
+    for (table_headers) |header| check.addArg(header);
     check.setCwd(b.path("."));
     return check;
 }

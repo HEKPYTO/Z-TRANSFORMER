@@ -349,14 +349,22 @@ pub const Attn = struct {
     /// for every published row and `max_tile` is the tile cap the benchmark uses; both
     /// are parameters so a caller is not forced to match the benchmark by construction.
     ///
-    /// A decode call wants a different thing and should NOT reach for this: one query
+    /// A decode call wants a different thing and should NOT reach for this: ONE query
     /// row at absolute position `pos`, attending to `n_keys` cached rows. That is
-    /// `forwardAt`, and it is a separate function rather than two extra defaulted
-    /// arguments here, because folding them together is how a caller passes `n_ctx`
-    /// where the cache length belonged -- and that mistake masks every key past index
-    /// 0 and returns `v[0]` with no error.
+    /// `forwardAt`, and it is a separate function rather than defaulted arguments here,
+    /// because folding them together is how a caller passes `n_ctx` where the cache
+    /// length belonged -- and that mistake masks every key past index 0 and returns
+    /// `v[0]` with no error.
+    ///
+    /// `t` is what made this reachable from a decode step at all. Every buffer here is
+    /// sized from one `t` given to `init`, so a holder built for a whole cache launched
+    /// that many QUERY rows: `t = n_ctx` computed 256 rows for a decode step and kept
+    /// one -- correct, because each query row is independent, but it read 255 rows of
+    /// whatever the device happened to hold. Passing the caller's own query count drops
+    /// that waste while the buffers stay at capacity, which is what a cache needs: `k`
+    /// and `v` hold `n_keys` rows, `q` and `out` hold one.
     pub fn forward(self: *const Attn, group_q: c_int, max_tile: c_int) Error!void {
-        return self.forwardAt(group_q, max_tile, 0, self.c_t);
+        return self.forwardAt(group_q, max_tile, 0, self.c_t, self.c_t);
     }
 
     /// The forward for one decode step. `q_offset` is the token's absolute position
@@ -367,8 +375,10 @@ pub const Attn = struct {
         max_tile: c_int,
         q_offset: c_int,
         n_keys: c_int,
+        t: c_int,
     ) Error!void {
-        const rc = zt_attn_forward(self.q, self.k, self.v, self.out, self.c_t, self.c_heads, self.c_kv_heads, self.c_dim, group_q, max_tile, q_offset, n_keys, null);
+        if (forwardBounds(self.c_t, q_offset, n_keys, t)) |e| return e;
+        const rc = zt_attn_forward(self.q, self.k, self.v, self.out, t, self.c_heads, self.c_kv_heads, self.c_dim, group_q, max_tile, q_offset, n_keys, null);
         if (rc != 0) return Error.ConfigRefused;
     }
 
@@ -444,6 +454,36 @@ fn bufferBytes(target: [*]f32, self: *const Attn) usize {
 
 const testing = std.testing;
 
+/// What `forwardAt` may address, as a pure predicate over the numbers, with no
+/// allocation and no device call -- so `zig build test` can check it on a host that
+/// has no GPU at all. `Attn.init` needs `cudaMalloc`, which is the whole reason this
+/// is separate: a test that constructs a holder could only ever run where a GPU is,
+/// and the bounds are the part most worth checking everywhere.
+///
+/// `n_keys` is how many rows of `k` and `v` the caller filled and `t` how many
+/// query rows it uploaded; either above `c_t` walks the matching buffer off its own
+/// end while the entry point still returns 0, which is an out-of-bounds device read
+/// reported as success. The kernel cannot see either, because it is handed a pointer
+/// and a count and not the allocation.
+///
+/// The third is the pairing: the last query row sits at `q_offset + t - 1` and must
+/// have a key, or every score that row sees is -inf and the kernel's own denominator
+/// is 0. The kernel refuses this too, and both refusals are wanted -- this one names
+/// the numbers, that one is the boundary for a caller reaching the entry point
+/// directly.
+pub fn forwardBounds(c_t: c_int, q_offset: c_int, n_keys: c_int, t: c_int) ?Error {
+    if (n_keys < 1 or n_keys > c_t) return Error.ShapeTooLarge;
+    if (t < 1 or t > c_t) return Error.ShapeTooLarge;
+    // `q_offset + t` is `c_int` arithmetic, so this line used to be able to overflow
+    // before it was compared: `q_offset = maxInt(c_int)` with `t = 2` wraps negative
+    // under ReleaseFast, `negative > n_keys` is false, and the caller is handed a
+    // shape that would launch the kernel at a ~2^31 row offset. Comparing against
+    // `c_t - q_offset` instead bounds both operands first, which makes the sum below
+    // provably land in `[0, c_t]` and therefore not overflow at all.
+    if (q_offset < 0 or q_offset > c_t or t > c_t - q_offset) return Error.ShapeTooLarge;
+    if (q_offset + t > n_keys) return Error.ShapeTooLarge;
+    return null;
+}
 test "the shipped shape's sizes, spelled out" {
     // 4 layers of a 4-head, 2-kv-head, head_dim 32, ctx 256 model.
     try testing.expectEqual(@as(usize, 256 * 4 * 32 * 4), try bytesFor(.query_headed, 256, 4, 2, 32));
@@ -478,15 +518,50 @@ test "the eleven buffers total 798720 bytes at the shipped shape, against 12 GiB
     // The coefficient is the point. `totalBytes` once said 5 query-headed buffers
     // while `Kind`'s own doc comment listed four, and init allocates four, so the
     // function a VRAM-budget caller would use over-reserved by one 131072-byte
-    // buffer -- 14%. Asserting the literal total rather than an expression over
-    // `bytesFor` is what makes a wrong coefficient FAIL here: an earlier version of
-    // this test was written as `5 * qh + 4 * kvh + 3 * pr` and so agreed with the bug
-    // by construction, and never called the function it was nominally checking.
+    // buffer -- 14%.
+    //
+    // This test committed that bug twice before catching it, and both times it kept
+    // re-deriving the total from `bytesFor` instead of calling `totalBytes`. Writing
+    // `5 * qh + 4 * kvh + 3 * pr` agreed with the defect by construction, and then
+    // fixing the literal to `4 *` did not help either -- the coefficient under test
+    // was spelled out in the TEST, so editing the function changed nothing here. Only
+    // calling the function can fail on an edit to the function, which is why the
+    // assertion is now `holder.totalBytes()` and the spelled-out sum is the weaker
+    // second line beside it.
     const qh = try bytesFor(.query_headed, 256, 4, 2, 32);
     const kvh = try bytesFor(.kv_headed, 256, 4, 2, 32);
     const pr = try bytesFor(.per_row, 256, 4, 2, 32);
-    try testing.expectEqual(@as(usize, 798720), 4 * qh + 4 * kvh + 3 * pr);
-    try testing.expect(4 * qh + 4 * kvh + 3 * pr < 1024 * 1024);
+    // Through the FUNCTION, which is the whole point. `totalBytes` reads four
+    // scalars and allocates nothing, so an `Attn` literal with `undefined`
+    // device pointers is a valid receiver here and the test still runs on a host
+    // with no GPU -- the pointers are never dereferenced, and if one were, that
+    // would be a defect this test should not be the thing that finds.
+    const holder: Attn = .{
+        .q = undefined,
+        .k = undefined,
+        .v = undefined,
+        .out = undefined,
+        .dout = undefined,
+        .dq = undefined,
+        .dk = undefined,
+        .dv = undefined,
+        .row_max = undefined,
+        .row_den = undefined,
+        .row_del = undefined,
+        .t = 256,
+        .n_heads = 4,
+        .n_kv_heads = 2,
+        .dim = 32,
+        .c_t = 256,
+        .c_heads = 4,
+        .c_kv_heads = 2,
+        .c_dim = 32,
+    };
+    try testing.expectEqual(@as(usize, 798720), holder.totalBytes());
+    try testing.expect(holder.totalBytes() < 1024 * 1024);
+    // The three coefficients, spelled out, so the shape the test is checking is
+    // also the shape the function is documented to allocate.
+    try testing.expectEqual(4 * qh + 4 * kvh + 3 * pr, holder.totalBytes());
 }
 
 test "a degenerate shape is refused by name, not as an allocator failure" {
@@ -513,4 +588,43 @@ test "a dimension above c_int's range is refused rather than wrapped negative" {
     try testing.expectError(Error.ShapeTooLarge, toCInt(@as(usize, 1) << 31));
     try testing.expectEqual(@as(c_int, 256), try toCInt(256));
     try testing.expectEqual(std.math.maxInt(c_int), try toCInt(@as(usize, std.math.maxInt(c_int))));
+}
+
+// The bounds `forwardAt` applies, checked as the pure predicate they are, so this runs
+// on a host with no CUDA toolchain at all -- `Attn.init` needs `cudaMalloc` and cannot.
+// Each of the five refusals is a silent-wrong-answer case on the other side of the
+// check, which is why none of them is a clamp.
+test "the forward's addressable set is refused rather than clamped" {
+    const c_t: c_int = 256;
+    // Accepted: the training shape, and a decode step at position 5 over six keys.
+    try testing.expectEqual(@as(?Error, null), forwardBounds(c_t, 0, c_t, c_t));
+    try testing.expectEqual(@as(?Error, null), forwardBounds(c_t, 5, 6, 1));
+
+    // `n_keys` past the end of k and v, and zero of it.
+    try testing.expectEqual(Error.ShapeTooLarge, forwardBounds(c_t, 0, c_t + 1, 1).?);
+    try testing.expectEqual(Error.ShapeTooLarge, forwardBounds(c_t, 0, 0, 1).?);
+
+    // `t` past the end of q and out, and zero of it.
+    try testing.expectEqual(Error.ShapeTooLarge, forwardBounds(c_t, 0, 1, c_t + 1).?);
+    try testing.expectEqual(Error.ShapeTooLarge, forwardBounds(c_t, 0, 1, 0).?);
+
+    // The last query row with no key of its own: position 256 in a 256-key buffer.
+    // Accepted at 255, because the query at 255 has its key at 255.
+    try testing.expectEqual(Error.ShapeTooLarge, forwardBounds(c_t, c_t, c_t, 1).?);
+    try testing.expectEqual(@as(?Error, null), forwardBounds(c_t, c_t - 1, c_t, 1));
+
+    // A position before the start of the sequence.
+    try testing.expectEqual(Error.ShapeTooLarge, forwardBounds(c_t, -1, c_t, 1).?);
+
+    // A position past the end of it, at magnitudes where `q_offset + t` overflows
+    // `c_int`. Under ReleaseFast the old sum wrapped negative, `negative > n_keys` was
+    // false, and this returned null -- a shape the caller would have launched at a
+    // ~2^31 row offset. Debug would have panicked on the add instead, so the defect
+    // showed up as a crash in one build and a wrong answer in the other, which is the
+    // worst shape a bounds check can have. Both of these are refused now, and neither
+    // input is reachable in-tree: `model.zig` passes a literal 0 and `decode.zig`
+    // passes `n_keys - 1` with `n_keys <= c_t`.
+    try testing.expectEqual(Error.ShapeTooLarge, forwardBounds(c_t, std.math.maxInt(c_int), 1, 1).?);
+    try testing.expectEqual(Error.ShapeTooLarge, forwardBounds(c_t, std.math.maxInt(c_int) - 1, 1, 2).?);
+    try testing.expectEqual(Error.ShapeTooLarge, forwardBounds(c_t, c_t + 1, c_t, 1).?);
 }

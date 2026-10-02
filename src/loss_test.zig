@@ -102,6 +102,39 @@ test "cross entropy rejects an empty batch instead of dividing by zero" {
     try std.testing.expectError(error.EmptyBatch, loss.forward(logits, &no_targets));
 }
 
+test "a non-finite logit is refused rather than returned as NaN" {
+    // `+inf` and NaN are separate mechanisms and both are here. `+inf` wins the row
+    // max, so `inf - inf` is NaN on the next line. NaN does NOT win it -- `@max`
+    // returns the other operand -- so a row of finite logits with one NaN in the
+    // middle has a perfectly finite `max`, and the `sum` takes `@exp(NaN)` further
+    // down. Testing the max alone would have missed the second one entirely.
+    //
+    // The target sits on a finite column in both, so the only thing that can produce
+    // an error is the finiteness check and not the existing range checks.
+    var logits = try Tensor.init(std.testing.allocator, 1, 3);
+    defer logits.deinit();
+    const targets = [_]u32{0};
+
+    logits.set(0, 1, std.math.inf(f32));
+    try std.testing.expectError(error.NonFiniteLogits, loss.forward(logits, &targets));
+
+    logits.set(0, 1, std.math.nan(f32));
+    try std.testing.expectError(error.NonFiniteLogits, loss.forward(logits, &targets));
+
+    // A NaN where it is NOT the maximum is the case a `std.math.isFinite(max)` check
+    // would have let through, so it is spelled out rather than left implicit.
+    logits.set(0, 1, std.math.nan(f32));
+    logits.set(0, 2, std.math.inf(f32));
+    try std.testing.expectError(error.NonFiniteLogits, loss.forward(logits, &targets));
+
+    // And the row is left as it was found, so the next row of a real batch is not
+    // refused by a stale NaN from this one.
+    logits.set(0, 0, 0);
+    logits.set(0, 1, 0);
+    logits.set(0, 2, 0);
+    try std.testing.expectApproxEqAbs(1.0986122886681098, try loss.forward(logits, &targets), ln_ulp);
+}
+
 test "raising the target logit lowers the loss" {
     var logits = try Tensor.init(std.testing.allocator, 1, 3);
     defer logits.deinit();

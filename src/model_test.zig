@@ -501,21 +501,38 @@ const Recorder = struct {
     }
 };
 
-test "a null sink runs the same arithmetic as no sink at all" {
+test "a live sink observes the pass without perturbing it" {
     var p = try model.initParams(std.testing.allocator, two_layers, 5);
     defer p.deinit();
     const tokens = [_]u32{ 1, 2, 3, 4 };
 
     var plain = try model.forward(std.testing.allocator, p, two_layers, &tokens);
     defer plain.deinit();
-    var through_sink = try model.forwardWith(std.testing.allocator, p, two_layers, &tokens, null);
+
+    // A REAL sink. `model.forward` is `return forwardWith(..., null)`, so an
+    // earlier version of this test handed both arms a null sink and compared
+    // `forwardWith(..., null)` against `forwardWith(..., null)`: a value against
+    // itself, which passes for any arithmetic at all. It could not see the one
+    // thing it was named after -- a live sink perturbing the pass, either
+    // through the `probs` allocation inside `attention.forwardWith` or through
+    // a `Sink.put` that wrote through a bad pointer. That is the failure the
+    // parity sink carries, and it is the thing grading the block against
+    // external, so the blind spot was on the load-bearing path.
+    var rec: Recorder = .{};
+    var through_sink = try model.forwardWith(std.testing.allocator, p, two_layers, &tokens, rec.asSink());
     defer through_sink.deinit();
 
-    // Bit for bit, not within a tolerance. The sink is read on no path in the
+    // First: the sink really was live on that pass. Without this the comparison
+    // below would again be two null runs if `rec.asSink()` ever returned null.
+    try std.testing.expectEqual(@as(usize, 16 * two_layers.n_layers + 2), rec.seen);
+
+    // Bit for bit, not within a tolerance and not `==`. `expectSameBits` reads
+    // the two tensors as raw u32, so a sink that perturbed the pass has to move
+    // a bit rather than merely a value: `+0.0 == -0.0` and `NaN != NaN` would
+    // both slip past a value comparison. The sink is read on no path in the
     // arithmetic, so a difference here is not a numerical question at all: it
     // means the plumbing changed what the pass computes.
-    try std.testing.expectEqualSlices(f32, plain.rowConst(0), through_sink.rowConst(0));
-    for (0..plain.rows) |r| try std.testing.expectEqualSlices(f32, plain.rowConst(r), through_sink.rowConst(r));
+    try expectSameBits(plain, through_sink);
 }
 
 test "the sink reports every intermediate, once per layer" {

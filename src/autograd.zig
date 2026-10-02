@@ -670,6 +670,14 @@ pub fn attentionBackward(
     {
         return error.DimensionMismatch;
     }
+    // `dout` is the one input the forward has no counterpart for, so nothing above
+    // covers it and there is nothing to mirror. Every `dq` write below reaches
+    // `dout.rowConst(t)[h * dim ..][0..dim]`, so a `dout` narrower than one head row
+    // reads past its own buffer and panics inside `rowConst` rather than coming back
+    // as an error. Same error as the shapes above, because it is the same mistake.
+    if (dout.rows != q.rows or dout.cols < cfg.n_heads * cfg.head_dim) {
+        return error.DimensionMismatch;
+    }
     const dim = cfg.head_dim;
     const group = cfg.n_heads / cfg.n_kv_heads;
     // Four of the six loops below are unrolled this many ways, and it is the

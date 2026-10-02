@@ -39,7 +39,7 @@ const csv_pending_path = "outputs/loss.pending.csv";
 /// updating the one `verify` checks leaves `train` permanently unable to
 /// promote. So when the claim changes, this is the line that changes, and the
 /// `verify` digest check follows from it rather than needing a second edit.
-pub const csv_sha256 = "f1dd54445064810c28002dcacaf23b4bc82bb1e6ecfa28f5ed91e7fa4518f792";
+pub const csv_sha256 = "7d7bcbd8f7a2e67ad9b29c344d60a3d95e37bc14e85ba379f52adb4f72cb6160";
 /// How a reader says "I have looked at the two curves and I know why they
 /// differ" without promoting anything. A presence check, not a value check: any
 /// value acknowledges, because the act is the reader's and the content of the
@@ -64,7 +64,32 @@ const n_merges = 200;
 /// the smoke run's own wall time includes the build check and the tokenization,
 /// neither of which divides into a per-step rate, so a total derived from one
 /// would be wrong in a way nothing in the run would reveal.
-const corpus_bytes = 65536;
+const corpus_bytes_default: u32 = 65536;
+
+/// The corpus size one run trains on: the shipped 64 KiB, or less when
+/// `ZTRANSFORMER_CORPUS_BYTES` asks for a short pass. The variable exists because
+/// a determinism gate costing seven minutes is a gate nobody runs, and because
+/// what is under test -- two runs of one seed produce the same bytes -- is a
+/// property of the arithmetic and not of how long it took.
+///
+/// Read once per run rather than per window, so a run cannot change its own
+/// corpus size partway through and produce a curve that is neither. It only ever
+/// shrinks: a value above the default is clamped, because a check that can widen
+/// the corpus is a check that can be made slow by accident, and a slow check is a
+/// skipped check. An unparseable value falls back to the default rather than
+/// failing, on the same grounds as `ZTRANSFORMER_ACCEPT_LOSS_DIFFERENCE`: a typo
+/// must not read as a deliberate short run.
+/// Through the `Environ` map `runTrain` already carries, NOT `std.c.getenv`.
+/// The libc route would make every binary that links this file pull in libc, and
+/// `exe`, `train_exe` and `dbg_train_exe` all deliberately do not link it -- so
+/// reading one more variable that way would have changed the link of the binary
+/// every published number depends on, to obtain something the file already had.
+fn corpusBytes(environ: *std.process.Environ.Map) u32 {
+    const raw = environ.get(corpus_bytes_var) orelse return corpus_bytes_default;
+    const parsed = std.fmt.parseInt(u32, raw, 10) catch return corpus_bytes_default;
+    return @min(parsed, corpus_bytes_default);
+}
+const corpus_bytes_var = "ZTRANSFORMER_CORPUS_BYTES";
 const epochs = 1;
 /// The same seed `train_test.zig` measures on, so a run here and a run there
 /// agree.
@@ -117,14 +142,15 @@ fn runTrain(
     environ: *std.process.Environ.Map,
 ) !void {
     const whole = try Io.Dir.cwd().readFileAlloc(io, corpus_path, arena, .unlimited);
-    // `@min`, not a bare slice. `corpus_bytes` is a cap, and a cap that is
-    // longer than the file is a cap that reads past the end: the checked build
-    // panics, and `zig build train` links a ReleaseFast binary where the bounds
-    // check is elided, so the slice silently becomes 64 KiB of whatever follows
-    // the allocation and the run trains on it. The vendored corpus is 1.1 MB so
-    // this never fires today, which is exactly why it survived: the only way to
-    // see it is to hand the binary a small file.
-    const text = whole[0..@min(whole.len, corpus_bytes)];
+    // `@min`, not a bare slice. The cap is a cap, and a cap that is longer than
+    // the file is a cap that reads past the end: the checked build panics, and
+    // `zig build train` links a ReleaseFast binary where the bounds check is
+    // elided, so the slice silently becomes 64 KiB of whatever follows the
+    // allocation and the run trains on it. The vendored corpus is 1.1 MB so this
+    // never fires today, which is exactly why it survived: the only way to see
+    // it is to hand the binary a small file -- and now
+    // `ZTRANSFORMER_CORPUS_BYTES` is one more way, so the `@min` matters twice.
+    const text = whole[0..@min(whole.len, corpusBytes(environ))];
     var tk = try tokenizer.Tokenizer.init(arena);
     try tk.train(text, n_merges);
     const ids = try tk.encode(arena, text);
@@ -205,16 +231,17 @@ fn runTrain(
 /// The threshold was built and then refuted by this repository's own two cases.
 /// A budget of `steps * f32_epsilon * max_loss` — one f32 ulp per step, added,
 /// which is what `src/README.md` documents — is 9.5e-5 on the committed curve.
-/// `optim.AdamW.beta1` at 0.85 instead of 0.9 lands 1667x outside it, so that
-/// case is caught. A Debug build of the identical source lands 189x outside it,
-/// at step 74, and the run is fine. Worse, its disagreements are 39507, 6119,
-/// -51706, 3219 and 9508 ulp at successive rows: not growing, not shrinking,
-/// changing sign. That is trajectory chaos, where a one-ulp difference in an
-/// early weight changes every weight after it, and it is unbounded in the step
-/// count in a way no additive bound can express. A threshold between the two
-/// cases would have to be 0.018 to 0.158 wide, which is a chosen constant
-/// wearing a derivation's clothes, and it would move with the seed, the host's
-/// libm, and the length of the run.
+/// `optim.AdamW.beta1` at 0.85 instead of 0.9 lands 2154x outside it, so that
+/// case is caught. The other host's libm lands 189x outside it, at step 74, and
+/// that run is fine. Worse, its rows disagree by -31971, -4635, +37696, -2288
+/// and -6648 f32 ulp: not growing, not shrinking, changing sign. An f32 ulp at a
+/// magnitude near 6 is 2^-21, four times the 2^-23 `floatEps(f32)` returns, so
+/// those are the ulp of the values and not of the budget's unit. That is
+/// trajectory chaos, where a one-ulp difference in an early weight changes every
+/// weight after it, and it is unbounded in the step count in a way no additive
+/// bound can express. A threshold between the two cases would have to be 0.018
+/// to 0.205 wide, which is a chosen constant wearing a derivation's clothes, and
+/// it would move with the seed, the host's libm, and the length of the run.
 ///
 /// So the default is loud. A mismatch is a discrepancy the reader has not yet
 /// explained, and this tool does not have the information to explain it: it can

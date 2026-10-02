@@ -32,8 +32,26 @@ pub fn forward(logits: Tensor, targets: []const u32) !f64 {
         // to zero probability, which a single large logit is enough to cause.
         // v_count is at least 1 here, because the bounds check above rejects
         // every target when the vocabulary is empty.
+        //
+        // The finiteness check is fused into the max pass because `@max` DROPS a NaN:
+        // it returns the other operand, so a row holding one NaN among finite logits
+        // still produces a finite `max`, and the `sum` below then takes `@exp(NaN)`.
+        // Testing `max` afterwards would not have seen it. `+inf` needs no such
+        // subtlety -- it wins the max, and `inf - inf` is NaN on the next line -- but
+        // both arrive the same way and from the same place, which is upstream of this
+        // function: a logit that overflowed f32 on its way out of the tied head.
+        //
+        // This used to be caught by `train.run` alone, one caller of three, and it
+        // returns NaN here rather than an error, so `gradcheck`'s central differences
+        // and the seam gate's comparison both consumed it silently. Fusing costs no
+        // extra pass and no extra rounding: for a finite row, max is the same value in
+        // the same order as the `row[1..]` loop this replaced.
         var max = @as(f64, row[0]);
-        for (row[1..]) |z| max = @max(max, @as(f64, z));
+        for (row) |zr| {
+            const z: f64 = zr;
+            if (!std.math.isFinite(z)) return error.NonFiniteLogits;
+            max = @max(max, z);
+        }
         var sum: f64 = 0;
         for (row) |z| sum += @exp(@as(f64, z) - max);
         total += max + std.math.log(f64, std.math.e, sum) - @as(f64, row[t]);

@@ -28,6 +28,25 @@ TWIN=$SCRATCH/attn_twin
 OBJ=$SCRATCH/attn.o
 BIN=$SCRATCH/attn
 
+# This script prints a speedup table, and a speedup is a ratio whose denominator
+# is one CPU call. So refuse to produce one on a host that would contaminate it,
+# naming the condition rather than quietly recording the contention as a result.
+#
+# The escape hatch is for the half of this run that is not a measurement at all:
+# parity against the CPU twin is exact arithmetic and does not care what else is
+# running. Someone who wants only that should not have to wait for the card.
+if ! sh "$ROOT/tools/host-clean.sh"; then
+    if [ "${ATTN_ALLOW_DIRTY_HOST:-0}" = "1" ]; then
+        echo "attn: ATTN_ALLOW_DIRTY_HOST=1, so continuing on a host this" >&2
+        echo "      repository would refuse. Every timing in the output below is" >&2
+        echo "      contaminated and the ratio beside it measures the contention." >&2
+    else
+        echo "attn: refusing to run. Re-run when the host is clean, or set" >&2
+        echo "      ATTN_ALLOW_DIRTY_HOST=1 if you want the parity result only." >&2
+        exit 1
+    fi
+fi
+
 cleanup() {
     rm -rf "$SCRATCH"
 }
@@ -157,9 +176,12 @@ if [ "$distinct" -ne 4 ]; then
 fi
 echo "attn: ...and all four signatures differ, so they are four different defects"
 
-echo "attn: the backward kernel exists and is graded, but NOTHING in this file is"
-echo "      wired into zig build train. A KV cache exists (src/kv_cache.zig, five"
-echo "      tests) and nothing decodes through it: there is no generation loop, so"
-echo "      the forward kernel's q_offset is exercised only by this benchmark at"
-echo "      q_offset 0, which is the training shape. The external parity"
+echo "attn: the backward kernel exists and is graded, and BOTH halves now run on the"
+echo "      GPU inside a real training step: src/model.zig's cuda_attn routes the"
+echo "      forward and the backward through this file, and 'zig build cuda-attn-check'"
+echo "      grades that path against attention.forward and attentionBackward on a real"
+echo "      step's tensors. A KV cache exists (src/kv_cache.zig, six tests) and"
+echo "      src/decode.zig decodes through it: decode.cudaAttnStep derives q_offset ="
+echo "      pos from the cache itself, so the forward kernel's offset is exercised at"
+echo "      every real decode position and not only at 0. The external parity"
 echo "      comparison still runs entirely on the CPU."
