@@ -368,7 +368,8 @@ __global__ void fusedAttnForward(const float *__restrict__ q, // [T, n_heads*dim
 // It also produces the three per-row scalars the other kernel needs: the row
 // max `m`, the softmax denominator `denom`, and `delta = sum_s probs * d_probs`,
 // which is the softmax Jacobian's other half. The reference accumulates that sum
-// inline as `dot_pp` (autograd.zig:733); it is the same real number as the
+// inline as `dot_pp` (`autograd.zig`'s `var dot_pp: f64 = 0`); it is the same
+// real number as the
 // rowsum-of-dout-times-out that a flash backend precomputes, and precomputing is
 // what makes the split into two kernels possible at all, because it turns an
 // unbounded prefix reduction into a length-dim row reduction that can be written
@@ -429,7 +430,8 @@ __global__ void attnDqKernel(const float *__restrict__ q,    // [T, H*dim]
     // with pu[s] = exp(score - running max), i.e. p before the divide. Both sums
     // rescale by the same `corr` as the max does, so the online form carries
     // unchanged. `scale` rides on each term rather than being factored out of the
-    // sum, because autograd.zig:754 writes it that way on purpose.
+    // sum, because the reference's `probs[s + u] = dot[u] * scale` writes it that
+    // way on purpose.
     float a0 = 0.0f;
     float a1 = 0.0f;
 
@@ -524,12 +526,14 @@ __global__ void attnDqKernel(const float *__restrict__ q,    // [T, H*dim]
 // three-run reproducibility rests on.
 //
 // The accumulators are f32, and that is NOT a shortcut. The reference narrows
-// each term to f32 before adding (autograd.zig:775), so an f64 register here
+// each term to f32 before adding (the reference's `d_probs[s + u] = acc[u];`), so
+// an f64 register here
 // would not be more accurate against the reference, only different from it, by
 // the 1.4e-6 that a 8192-long f32 chain carries.
 //
 // The loop nest is h-outer, t-inner, which is the reference's own order
-// (autograd.zig:677 outer over h, :767 inner over s accumulating into dk). That
+// (`autograd.zig`'s outer `for (0..cfg.n_heads)` and its `var s: usize = 0`
+// nest, which accumulates into dk). That
 // is deliberate: keeping it means the chain is not merely a permutation but the
 // same chain, and it costs nothing here because k[s] and v[s] are staged once
 // and stay live for the whole nest.
@@ -570,7 +574,8 @@ __global__ void attnDkDvKernel(const float *__restrict__ q,    // [T, H*dim]
 
     // BROKEN 1 walks the PREFIX instead of the suffix. This is the single most
     // likely defect in this kernel, because the reference's dk loop is written
-    // with t outside and s inside (autograd.zig:677, :767) and reads as a prefix
+    // with t outside and s inside (`autograd.zig`'s `for (0..cfg.n_heads)` over
+    // its `var s: usize = 0` loop) and reads as a prefix
     // at a glance, and because at s = 0 the two directions coincide, so position
     // zero -- the row a naive reader checks first -- is exactly right.
     const int t_first = (BROKEN == 1) ? 0 : s;
@@ -602,7 +607,7 @@ __global__ void attnDkDvKernel(const float *__restrict__ q,    // [T, H*dim]
             const float p_ds = (BROKEN == 3) ? p : (p * (dotp - del));
 
             adk += p_ds * qt[c] * scale;
-            adv += p * dt[c]; // NOTE: dv carries no scale. autograd.zig:782.
+            adv += p * dt[c]; // NOTE: dv carries no scale -- the reference's `dv_row[...] +=` does not either.
         }
     }
 
@@ -835,7 +840,18 @@ int zt_attn_forward(const float *q, const float *k, const float *v, float *out, 
     // it now. The bound is `q_offset + T > n_keys`, not `>=`: with exactly
     // `q_offset + T` keys the last query's own key sits at `q_offset + T - 1` and IS
     // visible, and refusing that would refuse the ordinary training shape.
-    if (q_offset < 0 || n_keys < 1 || q_offset + T > n_keys) {
+    //
+    // Written as `q_offset > n_keys - T` rather than as that sum, and the reason is
+    // that the sum is the bug: both operands are `int`, so `q_offset = INT_MAX` and
+    // `T = 1` wraps to `INT_MIN`, the comparison is false, the guard admits the call,
+    // and the kernel then computes `last = min(n_keys, INT_MIN)` -- zero tiles, a
+    // zero denominator, and `acc / lrun` storing NaN with a 0 return. That is this
+    // comment's own failure, reached through the check written to prevent it. The two
+    // clauses left of it are what makes the subtraction safe: `q_offset >= 0` and
+    // `n_keys >= 1` both hold before the third is evaluated, and `n_keys - T` is then
+    // computable without ever forming a sum that can overflow. `device.zig`'s
+    // `forwardBounds` compares the same way and says so.
+    if (q_offset < 0 || n_keys < 1 || q_offset > n_keys - T) {
         fprintf(stderr, "zt_attn: q_offset %d, n_keys %d is not launchable.\n", q_offset, n_keys);
         return 1;
     }

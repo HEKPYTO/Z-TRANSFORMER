@@ -15,6 +15,7 @@ const std = @import("std");
 const model = @import("model.zig");
 const autograd = @import("autograd.zig");
 const data = @import("data.zig");
+const profile = @import("profile.zig");
 const loss = @import("loss.zig");
 const optim = @import("optim.zig");
 const tensor = @import("tensor.zig");
@@ -178,8 +179,21 @@ pub fn run(
 
     for (0..cfg.epochs) |_| {
         while (true) {
+            // FIRST probe of the iteration, before anything is allocated. Every
+            // `defer` in this body fires at the closing brace, which is AFTER the
+            // last probe below, so without this row the previous step's loop
+            // -- `Cache.deinit` alone frees eleven tensors per block -- would
+            // land in `fetch`, and the row would be named after something other
+            // than what it measures.
+            if (profile.active) |pr| pr.stop(.loop);
             var batch = (try batcher.next()) orelse break;
             defer batch.deinit();
+            // Each probe closes the gap since the previous one and names what
+            // it was spent on, so the reading that ends one op opens the next
+            // and nothing is counted twice. `active` is null unless
+            // `ZTRANSFORMER_PROFILE=1`, so the committed curve takes a null check
+            // and no clock read at all.
+            if (profile.active) |pr| pr.stop(.fetch);
 
             // The one forward pass, handing its intermediates to the backward
             // pass as they are produced. `model.forward` plus a backward that
@@ -189,7 +203,9 @@ pub fn run(
             defer cache.deinit();
             var logits = try model.forwardWith(allocator, params, cfg.model, batch.inputs, &cache.sink);
             defer logits.deinit();
+            if (profile.active) |pr| pr.stop(.forward);
             const batch_loss = try loss.forward(logits, batch.targets);
+            if (profile.active) |pr| pr.stop(.loss);
             // Checked before the loss is used, not after. A non-finite loss is
             // already a non-finite gradient, and the row it would be logged
             // into is a NaN that reads like a measurement. Stopping here is
@@ -200,7 +216,9 @@ pub fn run(
             epoch_loss_sum += batch_loss;
             var dlogits = try autograd.dLossDLogits(allocator, logits, batch.targets);
             defer dlogits.deinit();
+            if (profile.active) |pr| pr.stop(.dlogits);
             try autograd.backwardFrom(allocator, params, &grads, cfg.model, batch.inputs, dlogits, &cache);
+            if (profile.active) |pr| pr.stop(.backward);
 
             // One global norm over every tensor, so the cap is the whole model's
             // and not a per-tensor budget. The norm is checked but not logged:
@@ -213,10 +231,12 @@ pub fn run(
             // parameter. Caught here, where the run can still be abandoned with
             // the weights intact.
             const norm = optim.clipByNorm(flat_grads, cfg.max_grad_norm);
+            if (profile.active) |pr| pr.stop(.clip);
             if (!std.math.isFinite(norm)) return error.NonFiniteGradient;
             const at = step;
             const lr = optim.cosineLR(@intCast(at), total, warmup, cfg.lr);
             for (flat_params, flat_grads, states) |*p, g, *s| try s.step(p, g, lr, cfg.weight_decay);
+            if (profile.active) |pr| pr.stop(.adam);
             // `backward` accumulates, so the buffers are cleared every step and
             // not once per epoch: otherwise every step after the first adds its
             // gradient to the whole history behind it.
@@ -228,6 +248,7 @@ pub fn run(
             // `flatten` on every step to rebuild it. Clearing the bytes the
             // view already names removes both problems, and cannot fail.
             for (flat_grads) |*g| g.fill(0);
+            if (profile.active) |pr| pr.stop(.zero);
 
             step = at + 1;
             in_epoch += 1;
@@ -247,6 +268,7 @@ pub fn run(
         // The stream is exhausted, so the epoch is over: measure validation,
         // put it on the row the epoch ended on, and reshuffle for the next one.
         val_loss = try evalLoss(allocator, params, cfg.model, &val_batcher);
+        if (profile.active) |p| p.stop(.eval);
         rows.items[rows.items.len - 1].val_loss = val_loss;
         val_batcher.reset();
         batcher.reset();

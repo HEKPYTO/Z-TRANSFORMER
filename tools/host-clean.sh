@@ -89,9 +89,23 @@ if [ "$mem" -gt "$max_gpu_mem_mib" ]; then
     failed=1
 fi
 
-load=$(awk '{print $1}' /proc/loadavg)
+# Guarded the same way the GPU read above is, and for the same reason: an
+# unreadable /proc/loadavg, or a host with no awk, leaves this empty, and
+# `[ "" -gt N ]` is an arithmetic error inside an `if`, which is simply false.
+# So the check passes having read nothing, and a host that was never measured is
+# reported as a clean bill of health. An audit found the GPU read already guarded
+# and these two not.
+load=$(awk '{print $1}' /proc/loadavg 2>/dev/null || true)
 load_whole=${load%%.*}
-if [ "$load_whole" -gt "$max_load" ]; then
+case "$load_whole" in
+    '' | *[!0-9]*)
+        echo "host-clean: /proc/loadavg did not yield a number (got '${load}')." >&2
+        echo "  A load average this script cannot read is not a load average of" >&2
+        echo "  zero. Refusing rather than reporting a host it never measured." >&2
+        failed=1
+        ;;
+esac
+if [ -n "$load_whole" ] && [ "$load_whole" -gt "$max_load" ]; then
     echo "host-clean: load average is ${load} and the ceiling is ${max_load}." >&2
     echo "  Every cpu_us here is a minimum over calls, so contention inflates it" >&2
     echo "  without bound and taking the minimum does not hide that." >&2
@@ -106,6 +120,16 @@ fi
 # because this script is itself run from inside a build step and would otherwise
 # match its own parent and refuse every clean host.
 siblings=$(pgrep -f 'ztransformer-train|ztransformer-cuda-train|ztransformer-dbg-train|attn_twin|norm_twin' 2>/dev/null | wc -l | tr -d ' ')
+siblings=${siblings:-0}
+# Same guard as the load read: no procps means no pgrep, the pipeline yields
+# nothing, and an empty `-gt 0` is false rather than a measurement of zero.
+case "$siblings" in
+    '' | *[!0-9]*)
+        echo "host-clean: pgrep did not yield a process count." >&2
+        echo "  A sibling count this script cannot read is not a count of zero." >&2
+        failed=1
+        ;;
+esac
 if [ "$siblings" -gt 0 ]; then
     echo "host-clean: ${siblings} training or benchmark processes are resident." >&2
     echo "  This host runs one job at a time. A second one makes the first's CPU" >&2

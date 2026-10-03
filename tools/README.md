@@ -71,6 +71,18 @@ one when both exist, so the pin is what actually runs.
 `oracle.txt` is the whole oracle: it reads the export, builds the reference, and writes
 `report.csv`. It is never imported by the shipped binary and nothing in `src/` imports it.
 
+It is also never EXECUTED by `zig build verify`, and the consequence is worth stating because it
+is a hole rather than a convention. `verify` reads the committed `report.csv`; it does not run the
+program that wrote it. So a defect that lives only in Python -- a syntax error, a wrong tensor
+name, a hook that never fires -- reaches a green `verify` untouched, and the first thing that sees
+it is this script. The loss curve has the same shape of gap, and `zig build determinism` does not
+close it either: that step runs two passes and requires them to agree with EACH OTHER, so it catches
+code that stopped reproducing its own output, while `loss_csv` hashes the committed FILE and so
+catches an edited curve. Nothing in the graph re-derives that curve from the current source, and
+AGENTS.md says so. Both gaps are open for the same reason -- the step that would close either one
+is a `python3` invocation or a full re-derivation, and neither is in the graph. A Python-only
+defect is therefore found by RUNNING `check.sh`, not by reading `verify`'s exit code.
+
 `check.sh` is the entry point, and the only place the two halves meet. It also runs
 `zig build removed-digest` over the report the oracle just wrote, which is the only thing that checks
 that report against the digests `build.zig` holds. The step does both halves in one script and prints
@@ -166,7 +178,7 @@ the second implementation agreeing with itself that this whole harness exists to
 And sensitivity, which is worth stating precisely rather than in the abstract. The sweep shape was
 chosen for legibility — `d_model` 64 over four heads of 16 keeps every tensor small enough to read.
 Measured at that shape by `sh tools/removed/sensitivity.sh`: perturbing one element of `wq` by 1e-3
-fails 20 of the 204 compared rows, and scaling the whole 4096-element block by 1.001 still fails 18. All
+fails 20 of the 204 compared rows, and scaling the whole 4096-element block by 1.001 still fails 18 -- 18 ROWS both times, spread over 9 and 7 distinct gates respectively. The "18 gated tensors" in the next sentence is a different 18: gates, not rows, and reached by the sweep as a whole rather than by either case alone. All
 seven perturbations are caught, and across the sweep all 18 gated tensors move under some perturbation
 — a gate that never moved would be present but unexercised, and the script fails on that rather than
 reporting it. A tenth of a percent is inside this harness's reach. What
@@ -256,17 +268,46 @@ this set the choice cost nothing measured. `MUTATION_MODE=verify` runs both conf
 badly written and nothing about the suite, so it is reported separately and never folded into the
 headline. `SURVIVED` is the rest, and each survivor is classified in the output rather than counted,
 because a survivor that is behaviourally identical is not a hole in the suite and one that moves the
-numbers is. At HEAD, 16 of 18 caught, by between 1 and 21 tests each:
+numbers is.
+
+**Measured `2026-10-03`: caught 15 of 18, on both hosts.** `6272360` on the development machine and
+`f79a59a` on the Linux host of record, which is the platform family CI runs on. Same fifteen,
+same three survivors, on both. The three are classified below, and all three are equivalent or below
+the gates, so none of them is a hole in the suite -- which is what makes the CI floor a measurement
+rather than a guess carried from one host to another.
+
+Getting there took two fixes, and the second is the one worth remembering.
+
+**Three patterns had gone stale**, because they were anchored on code that was rewritten. `matmul-f64-acc`
+still described the scalar accumulator `src/tensor.zig` had before the eight-lane rewrite; `norm-f32-acc`
+pinned the justification comment above `rms`, which was rewritten when the 4096-wide row it argued from was
+disowned by `norm_test.zig`, so it stopped matching a block of arithmetic that never changed; and
+`loss-no-rowmax` described a loop reading `row[1..]` that gained a finiteness guard. All three are
+re-anchored on the code as it stands. `norm-f32-acc` is deliberately anchored on two lines rather than
+spanning the comment and the `rms` line, so a future comment edit cannot stale it again.
+
+**The classifier was mis-scoring caught mutants as errors**, and that is why an earlier measurement
+reported `caught 0 of 18` and looked like a dead harness. The `caught` branch matched Zig's summary line
+with `run test [0-9]* pass, [1-9][0-9]* fail`, which requires `pass` and `fail` to be adjacent. They are
+not, whenever anything is skipped, and on this tree something always is -- two tests are gated behind
+`comptime model.cuda_attn`, so every line reads `224 pass, 2 skip, 2 fail`. The pattern therefore never
+matched, and every mutation that a test actually caught fell through to the `error` branch. A log full of
+`error: '...' failed` was being reported as broken machinery. The skip count is optional in the output and
+the pattern now says so.
+
+Both were worth fixing for the same reason: each one produced a number a reader would believe, and the
+number was wrong.
 
 | Mutation | Class | What it means |
 |---|---|---|
-| `clip-ge` | **equivalent, provably** | The two differ only when the norm equals the limit exactly, where the scale is `max / norm = 1` exactly and every element is multiplied by `1.0`. A bit-for-bit identical run, not a close one. No test can ever catch it, and one that tried would assert nothing. |
-| `norm-reassociate` | **below the gates** | `v / rms * w` and `v * w / rms` differ only in rounding, and every assertion in the suite is looser than that rounding. Catching it means pinning one f32 rounding rather than the function. |
+| `clip-ge` | **equivalent, provably** | The two differ only when the norm is exactly equal to `max_grad_norm`, where the scale is exactly 1 and every element is multiplied by 1.0. A bit-for-bit identical run, not a close one. |
+| `loss-no-rowmax` | **equivalent, algebraically** | `loss.forward` adds `max + log(sum(exp(z - max))) - target`. Seeding `max` with 0 instead of the row maximum shifts every term and they cancel: a max of `max - c` multiplies the sum by `e^c`, which adds `c` to its logarithm, and the explicit `-c` takes it straight back out. |
+| `norm-reassociate` | **below the gates** | `v / rms * w` and `v * w / rms` differ only in rounding, and every assertion here is looser than that rounding. Catching it means pinning one f32 rounding rather than the function. |
 
-`matmul-f64-acc` and `norm-f32-acc` were on that list and are not any more. Both are caught now, by
-one test each, so neither is a hole and neither is described here. A survivor table is a claim about
-the suite at one commit, and it is wrong the moment a test lands, which is why the numbers above are
-copied out of the harness's own output rather than kept in step by hand.
+A survivor table is a claim about the suite at one commit, and it is wrong the moment a test lands — which
+is why these numbers come from the harness's own output rather than being kept in step by hand. All three
+classes above are printed by the run itself, with the proof, in `run.sh`'s classification arm for each.
+
 
 ### Why it is a Zig program and not a sed line
 
@@ -348,3 +389,22 @@ host that refuses to produce a contaminated one.
 | VRAM ceiling | Above this host's resting desktop baseline rather than at zero. A GUI session moves between roughly 250 and 1050 MiB depending on what is drawn, so a ceiling below that reports a clean host as busy whenever a window repaints. |
 | Sibling match | The pattern names the training and benchmark binaries, not `zig build`, because this runs from inside a build step and would otherwise match its own parent. |
 | Necessary, not sufficient | The `ctx256` bimodality in `outputs/bench/ctx256-sweep.csv` was measured on a host this script calls clean, and is still a 1.7384x gap with nothing between two tight clusters. A green `host-check` says the machine was idle, not that the number is reproducible; the sweep says which statistic to trust. |
+
+## Step profile
+
+`sh tools/step-profile.sh <ztransformer-train binary>`, or `zig build step-profile`, times each op
+kind in a training step and checks two things of the result. One run gives: `backward` at 77% of a
+step, `forward` at 19%, and every other op at most 1.21% individually.
+
+It is a file rather than a `sh -c` blob in `build.zig` for the same reason the two scripts above are:
+a gate has to be breakable on purpose and readable on its own. Every failure it raised while it was
+an argv string was unreadable, because the whole script printed inside zig's `failed command` line
+and its own stderr never got out. `sh -x tools/step-profile.sh <bin>` now shows all of it.
+
+| | |
+|---|---|
+| Control 1 — the denominator | `SPAN > SUM`, compared as the two integers the table prints. **This check is close to an arithmetic identity and is documented as such**: the probes partition `[first probe, finish]`, so `bucketSum <= span` holds for any placement, count or naming, and the only thing that can fail it is `denominatorNs` returning `bucketSumNs`. It cannot detect a mis-placed probe. |
+| Placement control — the one that bites | Asserts `loop` carries real time and `fetch` is smaller than `loop`. `loop` is the frees, the counters and the row append; `fetch` is the batch shuffle. Added because `fetch` once read **0.310% of a step while measuring the previous step's four `defer`s** — Zig runs `defer` at the scope's closing brace, after the last op and before the next one — and every other check passed throughout. A person reading the loop caught it; no gate did. |
+| Expected refusal | A short profiled run *must* be refused: two rows cannot match the committed curve's five-row digest — 123 is its step count, not its row count — so `settleCsv` exits 1 with `error.CurveShape`. The predicate is "did the profiler print a table", not "did the curve match". |
+| Control 2 — they move | Two runs at 16384 and 49152 bytes: identical per-step arithmetic, three times the steps, so the fixed per-RUN cost is amortised further and the per-step ops take a larger share. `backward` moves about 77% to 82%. `eval` moves 0.01 points and is **not** the mechanism. The 0.5-point threshold sits under the ~5 the arithmetic predicts. |
+| Not in `verify` | These are times. A threshold on a time is a property of the machine and the hour. What is checked is a shape — the denominator and the movement — and both hold on a loaded host as much as an idle one. |

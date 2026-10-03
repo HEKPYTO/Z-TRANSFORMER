@@ -139,13 +139,13 @@ test "generate refuses what it cannot do instead of guessing" {
 // WHERE IT RUNS, and the CPU run is not asked to report a pass it did not earn.
 // Every build in the graph that links no CUDA object takes the else arm and returns
 // `error.SkipZigTest`, which the runner prints as `... SKIP` on its own line and
-// does NOT count as passed -- so `zig build test` reports 217 of 219 with two
+// does NOT count as passed -- so `zig build test` reports 226 of 228 with two
 // skipped, and neither skip is a silent pass.
 //
 // `zig build cuda-attn-check` is the one step that links `src/cuda/attn_kernels.cu`,
 // and it runs THIS test as well as the training gate: `build.zig` roots a second test
 // artifact at this file and makes the step depend on both, rather than rooting the
-// step at `src/tests.zig` and re-running all 219 against a CUDA-linked binary. Both
+// step at `src/tests.zig` and re-running all 228 against a CUDA-linked binary. Both
 // halves fail while `src/model.zig:cuda_attn` is false, so the step cannot pass
 // without having measured something.
 //
@@ -252,7 +252,17 @@ test "the CUDA decode step agrees with the CPU one over a filling cache" {
             // did, once, and the only reason it showed up is the negative control
             // that `src/cuda/run-attn.sh` runs and this file used to not.
             const row_base = q_cols + pos * 2 * kv_cols;
-            for (q.data, pos * q_cols..) |*e, i| e.* = fill(row_base + i);
+            // Row 0 only, rewritten in place every position. This used to slice
+            // `pos * q_cols..` across a ONE-row tensor, so pos 1 filled nothing
+            // (a slice at exactly len is empty) and pos 2 sliced past the end and
+            // panicked -- and the whole arm is comptime-dead while `cuda_attn` is
+            // false, so it compiled clean and would have failed the moment anyone
+            // followed the documented procedure and flipped the flag. Both sides read
+            // row 0 (`attnStep` at decode.zig:365, `cudaAttnStep` at :435) because
+            // the design is a one-token query, so row 0 is the only row to vary --
+            // and varying it per position is what makes this grade `q_offset` rather
+            // than the arithmetic.
+            for (q.data[0..q_cols], 0..) |*e, i| e.* = fill(row_base + i);
             var k_row: [kv_cols]f32 = undefined;
             var v_row: [kv_cols]f32 = undefined;
             for (0..kv_cols) |i| {

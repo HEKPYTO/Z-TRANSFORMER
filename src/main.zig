@@ -21,6 +21,7 @@ const train = @import("train.zig");
 const parity = @import("removed.zig");
 const scale = @import("scale.zig");
 const attn_bench = @import("attn_bench.zig");
+const profile = @import("profile.zig");
 
 const corpus_path = "data/tinyshakespeare.txt";
 const csv_path = "outputs/loss.csv";
@@ -192,8 +193,21 @@ fn runTrain(
         },
     );
 
+    // The per-op profiler is inert unless `ZTRANSFORMER_PROFILE=1`, so the
+    // committed curve always takes the null path and never reads a clock. It is
+    // created here because this is the one place holding both the `Io` and the
+    // environment map it needs; `train.run` reaches it through the module-level
+    // handle rather than an argument it would have to thread past a dozen tests.
+    const prof = try profile.enable(arena, io, environ);
+    profile.active = prof;
     var res = try train.run(gpa, cfg, corpus.train, corpus.val);
     defer res.deinit();
+
+    if (prof) |p| {
+        const measured = p.finish();
+        measured.writeTable();
+        profile.active = null;
+    }
 
     // Written beside the committed curve and moved onto it only on a match. A
     // run truncates its output, so writing `csv_path` directly replaced the

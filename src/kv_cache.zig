@@ -228,7 +228,7 @@ const testing = std.testing;
 test "the shipped shape holds 524288 bytes, which is what scale.zig costs" {
     // A `Cache`, built at the shipped shape, asked what it holds. The earlier
     // version of this test built none and called no `bytes()`: it transcribed
-    // `scale.zig:199` (`kv_cache = l * kv * T * 2 * 4`, `kv = n_kv_heads *
+    // `scale.zig`'s `kv_cache = l * kv * T * 2 * 4` term (`kv = n_kv_heads *
     // head_dim`) into three local constants and asserted that the arithmetic
     // worked. No edit to this file could fail it, which the comment at the time
     // admitted while the test's NAME and the file header's claim ("A test below

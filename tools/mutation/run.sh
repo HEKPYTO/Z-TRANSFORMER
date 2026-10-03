@@ -73,7 +73,18 @@ mode=${MUTATION_MODE:-release}
 case "$mode" in
     release) set_cmd="test -Doptimize=ReleaseFast" ;;
     debug)   set_cmd="test" ;;
-    *)       set_cmd="verify" ;;
+    verify)  set_cmd="verify" ;;
+    # Refuse rather than substitute. This used to fall through to `verify`, so a typo
+    # -- `MUTATION_MODE=ReleaseFast`, capitalised the way this repository spells that
+    # word everywhere else -- silently became eighteen mutations at full-verify cost,
+    # with nothing in the output saying the mode was not what was asked for. Every
+    # other unrecognised input here refuses: table-block.sh rejects a bad floor with
+    # exit 2, sensitivity.sh exits 2 when it cannot read its own gate count.
+    *)
+        echo "mutation: unknown MUTATION_MODE '$mode'." >&2
+        echo "  Expected one of: release, debug, verify." >&2
+        exit 2
+        ;;
 esac
 
 # A digest of the whole of src/ used to be taken here and compared after. It is
@@ -280,7 +291,14 @@ for name in $selected; do
     # that the mutant was never exercised at all.
     if (cd "$wt" && zig build $set_cmd) >"$log" 2>&1; then
         verdict=survived
-    elif grep -q 'run test [0-9]* pass, [1-9][0-9]* fail' "$log"; then
+    # The SKIP count is optional in Zig's own summary line and is printed whenever any
+    # test skips -- which on this tree is always, because two tests are gated behind
+    # `comptime model.cuda_attn`. The previous pattern demanded `pass, N fail`
+    # adjacently, so a line reading `224 pass, 2 skip, 2 fail` did not match and every
+    # genuinely-caught mutation fell through to `error` below. That is what made a
+    # Linux sweep report `caught 0 of 18` while the log plainly showed failing tests:
+    # the mutants WERE caught, and the harness scored them as broken machinery.
+    elif grep -qE 'run test [0-9]+ pass, ([0-9]+ skip, )?[1-9][0-9]* fail' "$log"; then
         verdict=caught
     elif grep -qE 'error: [0-9]+ compilation errors|error: the following command failed' "$log"; then
         verdict=unbuildable
@@ -350,6 +368,20 @@ if [ -n "$survivors" ]; then
                 echo "          in the suite. Catching it means a test that pins the exact order, which"
                 echo "          pins one f32 rounding rather than the function."
                 ;;
+            loss-no-rowmax)
+                echo "  class   EQUIVALENT, algebraically. loss.forward adds"
+                echo "          max + log(sum(exp(z - max))) - target, so seeding max with 0"
+                echo "          instead of the row maximum shifts every term and they cancel:"
+                echo "          a max of max - c multiplies the sum by e^c, which adds c to its"
+                echo "          logarithm, and the explicit -c on max takes it straight back out."
+                echo "          The result is the same number for any c. Only rounding differs, and"
+                echo "          no assertion narrower than that rounding can catch it."
+                echo ""
+                echo "          Found by re-anchoring the pattern: it used to match nothing at all,"
+                echo "          because the loop gained a finiteness guard and stopped reading"
+                echo "          row[1..]. A mutant that does not apply measures nothing, which is"
+                echo "          how an equivalent mutant hides behind a broken one."
+                ;;
             clip-ge)
                 echo "  class   EQUIVALENT, and provably so rather than hopefully. The mutant differs"
                 echo "          from the original only when the norm is exactly equal to max_grad_norm,"
@@ -369,4 +401,25 @@ if [ -n "$survivors" ]; then
 fi
 
 [ "$broken" -eq 0 ] || exit 1
+
+# The FLOOR, and why it is a knob rather than a constant. `broken` counts an
+# unbuildable mutant and a gate failure but NOT a survivor -- deliberately, because a
+# survivor is a measurement rather than an error. The consequence was that nothing in
+# this repository could go red when the test suite degraded: eight SURVIVED lines
+# would print, `broken` would stay 0, this exits 0, and the CI job asserted nothing
+# about the outcome. An audit found that.
+#
+# So the human-facing behaviour is unchanged -- unset, this still exits 0 on
+# survivors, and the survivor list stays the evidence -- and the enforcement lives
+# where a number has to be enforced: CI sets MUTATION_EXPECTED_CAUGHT, and a run that
+# catches fewer than that exits 1 naming the ones that got through. The value is set
+# from a measured run rather than chosen.
+if [ -n "${MUTATION_EXPECTED_CAUGHT:-}" ]; then
+    if [ "$caught" -lt "$MUTATION_EXPECTED_CAUGHT" ]; then
+        echo "mutation: caught $caught, and the floor is $MUTATION_EXPECTED_CAUGHT." >&2
+        echo "  The suite got weaker. Each of these mutants failed nothing:" >&2
+        for s in $survivors; do echo "    $s" >&2; done
+        exit 1
+    fi
+fi
 exit 0

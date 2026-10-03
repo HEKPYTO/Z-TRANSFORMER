@@ -35,6 +35,10 @@ comptime {
 }
 
 comptime {
+    _ = @import("profile_test.zig");
+}
+
+comptime {
     _ = @import("removed_test.zig");
 }
 

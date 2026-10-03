@@ -1,7 +1,7 @@
 # src
 
-Seventeen modules, plus the `main.zig` binary, `lib.zig` and the `tests.zig` root. 36 `.zig` files
-directly in `src/`, 16 of them `*_test.zig`. Three more sit in `src/cuda/`: `device.zig` and the two
+Nineteen modules, plus the `main.zig` binary, `lib.zig` and the `tests.zig` root. 40 `.zig` files
+directly in `src/`, 18 of them `*_test.zig`. Three more sit in `src/cuda/`: `device.zig` and the two
 CPU twins, `norm_twin.zig` and `attn_twin.zig`.
 
 There is deliberately no line count here. Three of them have been written and all three were wrong
@@ -100,6 +100,11 @@ every Zig target and is what stops a corrupt id from wrapping down into the vali
 | `train.run` | `run(allocator, cfg, train_tokens, val_tokens) !Result` | The whole loop: batch, forward, loss, backward, clip, rate, step, clear. |
 | `train.Result` | `{ train_loss, val_loss, steps, params, rows, allocator }`, with `deinit` | The run's numbers plus the trained weights, so a checkpoint can be written straight out. |
 | `train.writeCsv` | `writeCsv(path, rows) !void` | Header plus one line per row, truncating the file first. |
+| `profile.Op` | `enum { loop, fetch, forward, loss, dlogits, backward, clip, adam, zero, eval }` | The op kinds a step is attributed to, named for the call each probe follows. |
+| `profile.Totals` | `{ ns, calls, span_ns }`, with `rows`, `shareSum`, `denominatorNs`, `bucketSumNs`, `writeTable` | Accumulated nanoseconds per op. `denominatorNs` is the elapsed **span**, not the sum of the buckets, which is why the shares fall short of 100% by the un-attributed remainder. |
+| `profile.Profiler` | `start(io)`, `stop(op)`, `finish()` | One running measurement. `stop` closes the gap since the last probe and names what it was spent on, so no time is counted twice. |
+| `profile.enable` | `enable(arena, io, environ) !?*Profiler` | Returns the profiler when `ZTRANSFORMER_PROFILE=1` and `null` otherwise. Null is the default and the only path the committed curve takes. |
+| `profile.active` | `var active: ?*Profiler` | What `train.run` reads. A module-level handle rather than an argument, because `run` is called from a dozen tests and the value is null in every one. |
 | `optim.AdamW` | `init(allocator, like)`, `step(p, g, lr, weight_decay)` | Decoupled weight decay, bias-corrected moments. |
 | `optim.cosineLR` | `cosineLR(step, total, warmup, base_lr) f32` | Linear warmup then cosine to zero. Never negative. |
 | `optim.clipByNorm` | `clipByNorm(grads, max_norm) f32` | Scales in place by the GLOBAL norm. Returns the PRE-clip norm. |
@@ -235,7 +240,7 @@ bench  3 runs of 123 steps, user CPU seconds per step
        whole run including tokenizer startup, over the steps it did
 ```
 
-Measured `2026-10-03` on the CUDA host, which is the host of record for the committed curve. **The box
+Measured `2026-10-03` on the Linux host of record for the committed curve. **The box
 this replaces was a Mac measurement**, and the difference between the two is the machine rather than
 the code: the same source has read about 0.31 s/step on the Mac and 1.63 s/step on the 32-core Linux
 host, and no ratio between them is claimed anywhere. Earlier boxes quoted 0.2934 and then 0.2721,
@@ -272,11 +277,62 @@ should be compared with the other because the load differed. Those two are the n
 `zig build bench` produced in one sitting, and the rule here is that a number either comes out of
 that command or says where it came from.
 
-**The rest of this section does not come out of `bench`, and an earlier version of it implied that
-it did.** The per-call and per-phase figures below come from an instrumented copy that is not
-committed — two `clock_gettime(PROCESS_CPUTIME_ID)` reads at function entry and exit, none inside
-the loops. Treat them as observations with the method named, not as measurements a reader can
-re-run. `bench` reports the whole run and nothing below its level.
+**This section used to carry per-phase figures from an instrumented copy that was never committed, and
+say so. It no longer does: `zig build step-profile` measures the step, and it is in the tree.**
+
+One run of the shipped configuration, `2026-10-03`, 30 steps, CPU time, with
+`ZTRANSFORMER_PROFILE=1`:
+
+```
+op            ns_total   calls     share
+loop          26549113       30    0.107%
+fetch            22594       30    0.000%
+forward      4833289941       30   19.401%
+loss          84094960       30    0.338%
+dlogits      159688817       30    0.641%
+backward     19245403072       30   77.252%
+clip          57334987       30    0.230%
+adam         301967853       30    1.212%
+zero          37530790       30    0.151%
+eval         165459883        1    0.664%
+SUM          24911342010      271   99.995%
+SPAN         24912511361           100.000%
+```
+
+**`loop` is the work BETWEEN ops, and it exists because Zig runs `defer` at the scope's closing
+brace — after the last op and before the next one.** It therefore carries the previous step's four
+frees (`Cache.deinit` alone returns eleven tensors per block), the two step counters, and the
+conditional `rows.append`, which reallocates the row buffer when it fires. It is named `loop` and
+not `teardown` because the row append is not a free.
+
+An earlier version of this table had neither row and so banked all of that against the next step's
+`batcher.next()`: a row named `fetch` reported 0.310% of a step while measuring something else. It
+now reads 0.000%, and that zero is a real measurement rather than a probe that stopped — `fetch` is
+22,594 ns over 30 calls, 0.8 microseconds each, which three decimal places of a percentage cannot
+show. **A per-op table is only as honest as the placement of its probes**, and this one was
+mislabelled twice before a reviewer read the loop and counted the `defer`s.
+
+**The backward is 77% of a step and the forward is 19%; every other op is around 1% or less, with `adam` the largest of them — the table above carries the per-run figures, which move every time it is refreshed.**
+The op that is *not* the largest is the forward, and saying so matters more than the ordering: the
+projection in `scale-profile` above and the published CUDA numbers both concern *attention*, which
+this table does not break out at all — it sits inside the 19% forward and inside the 77% backward.
+So "attention is a few percent of a step" was never a statement about the largest term, and no
+number in this table is an argument for optimising attention first.
+
+The profiler is inert unless `ZTRANSFORMER_PROFILE=1`, so the committed curve takes a null check and
+never reads a clock. `SPAN` is wall-clock elapsed time and `SUM` is the buckets, and **the gap
+between them is the un-attributed remainder** — here 0.004%, which is the teardown and the row
+append. That gap is why the shares are a share of the step rather than of each other: dividing each
+op by the sum of the ops would print 100.000% always, whether or not the probes covered the step.
+
+
+**What the table above is not.** It times nine whole-step op kinds and nothing finer. The figures
+from here down -- `weightGrad` at 77% of the backward, `attentionBackward` at 10.54 ms a call -- are
+per-kernel and per-call, they come from an instrumented copy that is **not committed**, and
+`zig build step-profile` did not and cannot produce them. Note also that the two "77%"s are different
+quantities: the table's 77.2% is the backward's share of a whole step, and this next paragraph's is
+two loops' share of the backward. Read the first from the tree; read the second as an observation
+with the method named.
 
 The first round unrolled `weightGrad`'s column loop and `inputGrad`'s row loop eight ways, which
 were 77% of the backward. The second went after `attentionBackward`, at an observed 10.54 ms a call
@@ -310,11 +366,14 @@ unroll is wrong identically in both arms. The `head_dim`-split bodies need a `he
 makes `h * dim` and `kv * dim` identically zero in the only check that reached them.
 
 `unroll_s` in `src/autograd_test.zig` is nine tokens at `n_heads 4, n_kv_heads 2, head_dim 12`, and
-it is the only fixture that executes those paths. The proof that it is load-bearing is a manual experiment rather than a committed
-mutation, and there is no `tools/mutation` entry for it: no mutation in `mutate.zig` targets an
-unrolled lane. Replacing one unrolled lane write with lane zero's value fails that test and
-**only** it, 192 of 193 still passing, because every other gradcheck in the file never reaches that
-code at all. A reviewer read the test names back and observed that `train_test.zig` does reach the
+it is the only fixture that executes those paths. It was proved load-bearing by a manual experiment
+alone; **there is now a committed mutation for it** -- `attn-unroll-lane-write` in
+`tools/mutation/mutate.zig`, which rewrites `probs[s + u] = dot[u] * scale;` to lane zero's value so
+that seven of the eight prefixes in a group take the same dot product. An earlier version of this
+paragraph said no mutation targeted an unrolled lane; that was true when it was written and is not
+now. Replacing one unrolled lane write with lane zero's value fails `unroll_s` and, on the evidence
+gathered at the time, **only** it, because every other gradcheck in the file never reaches that code
+at all. A reviewer read the test names back and observed that `train_test.zig` does reach the
 `s`-splits at `ctx 32`; whether its other assertions would catch a bad `d q` lane is not checkable
 from the tree, so the "only it" is what was measured, not what is proven.
 
@@ -615,7 +674,9 @@ head width that cannot be fractional and is off by the one the `-1` leaves behin
 
 | Deferred item | Worth doing at | Deciding number |
 |---|---|---|
-| Fused IO-aware attention | `T >= 3 * d` | **Superseded.** `core/mlp >= 0.25` gives no at the shipped shape (0.167) and no at 8B (0.167), yes at 32k (0.667). The kernel exists and runs at **57.9x to 168.8x** per call across eleven shapes, the minimum of three runs measured `2026-10-03` on the CUDA host, per the root `README.md`. Two earlier ranges are withdrawn: "98.7x at the shipped shape, between 103x and 160x", and then "55.4x to 169.4x". Both were read off a denominator that is not a property of the kernel, and `ctx256` is why: across the three runs it swung 1.82x while the other ten shapes held between 1.00x and 1.03x. The committed ten-run sweep puts that one shape in two clusters 1.7384x apart with nothing between them, so no single floor here was ever a measurement of the kernel. `core/mlp` is a share of arithmetic and not of time. See "Attention: the floor, and then the kernel" below. |
+| Fused IO-aware attention | `T >= 3 * d` | **Superseded.** `core/mlp >= 0.25` gives no at the shipped shape (0.167) and no at 8B (0.167), yes at 32k (0.667). The kernel exists and runs at **57.9x to 168.1x** per call across eleven shapes, the minimum of three runs measured `2026-10-03` on the Linux host of record, per the root `README.md`. Three earlier ranges are withdrawn -- "106x and 165x", then "98.7x at the shipped shape,
+between 103x and 160x", then "55.4x to 169.4x", matching the longer list below. Every one was read
+off a denominator that is not a property of the kernel, and `ctx256` is why: across the three runs it swung 1.82x while the other ten shapes held between 1.00x and 1.03x. The committed ten-run sweep puts that one shape in two clusters 1.7384x apart with nothing between them, so no single floor here was ever a measurement of the kernel. `core/mlp` is a share of arithmetic and not of time. See "Attention: the floor, and then the kernel" below. |
 | KV cache | `T >= 3 * d` | The same term, and the same flaw: it is a share of arithmetic and not of time. The attention row above is the cautionary tale for this one. `src/kv_cache.zig` has landed and carries six tests, and `src/decode.zig` decodes through it -- a greedy generation loop whose five tests run and pass, checking a cached decode step against a full forward pass over the prompt, and the second generated token against a full forward over the grown prompt. It runs on the GPU as well: `decode.cudaAttnStep` derives `q_offset = pos` and `n_keys = pos + 1` from the cache itself, so the forward kernel's offset is exercised at every real position rather than only at 0, and `zig build cuda-attn-check` grades that path against the CPU `attnStep` over a cache filling one position at a time. The row is still unmeasured on time. It also costs 2 GiB at 8B and 12 GiB at the parity row. |
 | Tied-head restructure | `vocab >= 3 * d` | Landed, see below. `tied / (3 * mlp) >= 0.25` at every row here, including the shipped one at 10.5% of the step. |
 | `weightGrad` loop-order swap | never | Not a ratio. It reorders a fixed multiply-add count, so no shape improves it, and `matmul`, `weightGrad` and `inputGrad` already stream contiguous rows. |
@@ -661,7 +722,7 @@ beside the PCIe floor a GPU implementation would have to clear.
       4096          3    3114728.19      6.000     1031.39     3020x  floor is below the cpu: the kernel's own cost decides
 ```
 
-Measured `2026-10-03` on the CUDA host after `zig build host-check` was green. **This table is not a
+Measured `2026-10-03` on the Linux host of record after `zig build host-check` was green. **This table is not a
 generated block and cannot be one**: every column is a time, so two runs are not byte-identical and
 comparing them would pass by rounding. `scale-profile` above is protected that way because it is
 arithmetic; this is not. What protects it instead is the committed sweep and the host guard, and the
@@ -670,7 +731,8 @@ arithmetic; this is not. What protects it instead is the committed sweep and the
 On the 32-core Linux host. `cpu_us_min` is the **minimum** per-call time over `calls` calls, because
 contention and frequency scaling only make a call slower. `floor_us` is q, k and v in plus the result
 out at 6.1 GB/s. **No run in this repository measures a PCIe rate.** `src/attn_bench.zig` derives that constant
-from the norm table's own `gpu_e2e` minus `gpu`, and says so at `src/attn_bench.zig:36`; `src/attn_bench.zig` names where that constant
+from the norm table's own `gpu_e2e` minus `gpu`, and `src/attn_bench.zig` says so beside that
+derivation and names where the constant
 comes from, and it is the weakest number in the table.
 
 **The ratio column is not a figure to quote to two significant digits.** Three sweeps of this table on
@@ -689,9 +751,10 @@ not a property of the code.
 the running softmax in registers and no score matrix ever written to global memory. Its two backward
 kernels are in that same file and are graded against `attentionBackward` by the same script, at three
 separate gates, one each for dq, dk and dv. Both halves are now wired into a real training step behind
-one flag: `src/model.zig`'s `cuda_attn` routes the forward and the backward through this file, and
-`zig build cuda-attn-check` grades that path against `attention.forward` and `attentionBackward` on a
-real step's tensors. The file
+only the forward is wired behind one flag: `src/model.zig`'s `cuda_attn` routes it through this
+file, and `zig build cuda-attn-check` grades that path against `attention.forward` on a real step's
+tensors. **Nothing calls `device.Attn.backward`**, so the backward kernel is graded by the benchmark
+harness and nowhere else. The file
 beside it, `src/cuda/attn.cu`, is the benchmark harness and not a library: it `#include`s the kernels
 and defines `main`, so it cannot be linked as one. The full table, the three-run reproducibility
 measurement, the attack on its own gate and its known limitation are in `src/cuda/README.md`; the two
@@ -715,11 +778,11 @@ attn: broken variant 3 was caught, as it must be
 attn: broken variant 4 was caught, as it must be
 ```
 
-**That transcript is abridged, three rows out of seven and with two tables' worth of output removed.**
+**That transcript is abridged, three rows out of eleven and with two tables' worth of output removed.**
 The full run also prints the backward parity table with its three worst-case index columns, the
 `ATTN_GROUP_Q=` line, the `configurations used:` block, the four backward variants each with the
 `[dq/dk/dv ...]` signature it produced, and the line asserting that those four signatures differ.
-`src/cuda/README.md` carries the seven-row forward sweep; neither file quotes the run whole.
+`src/cuda/README.md` carries both parity tables in full -- eleven rows each; neither file quotes the run whole.
 
 At Llama-3's own geometry -- 32 heads over 8 kv heads at `head_dim` 128 -- the parity is `7.451e-08`,
 0.075% of the gate. That row is there because a kernel only ever run at `head_dim` 32 has not been
@@ -735,8 +798,8 @@ improves the reference rather than widening what is compared.
 
 ### The speedup, and why it is not the floor's number
 
-The kernel ran between **57.9x and 168.8x** per call across the eleven shapes on `2026-10-03`, the
-minimum of three runs, and **no floor is published at all**. Three earlier ranges were published and
+The kernel ran between **57.9x and 168.1x** per call across the eleven shapes on `2026-10-03`, the
+minimum of three runs (`ctx4096`'s widest single draw is the 168.8x in the root table's max column), and **no floor is published at all**. Three earlier ranges were published and
 withdrawn: 106x and 165x, then 98.7x with "between 103x and 160x", then 55.4x to 169.4x. Each was
 withdrawn because the ratio's *denominator* is not a property of the kernel.
 
@@ -787,8 +850,8 @@ an order of magnitude.
 ### It reverses the `scale-profile` verdict, and the projection was the weaker of the two
 
 `scale-profile` answers `fused_attn` with `core/mlp >= 0.25`, which at the shipped shape is `0.167`, so
-it says no, and the CUDA kernel wins over `attention.forward` by between 57.9x and 168.8x per call,
-per shape, with no floor. Both are computed correctly, because they
+it says no, and the CUDA kernel wins over `attention.forward` by between 57.9x and 168.1x per call,
+per shape, on the minimum of three, with no floor. Both are computed correctly, because they
 measure different things: `core/mlp` is the share of an MLP layer's *arithmetic* that attention
 contributes and it says nothing about how long either takes. `src/scale.zig` calls the bar "a choice,
 and named as one".
@@ -886,7 +949,7 @@ by about one f32 ulp per step, with `w_gate` and `w_down` in layer 0 the only te
 all and the forward pass bit-identical.
 
 **That stopped being true, and recording that it stopped is the point.** `zig build dbg-train` is
-the Debug build of the shipped run, built to make exactly this comparison. Run on the CUDA host against
+the Debug build of the shipped run, built to make exactly this comparison. Run on the Linux host of record against
 the committed curve it produced bytes **identical** to the ReleaseFast ones: `settleCsv` matched the
 digest, promoted, and left no pending file. A full 123-step Debug curve and a full 123-step
 ReleaseFast curve are the same bytes on this toolchain, so whatever used to move those two tensors in
@@ -898,5 +961,8 @@ was already wrong on a second count: `ReleaseFast` and `ReleaseSafe` are bit-ide
 contracting `a * b + c` in these loops at all and there is no contraction term for the gradcheck
 budget to carry. What produced the old difference is not established and is not re-established here.
 The half that still matters is the host: `@exp`, `@sqrt` and `@cos` resolve to the platform libm, so
-output is not comparable across libm versions, and that is measured -- the same source gives
-`7d7bcbd8...` on the CUDA host and refuses against a different machine's curve.
+output is not comparable across libm versions. What is measured is narrower than "a different host
+refuses": the same source gives `7d7bcbd8...` on **two** machines -- the Linux host of record and a second glibc host,
+both glibc 2.43 -- so this is a machine-independence result, not a libm-diversity one. The
+divergence is Apple's libm, where `zig build train` has refused against this curve; that is
+inherited from the repository's own history and was not re-measured here.

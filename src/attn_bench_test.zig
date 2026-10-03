@@ -59,10 +59,10 @@ test "verdict picks the side the ratio implies" {
 test "the head geometry the tool reports is the shipped one" {
     // LITERALS, and that is the whole point of the rewrite. `attention.defaultConfig`
     // is DEFINED as three fields copied out of `model.defaultConfig`
-    // (`src/attention.zig:24-27`), so the earlier version of this test compared
+    // (`attention.zig`'s `defaultConfig`), so the earlier version compared
     // a struct against the three fields it was built from and could not fail --
     // a value against itself, the identical mistake this file's own header
-    // records for `rope_theta` in `src/rope_test.zig:4-22`. Nothing in the tree
+    // records for `rope_theta` in `rope_test.zig`'s header. Nothing in the tree
     // pinned 4 / 2 / 32 anywhere: `model_test.zig` pins `n_layers`, `n_ctx` and
     // `n_heads % n_kv_heads == 0`, and `dModel` only pins the product. A silent
     // edit to the shipped split left the whole sweep measuring a shape nothing

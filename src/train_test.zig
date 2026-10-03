@@ -852,7 +852,7 @@ test "a wrong gradient is measured at the step it appears, not merely as a total
     // differ" would leave the reader to recompute the one thing that tells them
     // which kind of difference they are looking at.
     //
-    // Both curves are the CUDA host's, re-measured rather than carried over. This
+    // Both curves are the Linux host of record's, re-measured rather than carried over. This
     // fixture was a Mac run, so against the committed curve it was measuring the
     // optimizer defect and the host at the same time, and the two tests in this
     // file that quote a "host difference" would each have been partly reporting
@@ -886,7 +886,7 @@ test "a wrong gradient is measured at the step it appears, not merely as a total
 }
 
 test "a host difference is measured, and it is the same order as a broken run" {
-    // This repository's two hosts: the Mac's curve against the CUDA host's
+    // This repository's two hosts: the Mac's curve against the Linux host of record's
     // committed one, and the reason the budget was removed rather than
     // widened. It disagrees by 0.017975 at step 74 -- 189x the budget, so no
     // derived threshold separates them -- and its rows disagree by -31971,
@@ -1103,7 +1103,7 @@ test "a run that overflows stops instead of logging non-finite rows forever" {
         // `NonFiniteLogits`, not `NonFiniteLoss`, because the guard MOVED rather
         // than changed: `loss.forward` used to return the NaN and `train.run:187`
         // caught it afterwards, which left the other two callers of `loss.forward`
-        // -- `gradcheck`'s central differences and `train.zig:488`'s seam gate --
+        // -- `gradcheck`'s central differences and the training step's seam gate --
         // consuming it silently. The guard now sits inside `loss.forward`, so it
         // names the cause rather than the symptom and fires for all three callers.
         // With every logit finite the logsumexp cannot produce a non-finite loss:

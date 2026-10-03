@@ -176,11 +176,11 @@ if [ "$distinct" -ne 4 ]; then
 fi
 echo "attn: ...and all four signatures differ, so they are four different defects"
 
-echo "attn: the backward kernel exists and is graded, and BOTH halves now run on the"
-echo "      GPU inside a real training step: src/model.zig's cuda_attn routes the"
-echo "      forward and the backward through this file, and 'zig build cuda-attn-check'"
-echo "      grades that path against attention.forward and attentionBackward on a real"
-echo "      step's tensors. A KV cache exists (src/kv_cache.zig, six tests) and"
+echo "attn: the backward kernel exists and this harness grades it against"
+echo "      attentionBackward, but it is NOT on the training path: src/model.zig's"
+echo "      cuda_attn routes the FORWARD through this file, and nothing in the Zig"
+echo "      tree calls device.Attn.backward, so the backward kernel is exercised"
+echo "      only here. A KV cache exists (src/kv_cache.zig, six tests) and"
 echo "      src/decode.zig decodes through it: decode.cudaAttnStep derives q_offset ="
 echo "      pos from the cache itself, so the forward kernel's offset is exercised at"
 echo "      every real decode position and not only at 0. The external parity"

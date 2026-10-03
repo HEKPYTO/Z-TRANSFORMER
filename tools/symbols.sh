@@ -53,7 +53,19 @@ root=${2:-.}
 # `grep -c . "$1" -lt 3` rather than trusting a diff, and why `src/tests.zig`
 # asserts `named > 0` before walking. This gate had no such floor and an audit
 # found it.
-rows=$(grep -c '^| `[a-z_]*\.[A-Za-z_][A-Za-z_0-9]*`' "$readme" || true)
+# `${rows:-0}` is load-bearing, not defensive noise. `grep -c` writes its count to
+# stdout and its diagnostic to stderr, so an UNREADABLE $readme leaves $rows empty,
+# `|| true` swallows the exit 2, and `[ "" -lt 20 ]` is an arithmetic error inside an
+# `if` -- which is simply false, so the floor this block exists to enforce silently
+# does not run. An audit found that this gate passed over zero symbols. A floor whose
+# own operand can be empty is not a floor.
+[ -r "$readme" ] || {
+    echo "$readme: not readable, so the symbol gate has read nothing." >&2
+    echo "  A gate that read nothing is not a clean bill of health." >&2
+    exit 1
+}
+rows=$(grep -c '^| `[a-z_]*\.[A-Za-z_][A-Za-z_0-9]*`' "$readme" 2>/dev/null || true)
+rows=${rows:-0}
 if [ "$rows" -lt 20 ]; then
     echo "$readme: found $rows module.Symbol rows to check." >&2
     echo "  That is far below the 65 the table has, so the discovery grep is" >&2
@@ -67,7 +79,21 @@ bad=$(
         sed 's/^| `//; s/`$//' |
         while IFS=. read -r mod sym; do
             f="$root/src/$mod.zig"
-            [ -f "$f" ] || continue
+            # An ABSENT module was a silent skip, and that is the whole defect. A
+            # blanket `|| continue` cannot tell "this first cell was never a module"
+            # from "the module moved", so renaming src/gradcheck.zig took six
+            # documented symbols out of the check with no line of output and verify
+            # stayed green over a table of six lies. The allowlist below is measured,
+            # not guessed: of the seventeen distinct first cells this table carries,
+            # exactly one has no src/<cell>.zig, and it is `init`, whose rows are an
+            # allocator table whose cells are names rather than module.Symbol pairs.
+            # Every other absent module is now a failure, which is what a broken build
+            # is. A grep rather than a `case`, for the reason in the comment below.
+            if [ ! -f "$f" ]; then
+                if printf '%s\n' "$mod" | grep -qx 'init'; then continue; fi
+                echo "  $mod.$sym is documented, but src/$mod.zig does not exist"
+                continue
+            fi
             # `loss.csv` and `norm.cu` are filenames sitting in a first cell, not
             # symbols. `loss` and `norm` are both real modules, so the
             # missing-file skip above does not catch them and the row reads as a

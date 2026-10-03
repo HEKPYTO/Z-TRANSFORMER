@@ -13,7 +13,7 @@ and `device.zig` (the Zig side of that FFI).
 | `attn_kernels.cu` | The three attention kernels -- `fusedAttnForward`, `attnDqKernel`, `attnDkDvKernel` -- and the six `extern "C"` entry points that call them. **This is the library object**: a caller links this file, not `attn.cu`. |
 | `attn.cu` | The benchmark harness. It `#include`s `attn_kernels.cu` and holds `main`, so it cannot be linked as a library. Prints both tables, the four parity gates -- one forward at `ATTN_TOL`, three backward at `ATTN_BWD_TOL`, one each for dq, dk and dv -- drives the eight broken variants, four per direction, over two separate env vars, and then calls the library's own six entry points once per shape so the surface a training step would use is executed on every run rather than only compiled. |
 | `attn_twin.zig` | Generates inputs at five head widths, runs `attention.forward`, writes the reference and its own timings. |
-| `device.zig` | The Zig side of that FFI: six `extern fn` declarations, a checked size computation and an 11-buffer device holder. Nothing in `src/` calls it yet. |
+| `device.zig` | The Zig side of that FFI: six `extern fn` declarations, a checked size computation and an 11-buffer device holder. `src/model.zig` reaches it behind `pub const cuda_attn`: `cudaForward` calls `Attn.forward` when that flag is true; nothing calls `Attn.backward`, so the backward kernel has no training path. |
 | `run-attn.sh` | Compiles and runs both halves, proves all eight broken variants are caught -- four per direction, and the backward's four must additionally produce four *distinct* signatures -- and exits non-zero if any check fails. |
 | `run-probe.sh` | Compiles and runs the probe, the same container recipe, no parity. |
 | `cuda.sh` | The container, image pin and nvcc flags, shared by all three runners. |
@@ -255,8 +255,8 @@ That floor is the whole story at the shipped size, and it is why the `10.8x` sho
 
 - The kernel takes `3.68 us` at 1024 elements, `3.16 us` at 4096, `4.53 us` at 16384 and `7.31 us` at
   32768. From 1024 to 32768 elements, thirty-two times the work, and the time only doubles. Almost
-  all of it is launch and block scheduling. The actual work at `256x128` is 256 KiB of traffic, about
-  `0.3 us` at peak bandwidth.
+  all of it is launch and block scheduling. The actual work at `256x128` is 384 KiB of traffic -- the row is read twice and written once -- about
+  `0.43 us` at the 912 GB/s this file derives from the norm table.
 - The CPU side is slow for a reason that is specific to `norm.zig` rather than to RMSNorm. `78.64
   us` over `32768` elements is `2.40 ns` per element, and the reason is readable in the source: it is
   a serial `f64` accumulation, so each row is one dependency chain of 128 `f64` adds with no ILP to
@@ -398,7 +398,7 @@ scan on a card with a smaller ceiling. `gqa-256-T256` is the only row where the 
 anything, and it moved it from 64 to 48.
 
 At `head_dim` 256 the scan lands on **tile 48** -- 99904 bytes forward, 101120 for the
-backward's kernel A -- inside the 101376 an sm_86 grants, with 1472 bytes to spare. The
+backward's kernel A -- inside the 101376 an sm_86 grants -- 1472 bytes of slack on the forward ask and 256 on the larger backward one. The
 boundary, measured by handing the scan a stated limit:
 
 | limit | 132864 | 101376 | 99904 | 99903 | 3084 | 3083 | 1 | 0 |
@@ -446,32 +446,49 @@ goal actually names. At `head_dim` 256 the cap of 64 does not fit either, and th
 the tile until the ask does** rather than handing the number to the device and dying there -- see
 [the width contract](#the-width-contract) above.
 
-The third of the three runs below is the one published -- the only one of the three taken while
-the GPU read 0%. An earlier version of this line said "first", which contradicted the note eighty
-lines further down that said the published run is the third. Two sentences, eighty lines apart, opposite
-claims, and the second is the one with the measurement behind it.
+**What this run does not print, and what one block omits.** A full `sh src/cuda/run-attn.sh` prints,
+beside the two parity tables: the `attn: running with ATTN_GROUP_Q=1` and `attn: ATTN_MAX_TILE=64`
+lines; the `library entry points, one launch per manifest shape at T=8:` block, which calls
+`zt_attn_forward` and `zt_attn_backward` at every width in the manifest and prints the tile each
+chose and its two return codes; the `configurations used:` block listing every
+`group_q`/block/tile combination the sweep reached; and the backward's four variant lines each
+carrying its `[dq/dk/dv ...]` signature plus the `...and all four signatures differ` line. All of
+that is omitted here and none of it is a number a reader would compare against.
 
-**Abridged.** The block below is the forward table and the forward's own four variant lines, cut
-from a full `sh src/cuda/run-attn.sh`. The full run also prints, in this order: the
-`attn: running with ATTN_GROUP_Q=1` and `attn: ATTN_MAX_TILE=64` lines from the runner; the
-`library entry points, one launch per manifest shape at T=8:` block, which calls
-`zt_attn_forward` and `zt_attn_backward` at every width in the manifest and prints the tile
-each chose and its two return codes; the backward table, whose header carries three columns
-this file has not shown -- `worst_dq`, `worst_dk` and `worst_dv`, the argmax index of each
-gradient; the `configurations used:` block listing every `group_q`/block/tile combination the
-sweep actually reached; and then, from the runner, the backward's four variant lines each
-carrying its `[dq/dk/dv ...]` signature and the `...and all four signatures differ` line. The
-backward table is printed in full further down, minus those three columns.
+The forward's four variant lines ARE kept, because "the parity gate can fail" is a claim this
+directory should be able to show rather than assert.
+
+
+One `sh src/cuda/run-attn.sh` on `2026-10-03`, after `zig build host-check` reported a clean host.
+Both parity tables in full, and the forward's four broken-variant lines:
 
 ```
-Withdrawn -- this block held a transcript whose timing columns no longer
-describe any run in this repository. It is kept as the shape of the output,
-with every number removed, because inventing a replacement transcript from a
-run whose log was not kept would be exactly the defect this directory exists
-to stop.
-
 shape          ctx     cpu_us   kernel_us   max_abs     gate   used    ratio  parity  argmax
-        ... 11 rows, the timing and ratio columns deliberately absent ...
+ctx256          256   10800.28     104.690  5.960e-08     1e-04  0.060%    103.2x  ok   argmax 517
+ctx512          512   44694.46     336.031  5.960e-08     1e-04  0.060%    133.0x  ok   argmax 517
+ctx1024        1024  188315.18    1160.164  5.960e-08     1e-04  0.060%    162.3x  ok   argmax 517
+ctx2048        2048  761951.21    4576.780  5.960e-08     1e-04  0.060%    166.5x  ok   argmax 517
+ctx4096        4096 3079732.55   18374.339  5.960e-08     1e-04  0.060%    167.6x  ok   argmax 517
+llama3-T256     256  336746.01    3155.822  7.451e-08     1e-04  0.075%    106.7x  ok   argmax 76157
+llama3-T512     512 1523552.59   11803.331  7.451e-08     1e-04  0.075%    129.1x  ok   argmax 76157
+gqa-96-T256     256  255140.20    2468.086  5.960e-08     1e-04  0.060%    103.4x  ok   argmax 3792
+gqa-96-T512     512 1022021.56    9295.332  5.960e-08     1e-04  0.060%    109.9x  ok   argmax 3792
+mha-192-T256    256  251905.25    2411.664  1.043e-07     1e-04  0.104%    104.5x  ok   argmax 195211
+gqa-256-T256    256  165910.12    1656.361  7.451e-08     1e-04  0.075%    100.2x  ok   argmax 43433
+
+shape          ctx     bwd_us     max_abs_dq     max_abs_dk     max_abs_dv     gate   worst   parity      worst_dq      worst_dk      worst_dv
+ctx256          256     588.80      7.451e-09      1.537e-08      2.384e-07     1e-05   2.38%  ok            170          119            5
+ctx512          512    1474.56      7.451e-09      1.490e-08      2.980e-07     1e-05   2.98%  ok            170          184           39
+ctx1024        1024    4727.10      7.451e-09      1.676e-08      3.576e-07     1e-05   3.58%  ok            170          108           39
+ctx2048        2048   17725.34      7.451e-09      1.863e-08      2.384e-07     1e-05   2.38%  ok            170          108            5
+ctx4096        4096   70319.87      7.451e-09      1.863e-08      2.980e-07     1e-05   2.98%  ok            170          108            5
+llama3-T256     256   31140.86      2.980e-08      5.215e-08      7.153e-07     1e-05   7.15%  ok           7739          983         2043
+llama3-T512     512  115709.92      2.980e-08      7.451e-08      8.345e-07     1e-05   8.34%  ok           7739         1017         2043
+gqa-96-T256     256   18982.82      1.118e-08      4.098e-08      4.768e-07     1e-05   4.77%  ok           3370         2234           45
+gqa-96-T512     512   69966.66      1.118e-08      4.843e-08      5.960e-07     1e-05   5.96%  ok           3370         2234          345
+mha-192-T256    256   30832.64      2.235e-08      3.725e-08      2.384e-07     1e-05   2.38%  ok           3934         3993           73
+gqa-256-T256    256   28313.25      2.095e-08      3.725e-08      4.768e-07     1e-05   4.77%  ok           5564         1246          248
+
 attn: OK
 attn: proving the parity gate can fail
 attn: broken variant 1 was caught, as it must be
@@ -480,28 +497,25 @@ attn: broken variant 3 was caught, as it must be
 attn: broken variant 4 was caught, as it must be
 ```
 
-**The numbers live in the root `README.md`**, which carries the minimum of three
-invocations measured `2026-10-03`: **57.9x to 168.8x** per call across the eleven
-shapes, with `ctx256` the only shape that swings (1.82x) and the other ten holding
-between 1.00x and 1.03x. This block's previous contents quoted `105.2x` at
-`ctx256` and a `10884.32 us` CPU call, both from an earlier session on this host.
-Those are not wrong as history; they are withdrawn as current, because a reader
-comparing them against the root table would be comparing two sessions and
-calling the difference a regression.
+**One run, so one sample per shape, and this is not the published table.** The root `README.md`
+carries the minimum of three invocations, **57.9x to 168.1x** (min-of-3; the widest single run was 168.8x), because `ctx256`'s CPU column is
+bimodal and a single sample there is a 1.74x coin toss -- `outputs/bench/ctx256-sweep.csv` is the ten
+runs that establish it. The `10800.28 us` above is one draw from the high mode; the root table's
+`57.9x` comes from a run that drew low. Both are correct and they differ by a factor, which is the
+whole reason the minimum is the statistic and a single run is not one.
 
-That gap is itself the honest state of this directory: **no committed transcript
-of the current benchmark run exists yet.** The ten-run `ctx256` sweep at
-`outputs/bench/ctx256-sweep.csv` is committed and is what `host-clean.sh` and the
-minimum-of-three rule exist to serve; the full eleven-row transcript is the part
-still outstanding.
+This block previously quoted `105.2x` at `ctx256` and a `10884.32 us` call from an earlier session,
+and was withdrawn rather than re-pointed at numbers whose log was not kept. It is now a real run
+whose log exists, which is the difference between the two states.
 
-Two shapes' worth of geometry are in that table on purpose. The first five are this model's own
-configuration; the last two are Llama-3's, 32 heads over 8 kv heads at `head_dim` 128, because a
-kernel only ever run at `head_dim` 32 has not been shown to run at the width the project is about.
+More than one shape's worth of geometry is in that table on purpose. The first five are this model's
+own configuration; rows six and seven are Llama-3's, 32 heads over 8 kv heads at `head_dim` 128, because
+a kernel only ever run at `head_dim` 32 has not been shown to run at the width the project is about.
+Rows eight through eleven are the four widths the section below is about.
 
 ### The four widths the guard used to refuse
 
-The table above stops at seven rows because its timing columns are published and **the
+The table above carries all eleven rows because their timing columns are published and **the
 `cpu_us` and `kernel_us` figures from the run that added these widths are deliberately
 not recorded** -- the forward's CPU column at the shipped window is bimodal on this
 host, and a timing taken alongside a parity change would be read as a speedup claim
@@ -623,7 +637,7 @@ every `argmax`, because padding changes addresses and not the order of any float
 **The ratio column moved further than the kernel did, and most of that is not the kernel.** At the
 K-fix intermediate step the shipped window read 73.6x where the unpadded kernel had read 29.4x, a
 factor of 2.5, while the kernel itself improved by 1.43. Neither figure is current: 73.6x belongs to
-an intermediate this repository does not ship, and the table above publishes **105.2x** for the same
+an intermediate this repository does not ship, and the table above publishes **103.2x** for the same
 window. The distance between those ratios is the CPU column rather than the kernel -- 29.4x is
 `6089.81 / 206.8` and 105.2x is `10884.32 / 103.442`, both quotient of a row quoted in this file --
 and the shipped window's CPU reading is the one this host reproduces least. The kernel column is the
@@ -712,11 +726,24 @@ Llama-3's geometry while losing by `1.20x` at the shipped window. It ships at 1 
 shape needs a rule for when to switch, and that rule is not written. The measurement is in `attn.cu`,
 not in the table above, because the table comes from the configuration that ships.
 
-**What this file is not.** Not a training step. Both halves of attention are on the GPU and neither
-is on the training path: nothing here is wired into `zig build train`, a KV cache exists (`src/kv_cache.zig`) but nothing decodes yet: there is no generation loop and the forward kernel has no `q_offset`, so a cached key cannot be attended to by a single-token query, and
-this is not yet a step anyone can train through. The external parity comparison in `tools/removed/`
-runs entirely on the CPU and is untouched by anything here, so the block-parity claim in `AGENTS.md`
-does not depend on this file existing.
+**What this file is not.** Not a training step *by default*. Both halves of attention run on the GPU,
+but a training step reaches only one of them, and only when `src/model.zig`'s `cuda_attn` is true:
+under that `comptime` switch `model.forwardWith` routes through `cudaForward`, and
+`zig build cuda-attn-check` grades that path against `attention.forward` on a real step's tensors.
+**Nothing in the Zig tree calls `device.Attn.backward`**, so the backward kernel has no training path
+and is exercised by the harness above and by nothing else. With the switch false -- what ships -- no
+binary that `train` and `verify` build links this file at all.
+
+A KV cache exists (`src/kv_cache.zig`, six tests) and `src/decode.zig` decodes through it: a greedy
+generation loop whose five tests run and pass, checking a cached decode step against a full forward
+pass over the prompt and the second generated token against a full forward over the grown prompt.
+`decode.cudaAttnStep` runs that step on the GPU and derives `q_offset = pos` and `n_keys = pos + 1`
+from the cache itself, so the forward kernel's offset is exercised at every real decode position
+rather than only at 0. **An earlier version of this paragraph said there was no generation loop and
+no `q_offset` on a single-token query. Both were true when written and neither is now.**
+
+The external parity comparison in `tools/removed/` runs entirely on the CPU and is untouched by
+anything here, so the block-parity claim in `AGENTS.md` does not depend on this file existing.
 
 The `gate` column in either table is `ATTN_TOL` / `ATTN_BWD_TOL` from this directory, and it is **not
 one of the gates in `tools/removed/oracle.txt`.** Those eighteen are per-tensor tolerances against a
@@ -766,7 +793,7 @@ where `dk` happens to be small.
 **The gate is `1e-5`, set from the measurement.** The first working run read a worst of `8.345e-07`, so
 `1e-5` leaves 12x over the worst row and 4x over the spread between shapes. It was `1e-4` before that,
 which is 120x -- a gate that cannot detect anything this project has evidence to look for. The norm
-kernel's own gate is `1e-5` at 0.6% used, and setting a gate from the measurement and recording why is
+kernel's own gate is `1e-5` at 28.6% used, and setting a gate from the measurement and recording why is
 what that table did.
 
 **The order of the three columns is the diagnostic.** `dq` is smallest because the reference accumulates
@@ -821,7 +848,7 @@ forward's CPU cost had a published per-call number with a 78.8% run-to-run sprea
 measured on a *different host*, and the backward's cost was the phrase "about four times the work".
 Three numbers, none of them usable together.
 
-All three below are from **one host in one session**, which is the whole point. Host is the CUDA host,
+All three below are from **one host in one session**, which is the whole point. Host is the Linux host of record,
 32 cores, Linux 7.2.7, load 4.3 to 4.4 across the rounds.
 
 | | measured | how |
@@ -859,14 +886,28 @@ CPU attention, 4 layers, per step
 
 GPU attention, per step, from the tables above
   forward   103.442 us x 4 =   413.8 us
-  backward  588.80 us x 4 =  2355.2 us
-  PCIe, 4 MiB round trip    =   687.6 us   [3.0 MiB rounded up, derived below]
+  PCIe, 1.5 MiB round trip  =   257.8 us   [forward half of the 3.0 MiB derived below]
   launch/event overhead     =    30   us   [ASSUMED, measured by nothing here]
-  total                     =  3486.6 us     =  0.21% of a step
+  total                     =   701.6 us     =  0.04% of a step
 
-step after the swap: 1632.4 - 119.79 + 3.49 = 1516.1 ms
-                                      speedup = 1.077x
+FORWARD ONLY -- the swap a step can actually make today:
+  step after the swap: 1632.4 - 42.83 + 0.70 = 1590.3 ms
+                                        speedup = 1.027x
+
+IF THE BACKWARD WERE ALSO WIRED -- a projection, not a measurement:
+  backward  588.80 us x 4 =  2355.2 us
+  PCIe, 4 MiB round trip    =   687.6 us   [the round-up the derivation below explains]
+  total                   =  3486.6 us     =  0.21% of a step
+  step after the swap: 1632.4 - 119.79 + 3.49 = 1516.1 ms
+                                        speedup = 1.077x
 ```
+
+**This block is a projection, and one input to it cannot be reached by a step today.** `bwd_us` is
+measured correctly, but only by this directory's harness: nothing in the Zig tree calls
+`device.Attn.backward`, so a training step could not execute the `588.80 us x 4` line as written.
+The number is right for the kernel; what is missing is the call site that would let a step use it.
+Every other figure in the block is an input that IS reachable -- the forward through `cudaForward`,
+the PCIe round trip, and the step total.
 
 **The 4 MiB is a round-up, and here is the derivation it rounds.** At the shipped geometry
 (`T 256`, 4 heads over 2 kv heads, `head_dim 32`) the forward moves `q`, `k` and `v` in and `out`
@@ -892,15 +933,15 @@ observations and the optimistic one is the one that survives scrutiny:
   backward 19239.03 us x 4 = 76.96 ms
   total                       = 102.76 ms  =  6.30% of a 1632.4 ms step
   step after the swap: 1632.4 - 102.76 + 3.49 = 1533.1 ms
-                                        speedup = 1.065x
+                                        speedup = 1.065x   [projection]
 ```
 
-**So: attention is 6.3% to 7.3% of a training step, and the swap is worth 1.065x to 1.077x.** Both ends
+**So: attention is 6.3% to 7.3% of a training step, and the reachable forward-only swap is worth 1.016x to 1.027x.** The range is the ctx256 CPU mode again -- at the low mode the CPU forward is 25.80 ms and the swap 1.016x, at the high mode 42.83 ms and 1.027x. Both ends
 are quoted because the forward's spread is a factor of 1.67 and pretending to a third significant digit
 across that spread would be the exact thing this README keeps refusing to do elsewhere.
 
-**So the honest answer is 1.065x to 1.077x on a training step, and attention is 6.3% to 7.3% of it.** That
-is worth stating plainly because the per-call numbers are 105x to 165x and they invite the conclusion that
+**So the honest answer is 1.016x to 1.027x on a training step for the swap the code can make today, and attention is 6.3% to 7.3% of it. The wider 1.065x to 1.077x range earlier in this file assumed the backward was swapped too, which no step can do.** That
+is worth stating plainly because the per-call numbers are 57.9x to 168.1x and they invite the conclusion that
 the step will be many times faster. It will not be. The other 92.7% to 93.7% of a step is the matmuls,
 the two norms, RoPE, SwiGLU, the tied head and AdamW, and **all of it is still on the CPU.** This
 repository has one primitive kernel and three attention kernels; that is the entire device-side
@@ -909,7 +950,7 @@ inventory.
 Two consequences, and they point in opposite directions:
 
 - **Wiring attention in is worth doing to close the goal**, because the goal is that attention runs on
-  CUDA, and a kernel nothing calls is a benchmark. 1.065x to 1.077x is a real improvement and it is not
+  CUDA, and a kernel nothing calls is a benchmark. 1.027x is a real improvement and it is not
   the reason.
 - **If the objective is a faster step rather than a closed goal, attention is the wrong target.** The
   arithmetic points at `tensor.matmul`, which the CPU side already spends the majority of its time on and
@@ -972,7 +1013,7 @@ LazyPath)` and `Module.linkSystemLibrary("cudart", .{})`, which takes three argu
 `LazyPath` that `addObjectFile` wants, so an nvcc step and a link can be wired together without a
 temporary path or a file read back off disk.
 
-The FFI a training step would call is two files, and **nothing in `src/` calls them.**
+The FFI is two files and a training step reaches one of them: `src/model.zig`'s `cuda_attn` routes a real step's forward through `device.Attn`, and `zig build cuda-attn-check` grades that against the CPU one. The backward half has no caller in the Zig tree and so has no training path.
 `attn_kernels.cu` is the C half: the three attention kernels plus six `extern "C"` entry points --
 `zt_attn_forward`, `zt_attn_backward`, `zt_attn_dim_ok` and three shared-memory-size functions --
 taking raw device pointers and returning 0 or 1 with the reason on stderr. None of them allocates;
@@ -994,7 +1035,7 @@ the launcher chose and both return codes, a non-zero code fails the run, and it 
 uninitialised and nothing is compared -- a number nobody reads cannot be wrong -- so this is a
 check that the entry point **accepts** a configuration, not a second parity gate. The other
 three of the six, `zt_attn_dim_ok` and the shared-memory-size functions, are read by `attn.cu`
-directly; `device.zig` is still called by nothing at all.
+directly; `device.zig` is called by `src/model.zig` whenever `cuda_attn` is true.
 
 It is `#include`d by `attn.cu` rather than linked beside it, deliberately: one translation unit means the
 benchmark and a training step compile the SAME kernels and there is no second copy to drift. The proof
@@ -1023,14 +1064,18 @@ nvcc $FLAGS -c -o attn_kernels.o src/cuda/attn_kernels.cu
 to run before wiring a build edge, because a wrong file here fails at link time with a message about
 `main` that says nothing about which of two files was meant.
 
-**What does not exist yet, stated so nobody reads the paragraph above as more than it is.**
+**How this file is wired, stated so nobody reads the paragraph above as more than it is.**
 `src/cuda/device.zig` holds the Zig-side `extern` declarations, a checked size computation and an
-11-buffer device holder, with six tests on the arithmetic -- but **nothing calls any of it**, and no
-`zig build` edge links the object. So the FFI surface is reachable from C++ and from Zig-in-principle,
-and from no actual caller. Two obstacles remain, and neither is hidden: the `build.zig` edges, which
-cannot be exercised on a Mac because the object is ELF and the executable would be Mach-O; and
-`libcudart`, which has to be copied out of the image as the recipe two sections below shows rather than
-taken from the host's own -- see the note there about why the host's copy is the wrong one.
+11-buffer device holder, with seven tests on the arithmetic. It is called whenever `cuda_attn` is
+true, and `build.zig`'s `linkCudaAttn` links `attn_kernels.o` into three modules -- the CUDA test
+binary, the decode test binary and the training executable -- so the FFI is reachable from an actual
+caller rather than from C++ alone. Two things are still not in the graph, and neither is hidden.
+`linkSystemLibrary("cudart")` NAMES the library; it does not supply it, so the pinned 12.6.3
+runtime has to be copied out of the pinned image -- not taken from the host's own copy, which is a
+different version and the wrong one -- onto BOTH `LIBRARY_PATH`, which the linker reads, and
+`LD_LIBRARY_PATH`, which the loader reads and `LIBRARY_PATH` does not feed. The recipe two sections
+below does that. And those build edges cannot be exercised on a Mac at all: the object is ELF and
+the executable would be Mach-O, so the gate is NVIDIA-only by construction rather than by policy.
 
 `zig build cuda-check` does reference this directory: it sources `cuda.sh` and calls `nvcc`
 through `cuda()`, the same pinned container the two runners use, so the check compiles exactly what
@@ -1042,7 +1087,7 @@ files itself, which is why the object the runners hand back is still unused by t
 Neither runner needs it, because both compile and run inside the container. A `zig build` edge that
 links a device binary outside the container would, and it needs the runtime copied out.
 
-**The host may already have a `libcudart`, and using it would be the wrong one.** the CUDA host carries a
+**The host may already have a `libcudart`, and using it would be the wrong one.** The host of record carries a
 CUDA 13.4 toolkit and `ldconfig -p` resolves `libcudart.so` to
 `/usr/local/cuda/targets/x86_64-linux/lib/`, so a linker there finds `-lcudart` with no help at all.
 That runtime is **13.4**, and this repository pins **12.6.3**: `AGENTS.md` records the same tension for

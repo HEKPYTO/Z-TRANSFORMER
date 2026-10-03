@@ -46,10 +46,11 @@ const corpus_sha256 = "86c4e6aa9db7c042ec79f339dcb96d42b0075e16b8fc2e86bf0ca57e2
 /// seed 7 in ReleaseFast produced these exact bytes. It is not a claim across
 /// hosts or across optimization levels, and `src/README.md` says why rather than
 /// leaving it a mystery — `@exp`, `@sqrt` and `@cos` resolve to the platform
-/// libm, and Debug differs from release by about one f32 ulp per step. So a
-/// reader on another host whose run produced different bytes has found a
-/// different libm, not a broken build, and `zig build train` reports it in those
-/// words and leaves this file alone rather than replacing it.
+/// libm, and **optimization level is not currently a source of divergence**: a Debug build of this
+/// source reproduces the committed ReleaseFast curve byte for byte on this toolchain, measured, so the
+/// libm is the thing that has produced different bytes. So a reader on another host whose run
+/// produced different bytes has found a different libm, not a broken build, and `zig build train`
+/// reports it in those words and leaves this file alone rather than replacing it.
 ///
 /// `zig build verify` checks the file, and that proves exactly one thing: the
 /// curve in the tree is the curve this repository documents. The other half —
@@ -264,16 +265,19 @@ pub fn build(b: *std.Build) void {
     });
     const dbg_train_run = b.addRunArtifact(dbg_train_exe);
     dbg_train_run.addArg("train");
-    // This step's entire purpose is the comparison, and a Debug build of
-    // identical source does not reproduce the committed ReleaseFast curve, so
-    // `settleCsv` refuses to promote it and exits 1. That guard is right for
-    // `zig build train` and wrong here: without this the step failed on every
-    // run, which is the guard working and the step being useless at the same
-    // time. The flag acknowledges the difference and still does not replace the
-    // committed curve, so `train` keeps the guard and only this step relaxes it,
-    // and the Debug build is still covered by `zig build test`.
+    // This step's entire purpose is the comparison, and the comparison has a
+    // result: measured on the Linux host of record, a Debug build of identical source DOES
+    // reproduce the committed ReleaseFast curve byte for byte -- `settleCsv`
+    // matches the digest and promotes. So this step is no longer demonstrating a
+    // difference between optimization levels, and the flag it sets is kept for a
+    // different reason: a host whose libm differs makes `zig build train` refuse
+    // on the digest, and that guard is right for `train` and would make this
+    // step fail for the same uninteresting reason. The flag acknowledges the
+    // difference and still does not replace the committed curve, so `train` keeps
+    // the guard and only this step relaxes it. The Debug build is still covered
+    // by `zig build test`.
     dbg_train_run.setEnvironmentVariable("ZTRANSFORMER_ACCEPT_LOSS_DIFFERENCE", "1");
-    const dbg_train_step = b.step("dbg-train", "Train in Debug, for a host-difference comparison");
+    const dbg_train_step = b.step("dbg-train", "Train in Debug, to compare optimization levels against the committed curve");
     dbg_train_step.dependOn(&dbg_train_run.step);
 
     // `zig build scale-profile` prints the projections behind the deferred work.
@@ -376,8 +380,9 @@ pub fn build(b: *std.Build) void {
 
     // `src/cuda/attn_twin.zig` is the CPU half of the attention benchmark: it
     // writes the inputs, the reference output and the manifest that
-    // `src/cuda/attn.cu` is graded against, so the published 55.4x to 169.4x
-    // table cannot be reproduced without it compiling.
+    // `src/cuda/attn.cu` is graded against, so the published 57.9x to 168.1x
+    // table cannot be reproduced without it compiling. (55.4x to 169.4x is
+    // one of the three ranges withdrawn as a floor; see the root README.)
     //
     // It had no target here at all, because `run-attn.sh` invokes `zig
     // build-exe` itself, and that made this a permanent hole rather than a slow
@@ -489,8 +494,30 @@ pub fn build(b: *std.Build) void {
         \\rm -f outputs/loss.pending.csv
         \\"$bin" train > "$work/a.log" 2>&1 || true
         \\cp outputs/loss.pending.csv "$work/a.csv"
+        \\# Removed AGAIN before the second pass, and the reason is a hole this
+        \\## step had: `|| true` swallows a second pass that fails, and without
+        \\## this rm the `cp` below would copy the leftover from pass one into
+        \\## b.csv. `cmp` then matches and the step exits 0 having measured one
+        \\## run and called it two. With the file gone, a pass that writes
+        \\## nothing leaves `cp` failing under `set -eu`, which is the honest
+        \\## outcome: a second pass that did not happen is not evidence of
+        \\## determinism.
+        \\rm -f outputs/loss.pending.csv
         \\"$bin" train > "$work/b.log" 2>&1 || true
-        \\cp outputs/loss.pending.csv "$work/b.csv"
+        \\# `|| true` here too, and for the same reason: the rm above means a pass
+        \\## that wrote nothing leaves nothing to copy, and under `set -eu` a bare
+        \\## `cp: cannot stat` would be the whole diagnostic. This step promises a
+        \\## message that NAMES what failed, so the missing file is reported in the
+        \\## step's own words and with the pass-two log attached.
+        \\cp outputs/loss.pending.csv "$work/b.csv" 2>/dev/null || true
+        \\if [ ! -f "$work/b.csv" ]; then
+        \\  echo "determinism: the SECOND pass produced no curve, so there is" >&2
+        \\  echo "  nothing to compare the first against. A pass that never ran" >&2
+        \\  echo "  is not evidence of determinism. Pass one wrote" >&2
+        \\  echo "  $(( $(wc -l < "$work/a.csv") - 1 )) steps; the second pass said:" >&2
+        \\  tail -5 "$work/b.log" >&2 || true
+        \\  exit 1
+        \\fi
         \\rm -f outputs/loss.pending.csv
         \\# SILENT ON SUCCESS. `verify` is silent by contract and CI asserts that a
         \\# passing run writes no bytes to either stream, so a step inside it that
@@ -498,6 +525,30 @@ pub fn build(b: *std.Build) void {
         \\# nobody reads. `table-block-check` is outside `verify` for exactly this
         \\# reason; this one is inside because determinism is a property worth
         \\# gating, so it pays for the silence instead.
+        \\# A floor on BOTH copies, before the comparison. `cmp -s` exits 0 on two
+        \\## zero-byte files, so an empty pair certifies the arithmetic having
+        \\## measured nothing -- and `outputs/loss.pending.csv` is gitignored, so an
+        \\## empty one can sit in a working tree from an earlier run. This is the
+        \\## same hole `tools/table-block.sh` closes with a line-count floor, and the
+        \\## shape of the fix is copied from there rather than invented here.
+        \\##
+        \\## The number is MEASURED, and the first guess was wrong. These passes run at
+        \\## 16 KiB and write THREE lines: a header and two logged steps, because
+        \\## `log_every` is far larger than the run. An audit proposed five, from the
+        \\## thirty steps `outputs/README.md` quotes, and that turned a passing gate
+        \\## red on its own host. The floor has to catch an empty file and a
+        \\## header-only file, so two -- one data row -- is what it takes, and the
+        \\## rest of the margin is `cmp`'s to argue about.
+        \\a_lines=$(wc -l < "$work/a.csv" 2>/dev/null || echo 0)
+        \\b_lines=$(wc -l < "$work/b.csv" 2>/dev/null || echo 0)
+        \\if [ "$a_lines" -lt 2 ] || [ "$b_lines" -lt 2 ]; then
+        \\  echo "determinism: a pass produced too few lines to be a curve." >&2
+        \\  echo "  a.csv $a_lines lines, b.csv $b_lines lines. Two is a header and" >&2
+        \\  echo "  one step; these passes write three. Two files that short can" >&2
+        \\  echo "  still cmp equal, so comparing them would certify the" >&2
+        \\  echo "  arithmetic on no data at all." >&2
+        \\  exit 1
+        \\fi
         \\if cmp -s "$work/a.csv" "$work/b.csv"; then
         \\  exit 0
         \\else
@@ -519,6 +570,36 @@ pub fn build(b: *std.Build) void {
     determinism_step.dependOn(&determinism.step);
     verify_step.dependOn(determinism_step);
 
+    // Per-op attribution for one training step, with the two negative controls
+    // that make it a gate rather than a print.
+    //
+    // The body is `tools/step-profile.sh`, not a `sh -c` blob here, for the same
+    // reason `tools/host-clean.sh` and `tools/symbols.sh` are files: a gate has
+    // to be breakable on purpose and readable on its own, and every failure this
+    // step raised was unreadable because the script was one argv string printed
+    // inside zig's "failed command" line. `sh -x tools/step-profile.sh <bin>`
+    // now shows the whole thing.
+    //
+    // NOT in `verify`, for the reason `bench` is not: these are times, and a
+    // threshold on a time is a property of the machine and the hour. What is
+    // checked is a SHAPE -- the denominator is elapsed time rather than the sum
+    // of the buckets, and the shares move when the work does. Both hold on a
+    // loaded host as much as on an idle one, which is why they can gate and a
+    // magnitude cannot.
+    //
+    // Two runs at different corpus sizes: identical per-step arithmetic, three
+    // times the steps. The fixed per-RUN cost -- tokenizer, `initParams` -- is
+    // amortised over three times as many steps, so the per-step ops take a
+    // larger share. `backward` moves about 77% to 82% and `forward` 19% to 15%,
+    // which is the signal control 2 measures. An earlier version of this comment
+    // credited `eval`, which runs once per epoch; it moves 0.01 points and is
+    // not the mechanism.
+    const step_profile = b.addSystemCommand(&.{"sh"});
+    step_profile.addFileArg(b.path("tools/step-profile.sh"));
+    step_profile.addArtifactArg(train_exe);
+    step_profile.setCwd(b.path("."));
+    b.step("step-profile", "Time each op kind in a training step, and require the denominator to be elapsed time and the shares to move when the work does").dependOn(&step_profile.step);
+
     // The peak of the training run, against `peak_rss_budget`. `verify`
     // depends on it, and the reason it is here rather than in the one-command
     // list of digests is that it is the only gate in this file that runs the
@@ -536,6 +617,21 @@ pub fn build(b: *std.Build) void {
     const peak_rss = b.step("peak-rss", "Check the training run's peak resident set size against the budget in build.zig");
     peak_rss.dependOn(&addPeakRssCheck(b, train_exe).step);
     verify_step.dependOn(peak_rss);
+
+    // ORDERING, and it is load-bearing rather than tidy. `peak-rss` and
+    // `determinism` both invoke the train binary, and `train` writes its curve to
+    // ONE path, `outputs/loss.pending.csv`, with no per-run name in it. Zig runs
+    // independent top-level dependencies concurrently, so with no edge between
+    // these two the runs overlap on that file: determinism's `rm -f` deletes the
+    // curve peak-rss just wrote, or determinism's `cp` copies peak-rss's
+    // 123-step curve and compares it against its own 30-step one. The second
+    // outcome is the bad one -- the step then reports that the arithmetic is not
+    // reproducible on this host, confidently, from a race rather than from the
+    // arithmetic. A `verify` run was observed returning exit 1 with 5120 bytes of
+    // output and then exit 0 with none, unchanged in between, and this is where
+    // that came from. Any step added later that invokes `train` needs the same
+    // edge; sharing one writable path between concurrent steps is the defect.
+    determinism.step.dependOn(peak_rss);
 
     // CPU seconds per training step, median of a few runs. It reports and it does
     // not gate, and the asymmetry is the point: `peak-rss` can gate because a
@@ -889,7 +985,7 @@ fn cudaAttnObject(b: *std.Build) *std.Build.Step.Run {
 
 /// The compiled kernels and the runtime they resolve against, on one module.
 ///
-/// `cudart` is `-lcudart`, and WHICH one is the entire point. the CUDA host
+/// `cudart` is `-lcudart`, and WHICH one is the entire point. the host of record
 /// carries a CUDA 13.4 toolkit and `ldconfig` resolves its `libcudart.so` to
 /// `/usr/local/cuda/targets/x86_64-linux/lib/`, so a linker there finds `-lcudart`
 /// with no help at all -- while the object above was built by the pinned 12.6.3

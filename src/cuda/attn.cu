@@ -1,8 +1,8 @@
-// Fused causal grouped-query attention, forward, on the GPU.
-//
+// Fused causal grouped-query attention on the GPU: a benchmark harness for the forward
+// and backward kernels in `attn_kernels.cu`, which it `#include`s rather than links.
 // Why this file exists: `zig build attn-bench` measures one call of
-// `attention.forward` at each context length and prints it beside the PCIe floor
-// a GPU version has to clear. On the 32-core Linux host that floor read two
+// `attention.forward` and one of `attentionBackward` at each context length and
+// prints them beside the PCIe floor a GPU version has to clear. On the 32-core
 // orders of magnitude below the CPU at the shipped window and three at 4096, so
 // the arithmetic said the kernel was worth writing. It is, and the table this
 // program prints is where "worth writing" turns into "here is what it does" --
@@ -17,15 +17,24 @@
 // the other.
 //
 // What this file does NOT do, and must not be read as doing: it is not a
-// training step. Both halves of attention are on the GPU and neither is on the
-// training path: nothing here is wired into `zig build train`, there is still no
-// KV cache, and this is not yet a step anyone can train through. BOTH parity
-// tables are against the CPU implementations this would replace --
-// `attention.forward` and `attentionBackward` -- and NOT against a external
-// reference, which still runs entirely on the CPU and is unaffected by anything
-// in this file. Neither gate is one of the eighteen in `tools/removed/oracle.txt`;
-// those grade a different implementation against a different reference and share
-// no number with `ATTN_TOL` or `ATTN_BWD_TOL`.
+// training step *by default*. `src/model.zig`'s `cuda_attn` is false as shipped;
+// switched on, it routes a step's FORWARD through `attn_kernels.cu` -- this file
+// only `#include`s that to benchmark it -- and `zig build cuda-attn-check`, or
+// `zig build cuda-train` for a whole run, grades the result against
+// `attention.forward` on a real step's tensors. The BACKWARD has no training
+// path at all: nothing in the Zig tree calls `device.Attn.backward`, so this
+// harness is the only thing that exercises it.
+//
+// A KV cache exists (`src/kv_cache.zig`) and `src/decode.zig` decodes through
+// it, so the forward kernel's `q_offset` is reached at every real decode
+// position, not only at 0.
+//
+// BOTH parity tables here are against the CPU implementations this would
+// replace -- `attention.forward` and `attentionBackward` -- and NOT against a
+// external reference, which still runs entirely on the CPU and is unaffected
+// by anything in this file. Neither gate is one of the eighteen in
+// `tools/removed/oracle.txt`; those grade a different implementation against a
+// different reference and share no number with `ATTN_TOL` or `ATTN_BWD_TOL`.
 //
 // Tolerance: 1e-4 absolute, deliberately looser than the 1e-5 RMSNorm kernel
 // gate. The CPU accumulates scores and the weighted sum in f64 and this
@@ -50,10 +59,10 @@
 // forward runs at "roughly a third of one percent of f32 peak" and the backward
 // error budget was dominated by a chain PERMUTATION between the reference's
 // h-outer/t-inner order and the kernel's. There is no permutation:
-// attnDkDvKernel keeps h-outer, t-inner, which IS the reference's order
-// (autograd.zig:677 outer over h, :767 inner over s), deliberately, because k[s]
-// and v[s] are staged once and stay live for the whole nest. The same comment
-// also quoted sqrt(8192) * 5.96e-8 * 0.37 as "1.6e-6"; it is 2.0e-6.
+// attnDkDvKernel keeps h-outer, t-inner, which IS the reference's order (its
+// outer `for (0..cfg.n_heads)` and its unrolled `s` loop), deliberately, because
+// k[s] and v[s] are staged once and stay live for the whole nest. The same
+// comment also quoted sqrt(8192) * 5.96e-8 * 0.37 as "1.6e-6"; it is 2.0e-6.
 //
 // The SECOND error was worse, because it was a false claim about how this number
 // was produced: it said the gate "is set from the first measured run at 10x
@@ -69,21 +78,21 @@
 //   ctx4096    7.451e-09   1.863e-08   2.980e-07    3.0%
 //   llama3-T512 2.980e-08  7.451e-08   8.345e-07    8.3%
 //
-// Seven shapes, worst 8.345e-07, so 1e-5 leaves 12x over the worst row and 4x over
+// Eleven shapes, worst 8.345e-07, so 1e-5 leaves 12x over the worst row and 4x over
 // the spread between shapes. 1e-4 would have been 120x, which is a gate that cannot
 // detect anything this project has evidence to look for. The norm kernel's own gate
-// is 1e-5 at 0.6% used, and the precedent for setting a gate from the measurement
+// is 1e-5 at 28.6% used, and the precedent for setting a gate from the measurement
 // and recording why is that table.
 //
 // The ORDER of the three is the diagnostic, and it is not arbitrary:
 //
 //   dq  the reference accumulates it in f64 and narrows ONCE at the store
-//       (autograd.zig:754), so the whole budget is a single f32 rounding of a
+//       (`g.dq.set`), so the whole budget is a single f32 rounding of a
 //       well-conditioned sum. It reads 7.451e-09.
 //   dk  same shape as dq, reads within 2.5x of it.
 //   dv  the reference accumulates it as an f32 READ-MODIFY-WRITE, one narrowing
-//       per term, in a chain up to group * (T - s) long (autograd.zig:782). At
-//       llama3-T512 that is 4 * 512 = 2048 roundings against dq's one, and dv
+//       per term, in a chain up to group * (T - s) long (its `dv_row[...] +=`).
+//       At llama3-T512 that is 4 * 512 = 2048 roundings against dq's one, and dv
 //       reads 28x worse than dq. The ratio is the chain length.
 //
 // So dv is the largest error in the table because the REFERENCE is least accurate
@@ -332,13 +341,13 @@ static bool runShape(const Shape *s, const char *dir, size_t shared_limit, int m
     // experiment. The real defect was a 32-way shared-memory bank conflict in the
     // QK phase, described where TILE_STRIDE is defined; fixing it was worth 1.43x to
     // 1.65x, several times what any change of tile reaches. Occupancy is still
-    // worth something -- twelve warps per SM against a limit of thirty-two -- but
+    // worth something -- eleven warps per SM against a limit of thirty-two -- but
     // it was not what was stopping this kernel.
     //
     // A tile of 256 asks for
-    // 66816 bytes of shared memory per block and an sm_86 block has about 100 KB
+    // 68736 bytes of shared memory per block and an sm_86 block has about 100 KB
     // to give, so ONE block is resident per SM where 8704 bytes allowed about
-    // twelve. With 32 threads per block there is nothing else to hide latency
+    // eleven. With 32 threads there is nothing else to hide latency
     // behind. Fewer barriers per unit of work bought less than the residency it
     // cost, which is the usual bargain and not a surprise in hindsight.
     //
@@ -377,9 +386,9 @@ static bool runShape(const Shape *s, const char *dir, size_t shared_limit, int m
     // which is also the configuration the published table was measured under.
     //
     // The occupancy reading above says where the headroom is: 8704 bytes of shared
-    // memory allows about twelve blocks per SM and a block here is one warp, so
-    // twelve warps against a hardware limit of thirty-two. An interleaved A/B of
-    // tile 32 against tile 8 (2208 bytes, thirty-two warps) could not settle it:
+    // memory allows about eleven blocks per SM and a block here is one warp, so
+    // eleven warps against a hardware limit of thirty-two. An interleaved A/B of
+    // tile 32 against tile 8 (2272 bytes, thirty-two warps) could not settle it:
     // the GPU was between 68% and 100% busy from another process throughout, and
     // the spread WITHIN the tile-32 arm at T=4096 was 9.8% against a 7.7%
     // difference between the arms, with the sign flipping at shorter contexts.

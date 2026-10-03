@@ -56,18 +56,35 @@ const mutations = [_]Mutation{
         .name = "matmul-f64-acc",
         .file = "src/tensor.zig",
         .what = "matmul accumulates its k reduction in f32; the mutant accumulates in f64",
+        // Re-anchored on the eight-lane block that replaced the scalar loop, and it
+        // spans the WHOLE while-block: an earlier attempt stopped at the k-loop's
+        // closing brace, which left the original store line behind it and produced a
+        // mutant that did not parse. The guard caught that as "zig fmt rejected the
+        // mutant" rather than running it, which is the guard doing its job.
+        //
+        // The mutant keeps the lane structure and the k order and changes only the
+        // accumulator width. That is the property: a wider reduction is more
+        // accurate, so a suite that does not notice it is not testing the arithmetic.
         .from =
-        \\        for (0..a.cols) |k| {
-        \\            const scale = a_row[k];
-        \\            const b_row = b.rowConst(k);
-        \\            for (0..b.cols) |j| out_row[j] += scale * b_row[j];
+        \\        while (j + lanes <= b.cols) : (j += lanes) {
+        \\            var acc: [lanes]f32 = @splat(0);
+        \\            for (0..a.cols) |k| {
+        \\                const scale = a_row[k];
+        \\                const b_row = b.rowConst(k);
+        \\                inline for (0..lanes) |u| acc[u] += scale * b_row[j + u];
+        \\            }
+        \\            inline for (0..lanes) |u| out_row[j + u] = acc[u];
         \\        }
         ,
         .to =
-        \\        for (0..b.cols) |j| {
-        \\            var acc: f64 = 0;
-        \\            for (0..a.cols) |k| acc += @as(f64, a_row[k]) * @as(f64, b.rowConst(k)[j]);
-        \\            out_row[j] = @floatCast(acc);
+        \\        while (j + lanes <= b.cols) : (j += lanes) {
+        \\            var acc: [lanes]f64 = @splat(0);
+        \\            for (0..a.cols) |k| {
+        \\                const scale = a_row[k];
+        \\                const b_row = b.rowConst(k);
+        \\                inline for (0..lanes) |u| acc[u] += @as(f64, scale) * @as(f64, b_row[j + u]);
+        \\            }
+        \\            inline for (0..lanes) |u| out_row[j + u] = @floatCast(acc[u]);
         \\        }
         ,
     },
@@ -81,23 +98,22 @@ const mutations = [_]Mutation{
     .{
         .name = "norm-f32-acc",
         .file = "src/norm.zig",
-        .what = "the RMS sum-of-squares accumulator drops from f64 to f32",
+        .what = "the RMS sum-of-squares reduction keeps f32 precision and widens after",
+        // Two lines on each side, deliberately. The original pattern spanned the
+        // accumulator AND the justification comment AND the `rms` line, so when that
+        // comment was rewritten -- the 4096-wide row it argued from was disowned by
+        // `norm_test.zig` -- the pattern stopped matching code that never changed and
+        // the mutant measured nothing. Squaring in f32 and widening keeps `sum_sq`
+        // an f64, so the `rms` line below is untouched and the anchor stays the two
+        // lines that carry the arithmetic. The defect under test is the same one: a
+        // reduction that loses low bits before it accumulates them.
         .from =
         \\        var sum_sq: f64 = 0;
         \\        for (x_row) |v| sum_sq += @as(f64, v) * @as(f64, v);
-        \\        // f64 accumulator, narrowed once per row: 4096 f32 squares lose the low
-        \\        // bits of the row and drift the scale by more than 1e-6, which the
-        \\        // numerics tests hold this op to.
-        \\        const rms: f32 = @floatCast(@sqrt(sum_sq / @as(f64, @floatFromInt(d)) + eps));
         ,
         .to =
-        \\        var sum_sq: f32 = 0;
-        \\        for (x_row) |v| sum_sq += v * v;
-        \\        // f64 accumulator, narrowed once per row: 4096 f32 squares lose the low
-        \\        // bits of the row and drift the scale by more than 1e-6, which the
-        \\        // numerics tests hold this op to.
-        \\        const eps32: f32 = @floatCast(eps);
-        \\        const rms: f32 = @sqrt(sum_sq / @as(f32, @floatFromInt(d)) + eps32);
+        \\        var sum_sq: f64 = 0;
+        \\        for (x_row) |v| sum_sq += @as(f64, @as(f32, v * v));
         ,
     },
     .{
@@ -238,14 +254,27 @@ const mutations = [_]Mutation{
     .{
         .name = "loss-no-rowmax",
         .file = "src/loss.zig",
-        .what = "logsumexp stops pulling out the row max, so a large logit overflows exp",
+        .what = "the softmax denominator subtracts a max seeded with 0 instead of the row maximum",
+        // Re-anchored: this loop used to read `row[1..]` and gained the finiteness
+        // guard inside it, so the two-line pattern no longer matched. The seed is the
+        // thing under test and it is unchanged -- a max seeded with 0 is correct for an
+        // all-positive row and wrong for a row whose logits are negative, which is
+        // exactly the case `exp(z - max)` overflows on.
         .from =
         \\        var max = @as(f64, row[0]);
-        \\        for (row[1..]) |z| max = @max(max, @as(f64, z));
+        \\        for (row) |zr| {
+        \\            const z: f64 = zr;
+        \\            if (!std.math.isFinite(z)) return error.NonFiniteLogits;
+        \\            max = @max(max, z);
+        \\        }
         ,
         .to =
         \\        var max: f64 = 0;
-        \\        for (row[1..]) |z| max = @max(max, @as(f64, z));
+        \\        for (row) |zr| {
+        \\            const z: f64 = zr;
+        \\            if (!std.math.isFinite(z)) return error.NonFiniteLogits;
+        \\            max = @max(max, z);
+        \\        }
         ,
     },
 };
