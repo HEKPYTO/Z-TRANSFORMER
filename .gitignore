@@ -19,3 +19,6 @@ zt-debug-train
 # AGENTS.md allows only README.md, LICENSE and CHANGELOG.md in the commit tree.
 docs/
 .scratch/
+
+# A review artifact, never committed. AGENTS.md caps committed *.md at 7.
+ISSUES.md

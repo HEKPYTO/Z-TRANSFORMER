@@ -38,9 +38,7 @@ comptime {
     _ = @import("profile_test.zig");
 }
 
-comptime {
-    _ = @import("removed_test.zig");
-}
+comptime {}
 
 // `src/cuda/device.zig` lives under `src/cuda/` and holds its tests inline, which
 // looks like it should be a `src/cuda/device_test.zig` and is deliberately not.

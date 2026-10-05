@@ -40,6 +40,128 @@ compile each with its own `zig build-exe`. `sh
 src/cuda/run-probe.sh` compiles the probe and runs it on the local GPU; `src/cuda/README.md` says
 what that does and does not establish.
 
+## What the step profiler says, and the one thing it does not fix
+
+`zig build step-profile` measures a real training step, not an estimate. On an idle
+fedora-pc it reports, over 120 windows:
+
+| bucket | share |
+|---|---|
+| `backward` | **82.8%** |
+| `forward` | 14.8% |
+| `adam` | 0.8% |
+| everything else | under 0.7% each |
+
+That matches what `AGENTS.md` publishes for the 30-window run (77% backward, 19%
+forward), so the split is stable and it says the same thing both times: **the step is
+the backward pass, and the backward pass is matmul.**
+
+**Everything on that path is single-threaded.** `src/tensor.zig` holds no
+`Thread.spawn` and neither does `src/autograd.zig`; `zig grep -n "Thread" src/*.zig`
+returns nothing but the test harness. So on a host with thirty-two cores, a training
+step uses one of them. That is the largest single inefficiency in this repository and it
+is not a tuning knob — it is a missing component.
+
+**A thread pool was written for this and is not in the tree.** The intent was
+row-parallel `matmul`, which is safe for `outputs/loss.csv`: a row is still summed over
+`k` in ascending order by one worker, so every output element is bit-identical and the
+committed digest is the check. It did not land. A lock-free pool needs a worker to be
+counted between *deciding* to take a job and *touching* its fields, and four attempts at
+that handshake still raced — three segfaults against a stack frame that had already been
+popped. Rather than ship a shared-memory primitive whose only defence is the fact that
+each row is computed once, it was deleted.
+
+**Whether it would have paid is measured, and spawn-per-call is not the answer.**
+A fork-join benchmark on the shapes this model actually builds — `d_model` 128, `ffn_dim`
+512, `vocab_size` 456 — spawning 31 threads per call and having the caller work too:
+
+Measured on `fedora-pc`, the same host as the published step. **Two runs, one sample per
+shape per run**, at `loadavg` 2.30 and 2.56; the table is the second. Both sets are given
+below because the gap between them is the honest part of this measurement.
+
+| shape | serial | fork-join | speedup |
+|---|---|---|---|
+| 128×128×128 | 352 µs | 5719 µs | **0.06×** |
+| 128×128×512 | 1586 µs | 5707 µs | 0.28× |
+| 512×128×128 | 1414 µs | 5713 µs | 0.25× |
+| 128×512×128 | 1563 µs | 5713 µs | 0.27× |
+| 128×128×456 | 801 µs | 4839 µs | 0.17× |
+
+**The two runs are the useful part, and what they show is narrower than a first reading
+suggests.** At `loadavg` 2.30 the same shapes read 170, 1124, 1026, 1156 and 674 µs serial;
+at 2.56 they read 352, 1586, 1414, 1563 and 801 µs. The fork-join arm barely moved across
+the two: 5787, 5774, 5735, 5746 and 5729 µs, then 5719, 5707, 5713, 5713 and 4839 µs.
+
+**What that establishes is that the spawn cost is fixed and the arithmetic cost is not.**
+Thread creation is ~5.7 ms either way; the serial arm moved by 2.07× across two runs.
+**What it does not establish is why.** The load moved 1.11× and the serial arm moved 2.07×,
+so load does not account for the difference, and no other cause was isolated — this is one
+of the same bimodal readings `ctx256` shows in the CPU column of `attn-bench`, and it is
+recorded as unexplained rather than attributed. The conclusion that survives either way is
+the one that does not need the cause: **five point seven milliseconds is three to sixteen
+times the largest matmul in the table, so spawn-per-call loses regardless of which run is
+the representative one.**
+
+**And the ceiling is too low to pay for any pool.** Counting the matmuls a step
+actually issues — four layers of qkv/o, gate/up, down, plus the tied head — against the
+published 1765 ms step on the same host, **all matmul in a step is about 55 ms, or 3.4%**.
+**3.4% is an upper bound and the number is not tight**, because the serial times behind it
+come from the noisier of the two runs above and the better run reads roughly half as much.
+**No idle matmul measurement exists**, and this repository does not turn a two-run spread
+into a published figure. What is established is the bound: **no matmul in a step exceeds
+3.4% of it, and spawn-per-call loses 7.7% trying to capture it.** A persistent pool is the
+only shape that could win at all, because its handshake is microseconds against a ~2 ms
+matmul — but paying shared-memory prices for a bound that low is not a trade, and what
+would settle it is a repeated idle matmul measurement on `fedora-pc`, not an estimate.
+
+**And `blockBackward` is not matmul.** `zig build step-profile` reports `backward` as one
+bucket, and nothing in `autograd.zig` calls `tensor.matmul` — the gradients are
+hand-rolled in `weightGrad` and `inputGrad`.
+
+**This next measurement was NOT taken on `fedora-pc`.** Timing every callsite in
+`blockBackward` with a throwaway probe, reverted immediately after reading, was done on
+**the development Mac, under load, while `fedora-pc` was unreachable** — the 123 steps
+that produced it are not the 123 steps the committed curve is. It puts the total in this
+order, and the order is what is being claimed: `weightGrad` first at roughly half,
+`inputGrad` second at roughly a third,
+`attentionBackward` third at under a fifth, and `ropeBackward` and `normBackward` together
+under two percent. **So the hand-rolled accumulation loops are the hot path, and the
+matmul figures above are the ceiling for the same multiply-adds** — which is the second
+independent reason parallelising them is not worth a pool.
+
+**Read this as structure, not as a published figure.** The probe was reverted, so no
+reader can re-derive it; it ran on the wrong host under load; and `outputs/` holds the
+loss curve and nothing else, so no transcript of it exists either. That is why no
+percentage is quoted to two significant figures. The ORDER is the finding, it is stable
+across two probe runs that disagreed on the absolute numbers by more than a fifth, and it
+is the same conclusion the `matmul` figures above reach by a different route. **Re-measuring
+it properly is a `fedora-pc` job and it has not been done.**
+
+**Blocking `weightGrad` over the output rows was tried, and it is not worth shipping.**
+The loop as written runs `i` outermost and `t` inside it, so `w_row` stays in L1 across
+the whole `t` sweep while all of `dout` is re-streamed once per output row. Sweeping `t`
+outside a block of eight `i` reads each `dout` row once per block instead of once per row,
+and it is **bit-identical by construction** — `i` belongs to exactly one block and `t`
+still ascends inside it, so every `w_row[j]` accumulates over the same `t` in the same
+order. It was implemented, and `zig build train` reproduced the committed digest
+`7d7bcbd8` exactly, so the bit-identity argument above is not theoretical.
+
+**It measured at 1.6313 s/step against the 1.6346 this host recorded for the row-major
+loop** — 0.2%, and this repository's own floor is that nothing under about 20% is
+measurable here. The reason is in the sizes: `dout` at the shipped shape is T×d f32,
+**256×128×4 = 128 KB, which already sits in L2**, so re-streaming it was an L2 hit and
+there is no DRAM traffic to save. A cache-blocking win needs a working set that misses
+cache, and this one does not. The change was reverted rather than carried as unmeasurable
+complexity, and the digest it reproduced is recorded here so the next attempt does not
+re-derive it.
+
+**And nothing may regress while it is tried.** The order that matters: `zig build verify`
+exit 0 and 0 bytes, `zig build test` at 229/231, and `zig build train` reproducing the
+`outputs/loss.csv` digest `7d7bcbd8` before and after. Row-parallel `matmul` is
+bit-safe because a row is still summed over `k` in ascending order by one worker, so the
+digest is a real check rather than a formality — if a pool reorders an accumulation the
+digest moves and the change does not ship.
+
 ## Numerics
 
 | Symbol | Signature | Purpose |
@@ -396,9 +518,6 @@ eight by accident. `unroll_tail` in `src/autograd_test.zig` is the fixture that 
 | `model.forwardWith` | `forwardWith(allocator, p, cfg, tokens, ?*Sink) !Tensor` | The same pass, handing each intermediate to a `Sink`. `forward` is this with a null sink. |
 | `model.Name` | 18 values | Which intermediate a `Sink.put` call is about. |
 | `model.Sink` | `{ put }` | A callback, not a bag of pointers: the intermediates live in buffers the pass frees before it returns. |
-| `parity.run` | `run(allocator, io, s: Sweep) !Summary` | Writes the weights, intermediates, token ids and shape to `outputs/parity/`. |
-| `parity.runInto` | `runInto(allocator, io, out_dir, s: Sweep) !Summary` | `run` with the output directory as an argument. One caller overrides it: `removed_test.zig`, which would otherwise overwrite the sweep the Python oracle reads with a one-layer fixture. |
-| `parity.sweep` | `sweep() Sweep` | The shape and the sequence lengths and seeds the harness compares. |
 
 Pre-norm: the norm sits inside the residual branch, not on the sum. Tied embeddings mean `tok_embed`
 takes gradient from both the input lookup and the output projection, and the second path is the one
@@ -407,7 +526,7 @@ so no gradient reaches any of the 28 projection tensors or the embedding, and on
 move. Both PRNGs name `Xoshiro256` explicitly rather than reaching for `DefaultPrng`, whose stream
 Zig documents as an implementation choice rather than a guarantee.
 
-`model.Sink` has two callers, `parity.run` and `autograd.Cache`, and changes no arithmetic: the
+`model.Sink` has one caller, `autograd.Cache`, and changes no arithmetic: the
 callback is the only thing the pass does that the arithmetic does not already do, so a null sink walks
 the same statements in the same order, which `model_test.zig` asserts bit for bit. It is a function
 pointer rather than a set of tensor pointers because the intermediates live in buffers the pass frees
@@ -426,11 +545,9 @@ sink costs is 1 MiB at the shipped T=256 over four heads, freed before `forwardW
 layer's worth of peak against a measured whole-model peak of about 47 MiB, and a step time that did
 not move. `autograd.Cache` takes the name and stores nothing, which is true rather than convenient —
 `attentionBackward` is handed `q_pos` and `k_pos` and rebuilds the forward's softmax row in f64 from
-them. `mlp_gate`, `mlp_up` and `mlp_hidden` are exported into `data.bin` at `[T, ffn]` and compared
-against external, which hands all three over at module boundaries: the two halves as `gate_proj` and
-`up_proj` outputs, the product as `down_proj`'s input. `parity.run` writes raw little-endian f32 with a
-text index rather than safetensors, because the oracle never calls `from_pretrained` and there is one
-dtype and no mmap on either side. `tools/README.md` says what the harness checks and what it does not.
+them. The MLP's three `[T, ffn]` intermediates -- `mlp_gate`, `mlp_up` and `mlp_hidden` -- are
+reachable the same way, at the module boundaries a Llama block hands them over: the two halves are
+`gate_proj` and `up_proj` outputs, and the product is `down_proj`'s input.
 
 ## Gradients
 
@@ -674,7 +791,7 @@ head width that cannot be fractional and is off by the one the `-1` leaves behin
 
 | Deferred item | Worth doing at | Deciding number |
 |---|---|---|
-| Fused IO-aware attention | `T >= 3 * d` | **Superseded.** `core/mlp >= 0.25` gives no at the shipped shape (0.167) and no at 8B (0.167), yes at 32k (0.667). The kernel exists and runs at **57.9x to 168.1x** per call across eleven shapes, the minimum of three runs measured `2026-10-03` on the Linux host of record, per the root `README.md`. Three earlier ranges are withdrawn -- "106x and 165x", then "98.7x at the shipped shape,
+| Fused IO-aware attention | `T >= 3 * d` | **Superseded.** `core/mlp >= 0.25` gives no at the shipped shape (0.167) and no at 8B (0.167), yes at 32k (0.667). The kernel exists and runs at **93.8x to 165.4x** per call across eleven shapes, the minimum of three runs measured `2026-10-04` on a host its own gate accepted on the Linux host of record, per the root `README.md`. Three earlier ranges are withdrawn -- "106x and 165x", then "98.7x at the shipped shape,
 between 103x and 160x", then "55.4x to 169.4x", matching the longer list below. Every one was read
 off a denominator that is not a property of the kernel, and `ctx256` is why: across the three runs it swung 1.82x while the other ten shapes held between 1.00x and 1.03x. The committed ten-run sweep puts that one shape in two clusters 1.7384x apart with nothing between them, so no single floor here was ever a measurement of the kernel. `core/mlp` is a share of arithmetic and not of time. See "Attention: the floor, and then the kernel" below. |
 | KV cache | `T >= 3 * d` | The same term, and the same flaw: it is a share of arithmetic and not of time. The attention row above is the cautionary tale for this one. `src/kv_cache.zig` has landed and carries six tests, and `src/decode.zig` decodes through it -- a greedy generation loop whose five tests run and pass, checking a cached decode step against a full forward pass over the prompt, and the second generated token against a full forward over the grown prompt. It runs on the GPU as well: `decode.cudaAttnStep` derives `q_offset = pos` and `n_keys = pos + 1` from the cache itself, so the forward kernel's offset is exercised at every real position rather than only at 0, and `zig build cuda-attn-check` grades that path against the CPU `attnStep` over a cache filling one position at a time. The row is still unmeasured on time. It also costs 2 GiB at 8B and 12 GiB at the parity row. |
@@ -760,11 +877,11 @@ and defines `main`, so it cannot be linked as one. The full table, the three-run
 measurement, the attack on its own gate and its known limitation are in `src/cuda/README.md`; the two
 facts that belong here are these.
 
-**The `gate` column is `ATTN_TOL` 1e-4 from `src/cuda/attn.cu`, and it belongs to none of the eighteen
-per-tensor gates in `tools/removed/oracle.txt`** -- those run 2e-6 to 2e-4 against a Llama
-reference, while the backward's `ATTN_BWD_TOL` 1e-5 grades this directory's own `attentionBackward`.
-Three tolerance systems, no number in common, and a row passing here says nothing about the
-block-parity claim, which rests entirely on `oracle.txt`.
+**The `gate` column is `ATTN_TOL` 1e-4 from `src/cuda/attn.cu`, and it grades this directory against
+this repository's own CPU attention** -- `attention.forward` forward and `attentionBackward` backward.
+The backward's `ATTN_BWD_TOL` 1e-5 is a second, tighter system over the same CPU twin. Two
+tolerances, no number in common, and both of them are internal: a row passing here says the CUDA
+kernel agrees with the Zig one and nothing beyond that.
 
 ```
 shape          ctx     cpu_us   kernel_us   max_abs     gate   used    ratio  parity  argmax
@@ -798,8 +915,8 @@ improves the reference rather than widening what is compared.
 
 ### The speedup, and why it is not the floor's number
 
-The kernel ran between **57.9x and 168.1x** per call across the eleven shapes on `2026-10-03`, the
-minimum of three runs (`ctx4096`'s widest single draw is the 168.8x in the root table's max column), and **no floor is published at all**. Three earlier ranges were published and
+The kernel ran between **93.8x and 165.4x** per call across the eleven shapes on `2026-10-04`, the
+minimum of three runs (`ctx4096`'s three invocations read 165.6x, 165.4x and 166.2x), and **no floor is published at all**. Three earlier ranges were published and
 withdrawn: 106x and 165x, then 98.7x with "between 103x and 160x", then 55.4x to 169.4x. Each was
 withdrawn because the ratio's *denominator* is not a property of the kernel.
 
@@ -850,7 +967,7 @@ an order of magnitude.
 ### It reverses the `scale-profile` verdict, and the projection was the weaker of the two
 
 `scale-profile` answers `fused_attn` with `core/mlp >= 0.25`, which at the shipped shape is `0.167`, so
-it says no, and the CUDA kernel wins over `attention.forward` by between 57.9x and 168.1x per call,
+it says no, and the CUDA kernel wins over `attention.forward` by between 93.8x and 165.4x per call,
 per shape, on the minimum of three, with no floor. Both are computed correctly, because they
 measure different things: `core/mlp` is the share of an MLP layer's *arithmetic* that attention
 contributes and it says nothing about how long either takes. `src/scale.zig` calls the bar "a choice,
@@ -863,7 +980,7 @@ which is those same 8.42 M multiply-adds counted as two operations each. Nothing
 tool; using a share of arithmetic as if it were a share of time was the error.
 
 The KV cache row above is gated on the same `core/mlp` term and this section does not speak to it. It
-has landed -- `src/kv_cache.zig`, six tests -- and the flaw the attention row had is now gone: the
+has landed -- `src/kv_cache.zig`, seven tests -- and the flaw the attention row had is now gone: the
 threshold is backed by a decode rather than by nothing. `src/decode.zig` is a greedy generation loop
 over the cache, its five tests run and pass, and `decode.cudaAttnStep` runs the same step on the GPU
 with `q_offset = pos`, so the forward kernel's offset is exercised at every real position instead of

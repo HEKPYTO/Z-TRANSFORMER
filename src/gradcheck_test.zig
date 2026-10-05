@@ -69,7 +69,7 @@ test "gradcheck: compare returns the whole sweep as data" {
     var g = try grads(std.testing.allocator, tiny, p);
     defer g.deinit();
 
-    const r = try gradcheck.compare(std.testing.allocator, tiny, p, tok, tgt, &g);
+    const r = try gradcheck.compare(std.testing.allocator, tiny, &p, tok, tgt, &g);
     defer r.deinit();
 
     // One row per parameter tensor, in the order the failure line would name
@@ -126,7 +126,7 @@ test "gradcheck: compare finds the first element that does not fit" {
     // gradient is not one of the zeros a zeroed model produces.
     g.layers[0].wq.data[9] = 1.0;
 
-    const r = try gradcheck.compare(std.testing.allocator, two_layers, p, tok, tgt, &g);
+    const r = try gradcheck.compare(std.testing.allocator, two_layers, &p, tok, tgt, &g);
     defer r.deinit();
 
     const m = r.mismatch orelse return error.TestUnexpectedResult;
@@ -137,6 +137,58 @@ test "gradcheck: compare finds the first element that does not fit" {
     // the Report carries, and the gap is over its own rather than merely near it.
     try std.testing.expect(m.budget <= r.floor);
     try std.testing.expect(m.diff > m.budget);
+}
+
+// A NaN gradient is the most wrong value a sweep can see, and it used to score as
+// the cleanest: `diff > budget` is false for NaN and `@max` drops it rather than
+// propagating, so both `tightest` and `scale` read as if the element were merely
+// small, and the report came back with `mismatch == null`. This pins the opposite.
+test "gradcheck: a non-finite gradient is reported, not averaged away" {
+    // The `gqa` fixture, deliberately: it is the smallest one whose `wk` carries a
+    // non-zero gradient, and the corruption test above already sweeps it, so the
+    // cost is known. An earlier version of this test built its own config and ran
+    // `compare` four times, which is roughly 500x the work for the same assertion.
+    const nan_cfg = gqa;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try liveParams(arena.allocator(), nan_cfg);
+    // The file-level `tok`/`tgt`, NOT parallel arrays: `grads()` above builds `g`
+    // against those exact four elements, and `compare` has to difference the same
+    // objective it was handed. A shorter array here makes every `tok_embed` element
+    // disagree, so the sweep reports `tok_embed` long before it reaches `wk` and the
+    // assertion below names the wrong field.
+
+    var g = try grads(std.testing.allocator, nan_cfg, p);
+    defer g.deinit();
+
+    for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |poison| {
+        g.layers[0].wk.data[5] = @floatCast(poison);
+        const nan_bad = try gradcheck.compare(std.testing.allocator, nan_cfg, &p, tok, tgt, &g);
+        defer nan_bad.deinit();
+        const m = nan_bad.mismatch orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("wk", m.field);
+    }
+
+    // TWO non-finite elements in the SAME tensor, which is the case a guard written as
+    // `... and mismatch == null` misses: the second one skips the finiteness test
+    // entirely. Poisoning one at a time cannot see it, because `mismatch` is null
+    // going in every time.
+    g.layers[0].wk.data[5] = std.math.nan(f32);
+    g.layers[0].wk.data[6] = std.math.inf(f32);
+    const two = try gradcheck.compare(std.testing.allocator, gqa, &p, tok, tgt, &g);
+    defer two.deinit();
+    try std.testing.expect(two.mismatch != null);
+    // NOT "the field is wk". Poisoning `wk` makes `attn_norm`'s gradient non-finite
+    // too, and the sweep reports the FIRST non-finite group, which is therefore
+    // `attn_norm` -- that ordering is correct and not worth pinning. The property
+    // this half exists for is that no row holding a non-finite value reads as clean:
+    // `relative > group.worst` is false for a NaN, so without an explicit mark those
+    // rows would print `worst 0.000e+00`.
+    var marked = false;
+    for (two.groups) |row| {
+        if (std.math.isInf(row.worst)) marked = true;
+    }
+    try std.testing.expect(marked);
 }
 
 test "gradcheck: the budget bounds a correct gradient on grouped-query attention" {
@@ -153,7 +205,7 @@ test "gradcheck: the budget bounds a correct gradient on grouped-query attention
     var g = try grads(std.testing.allocator, gqa, p);
     defer g.deinit();
 
-    const r = try gradcheck.compare(std.testing.allocator, gqa, p, tok, tgt, &g);
+    const r = try gradcheck.compare(std.testing.allocator, gqa, &p, tok, tgt, &g);
     defer r.deinit();
 
     // Two bounds, not one: `mismatch == null` is also true of a budget that has
@@ -192,7 +244,7 @@ test "gradcheck: the budget bounds a correct gradient on grouped-query attention
     // slack in one direction.
     const before = g.layers[0].wk.data[5];
     g.layers[0].wk.data[5] = before + @as(f32, @floatCast(2.0 * r.floor));
-    const bad = try gradcheck.compare(std.testing.allocator, gqa, p, tok, tgt, &g);
+    const bad = try gradcheck.compare(std.testing.allocator, gqa, &p, tok, tgt, &g);
     defer bad.deinit();
     const m = bad.mismatch orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("wk", m.field);
@@ -253,7 +305,7 @@ test "gradcheck: report writes the table it is handed" {
 
     var g = try grads(std.testing.allocator, tiny, p);
     defer g.deinit();
-    const r = try gradcheck.compare(std.testing.allocator, tiny, p, tok, tgt, &g);
+    const r = try gradcheck.compare(std.testing.allocator, tiny, &p, tok, tgt, &g);
     defer r.deinit();
     try std.testing.expectEqual(@as(?gradcheck.Mismatch, null), r.mismatch);
     for (r.groups) |group| {
@@ -313,7 +365,7 @@ test "gradcheck: checkAll passes on a correct gradient and restores the paramete
     const before = try std.testing.allocator.dupe(f32, p.tok_embed.data);
     defer std.testing.allocator.free(before);
 
-    try gradcheck.checkAll(std.testing.allocator, tiny, p, tok, tgt);
+    try gradcheck.checkAll(std.testing.allocator, tiny, &p, tok, tgt);
 
     try std.testing.expectEqualSlices(f32, before, p.tok_embed.data);
 }

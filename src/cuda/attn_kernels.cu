@@ -77,6 +77,23 @@
         }                                                                                          \
     } while (0)
 
+// A LAUNCH failure is not an allocation or a memcpy failure, and the two must not
+// share an exit. Everything above uses CUDA_GO, whose `exit(1)` is right for the
+// benchmark harness -- that process is about to stop anyway -- and wrong for the
+// library path, because `src/cuda/device.zig` links this same object to put the
+// forward INSIDE a training step. There, a launch the driver refuses killed the
+// trainer outright instead of surfacing as a Zig error, and the caller never got
+// the chance to synchronise and read the status the C header tells it to read.
+//
+// So a launch is checked by this, which RETURNS. The harness maps the non-zero to
+// its own exit(1); the Zig side maps it to an error. One error path, not two.
+static int zt_attn_launch_ok(const char *what) {
+    const cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess) return 0;
+    fprintf(stderr, "attn: FAIL %s: %s\n", what, cudaGetErrorString(e));
+    return 1;
+}
+
 // The host side of the shared-memory layout: sq[dim], ss[tile], sk[tile*(dim+1)],
 // sv[tile*dim]. It does NOT bind the kernel, which derives the same layout by
 // pointer arithmetic, and an earlier version of this comment claimed it did. If
@@ -816,6 +833,20 @@ static int zt_attn_optin(const void *fn, size_t bytes) {
 int zt_attn_forward(const float *q, const float *k, const float *v, float *out, int T, int n_heads,
                     int n_kv_heads, int dim, int group_q, int max_tile, int q_offset, int n_keys,
                     cudaStream_t stream) {
+    // T first, before every other guard, and the reason is that nothing below it
+    // is safe without it. `blocks_x = (T + group_q - 1) / group_q` turns T = 0 into a
+    // grid with no blocks and T = -1 into a grid of 4294967295; both are
+    // `cudaErrorInvalidConfiguration`, which `CUDA_GO` reports by ending the host
+    // process, from a library entry point whose contract is to return 1 with a
+    // reason on stderr. `n_keys - T` further down is overflow-safe only once T is
+    // positive: with T = INT_MIN the subtraction is itself signed overflow.
+    if (T < 1) {
+        fprintf(stderr,
+                "zt_attn: T %d is not launchable. A zero or negative query count\n"
+                "       gives a grid with no blocks, or one the driver cannot form.\n",
+                T);
+        return 1;
+    }
     // The width check comes FIRST and it prints. It used to be a silent `return 1`
     // here as well as the printing one further down, and the silent one won: a
     // refused width produced a return code and no line at all, so the most common
@@ -824,6 +855,17 @@ int zt_attn_forward(const float *q, const float *k, const float *v, float *out, 
     if (n_heads <= 0 || n_kv_heads <= 0 || n_heads % n_kv_heads != 0) {
         fprintf(stderr, "zt_attn: %d heads over %d kv heads is not a group.\n", n_heads,
                 n_kv_heads);
+        return 1;
+    }
+    // gridDim.y is 65535 and gridDim.z is 65535 on every architecture CUDA supports;
+    // only .x is the 2^31-1 one. Both kernels below launch `dim3 grid(blocks_x,
+    // n_heads)`, so a head count past 65535 builds a grid the driver refuses. Nothing
+    // above caught it: the group check bounds n_heads only from BELOW, so
+    // `Attn.init(1, 65536, 32768, 32)` passed every gate and then produced
+    // cudaErrorInvalidConfiguration on the launch -- which, before this check, reached
+    // the caller as an `exit(1)` from inside CUDA_GO rather than as a refusal.
+    if (n_heads > 65535) {
+        fprintf(stderr, "zt_attn: %d heads exceeds the 65535 gridDim.y limit.\n", n_heads);
         return 1;
     }
     if (group_q < 1 || group_q > 64 || (size_t)dim * (size_t)group_q > 1024) {
@@ -846,10 +888,10 @@ int zt_attn_forward(const float *q, const float *k, const float *v, float *out, 
     // `T = 1` wraps to `INT_MIN`, the comparison is false, the guard admits the call,
     // and the kernel then computes `last = min(n_keys, INT_MIN)` -- zero tiles, a
     // zero denominator, and `acc / lrun` storing NaN with a 0 return. That is this
-    // comment's own failure, reached through the check written to prevent it. The two
-    // clauses left of it are what makes the subtraction safe: `q_offset >= 0` and
-    // `n_keys >= 1` both hold before the third is evaluated, and `n_keys - T` is then
-    // computable without ever forming a sum that can overflow. `device.zig`'s
+    // comment's own failure, reached through the check written to prevent it. The
+    // subtraction is overflow-safe only because the `T < 1` guard above has already
+    // returned; an audit claimed `q_offset >= 0` and `n_keys >= 1` were what made it
+    // safe, and neither has anything to say about `T`'s sign. `device.zig`'s
     // `forwardBounds` compares the same way and says so.
     if (q_offset < 0 || n_keys < 1 || q_offset > n_keys - T) {
         fprintf(stderr, "zt_attn: q_offset %d, n_keys %d is not launchable.\n", q_offset, n_keys);
@@ -891,7 +933,7 @@ int zt_attn_forward(const float *q, const float *k, const float *v, float *out, 
     dim3 block((unsigned)(dim * group_q));
     fusedAttnForward<0><<<grid, block, shmem, stream>>>(q, k, v, out, T, n_heads, n_kv_heads, dim,
                                                          tile, group_q, q_offset, n_keys);
-    CUDA_GO(cudaGetLastError());
+    if (zt_attn_launch_ok("fusedAttnForward launch")) return 1;
     return 0;
 }
 
@@ -910,6 +952,20 @@ int zt_attn_forward(const float *q, const float *k, const float *v, float *out, 
 int zt_attn_backward(const float *q, const float *k, const float *v, const float *dout, float *dq,
                      float *dk, float *dv, float *row_max, float *row_den, float *row_del, int T,
                      int n_heads, int n_kv_heads, int dim, int max_tile, cudaStream_t stream) {
+    // T first, before every other guard, and the reason is that nothing below it
+    // is safe without it. `blocks_x = (T + group_q - 1) / group_q` turns T = 0 into a
+    // grid with no blocks and T = -1 into a grid of 4294967295; both are
+    // `cudaErrorInvalidConfiguration`, which `CUDA_GO` reports by ending the host
+    // process, from a library entry point whose contract is to return 1 with a
+    // reason on stderr. `n_keys - T` further down is overflow-safe only once T is
+    // positive: with T = INT_MIN the subtraction is itself signed overflow.
+    if (T < 1) {
+        fprintf(stderr,
+                "zt_attn: T %d is not launchable. A zero or negative query count\n"
+                "       gives a grid with no blocks, or one the driver cannot form.\n",
+                T);
+        return 1;
+    }
     // The width check first, and printing, for the reason the forward's copy of it
     // gives: the silent one used to sit in front of this one and swallow every
     // message.
@@ -917,6 +973,12 @@ int zt_attn_backward(const float *q, const float *k, const float *v, const float
     if (n_heads <= 0 || n_kv_heads <= 0 || n_heads % n_kv_heads != 0) {
         fprintf(stderr, "zt_attn: %d heads over %d kv heads is not a group.\n", n_heads,
                 n_kv_heads);
+        return 1;
+    }
+    // The same 65535 gridDim.y ceiling the forward's copy explains, and for the same
+    // reason: both dq and dk/dv launch `dim3 grid(blocks_x, n_heads)`.
+    if (n_heads > 65535) {
+        fprintf(stderr, "zt_attn: %d heads exceeds the 65535 gridDim.y limit.\n", n_heads);
         return 1;
     }
     if (max_tile < 1) {
@@ -960,9 +1022,16 @@ int zt_attn_backward(const float *q, const float *k, const float *v, const float
     dim3 blockB((unsigned)dim);
     attnDqKernel<0><<<gridA, blockA, shmemA, stream>>>(q, k, v, dout, dq, row_max, row_den, row_del,
                                                        T, n_heads, n_kv_heads, dim, tile);
+    // Checked HERE, between the two launches, not once after both. A single check
+    // after the pair attributes a dq failure to the dk/dv launch that follows it, and
+    // clearing the error here is what stops it being picked up by an unrelated later
+    // call. This file already documents that exact failure mode -- "the silent one
+    // used to sit in front of this one and swallow every message" -- and it is the
+    // same bug wearing a different hat.
+    if (zt_attn_launch_ok("attnDqKernel launch")) return 1;
     attnDkDvKernel<0><<<gridB, blockB, shmemB, stream>>>(q, k, v, dout, row_max, row_den, row_del, dk,
                                                          dv, T, n_heads, n_kv_heads, dim);
-    CUDA_GO(cudaGetLastError());
+    if (zt_attn_launch_ok("attnDkDvKernel launch")) return 1;
     return 0;
 }
 

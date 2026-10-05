@@ -183,5 +183,4 @@ echo "      tree calls device.Attn.backward, so the backward kernel is exercised
 echo "      only here. A KV cache exists (src/kv_cache.zig, six tests) and"
 echo "      src/decode.zig decodes through it: decode.cudaAttnStep derives q_offset ="
 echo "      pos from the cache itself, so the forward kernel's offset is exercised at"
-echo "      every real decode position and not only at 0. The external parity"
-echo "      comparison still runs entirely on the CPU."
+echo "      every real decode position and not only at 0."

@@ -26,7 +26,7 @@
 //!
 //!   <tag>.x.bin  the [rows, cols] input
 //!   <tag>.w.bin  the [1, cols] weight
-//!   <tag>.y.bin  norm.forward's answer, the parity oracle
+//!   <tag>.y.bin  norm.forward's answer, the reference the kernel is graded against
 //!   manifest.tsv one line per shape, described below
 //!
 //! The manifest exists so the shape table is written once. `norm.cu` reads it and
@@ -144,8 +144,7 @@ const shapes = [_]Shape{
 const flat_value: f32 = @as(f32, 1.0) / @as(f32, 3.0);
 
 /// One PRNG seed for the whole table, so a run is reproducible from this file
-/// alone and the .cu side needs no seed of its own. removed.zig uses the same
-/// generator for the same reason.
+/// alone and the .cu side needs no seed of its own.
 const seed: u64 = 20260929;
 
 // The blob format is little-endian f32 written straight out of memory, so this
@@ -181,7 +180,17 @@ pub fn main(init: std.process.Init) !void {
         var w = try Tensor.init(gpa, 1, shape.cols);
         defer w.deinit();
         fillInput(&x, shape.kind);
-        fillWeight(&w, seed, shape.cols);
+        // A DIFFERENT seed from `fillInput`'s, and that is the whole point of the
+        // parameter. `fillInput` draws from `seed` and consumes two randoms per
+        // element; passing `seed` here too made `w.data[i]` bit-identical to
+        // `x.data[i]` for every `i < cols` -- verified, not assumed -- so a kernel
+        // reading `x_row[i]` where it meant `weight[i]` agreed with the CPU twin on
+        // EVERY shape's first row, and on the whole of the 1x1 and 1x4 shapes. The
+        // doc comment above `fillWeight` says a constant weight "would hide a kernel
+        // that indexed the wrong element"; the equal-seed case hid it just as well.
+        // Deriving the weight seed keeps the two streams provably distinct without a
+        // second hand-maintained constant to fall out of step with this one.
+        fillWeight(&w, seed ^ 0x9E3779B97F4A7C15, shape.cols);
 
         // `var` rather than `const` because `deinit` takes a mutable receiver,
         // and a const local would make defer a cast that discards const.

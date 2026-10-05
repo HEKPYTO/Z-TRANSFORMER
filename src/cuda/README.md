@@ -147,17 +147,18 @@ partials of 512 values serially, which is no longer a power of two and does roun
 `wide_flat` reads `7.2e-7` instead of zero. The `f32` rounding of the square itself is common to
 both sides at every width and is not what separates these rows.
 
-## The gate is checked against two broken kernels
+## The gate is checked against three broken kernels
 
-A gate that has never rejected anything is not known to work. Every run also launches two
+A gate that has never rejected anything is not known to work. Every run also launches three
 deliberately broken variants of the same kernel over the same inputs and requires the gate to
-reject both. A run where either slips past exits non-zero, which means the parity column above would
-mean nothing.
+reject all three. A run where any slips past exits non-zero, which means the parity column above
+would mean nothing.
 
 | Fault | What it is | Worst difference seen | Rejected |
 |---|---|---|---|
-| `weight[0] += 1e-3` | One weight element out of 16.7 million moved by 1e-3 | `5.7e-4` to `3.9e-3` | every shape |
-| `mean, not mean of squares` | The multiply by itself is dropped from the accumulator | `1.1` to `4.0e+03`, and `inf` | every shape |
+| `weight[0] += 1e-3` | One weight element out of 16.7 million moved by 1e-3 | `5.7e-4` to `3.2e-3` | every shape |
+| `mean, not mean of squares` | The multiply by itself is dropped from the accumulator | `1.9` and `inf` | every shape |
+| `weight read from x` | The index is right, the tensor is wrong | `6.3e-1` to `3.9e+1` | every shape |
 
 The first is the important one: a `1e-3` error is caught by a `1e-5` gate with two orders of
 magnitude to spare, which says the gate discriminates at its own scale and is not merely detecting
@@ -168,20 +169,68 @@ whose mean is negative, that kernel takes `sqrt` of a negative and returns `NaN`
 comparison was `if (d > worst)`, which is **false for every comparison against a `NaN`**. A kernel
 returning `NaN` on every element therefore reported a worst difference of exactly `0.000000e+00`
 and passed the gate on three shapes. The comparison now maps a `NaN` to infinity before comparing.
-That is what the `inf` rows below are.
+That is what the `inf` readings are in the transcript below.
+
+The third found a hole in this gate's own inputs. It is the fault the other two cannot express:
+both of them mutate a value the kernel already holds in a register, so a kernel reading the wrong
+**tensor** would still be caught by them, and nothing tested the tensor choice itself. It was
+invisible because `norm_twin.zig` drew the weight from the same PRNG seed as the input, which made
+`w.data[i]` bit-identical to `x.data[i]` for every `i < cols` — verified, not assumed. A kernel
+reading `x_row[i]` where it meant `weight[i]` therefore agreed with the CPU twin on **every shape's
+first row**, and on the whole of the `1x1` and `1x4` shapes. The twin now draws from a derived
+seed, and the transcript below is what shows the gate noticing.
 
 ```
 gate    shape        size         deliberate fault          max_abs_diff  caught?
-gate    one          1x1          weight[0] += 1e-3         9.999871e-04  caught
+gate    one          1x1          weight[0] += 1e-3         9.999946e-04  caught
 gate    one          1x1          mean, not mean of squares           inf  caught
-gate    hand         1x4          weight[0] += 1e-3         5.692840e-04  caught
+gate    one          1x1          weight read from x        6.265555e-01  caught
+gate    hand         1x4          weight[0] += 1e-3         5.693026e-04  caught
 gate    hand         1x4          mean, not mean of squares           inf  caught
-gate    ragged       3x7          weight[0] += 1e-3         1.513243e-03  caught
+gate    hand         1x4          weight read from x        2.563221e+00  caught
+gate    ragged       3x7          weight[0] += 1e-3         1.513280e-03  caught
 gate    ragged       3x7          mean, not mean of squares           inf  caught
+gate    ragged       3x7          weight read from x        3.482360e+00  caught
 ...
-gate    big          4096x4096    weight[0] += 1e-3         3.232718e-03  caught
+gate    model_flat   256x128      weight[0] += 1e-3         9.999573e-04  caught
+gate    model_flat   256x128      mean, not mean of squares  1.874910e+00  caught
+gate    model_flat   256x128      weight read from x        4.769584e+00  caught
+...
+gate    big          4096x4096    weight[0] += 1e-3         3.232822e-03  caught
 gate    big          4096x4096    mean, not mean of squares           inf  caught
+gate    big          4096x4096    weight read from x        3.874138e+01  caught
+gate    ...and every pair of variants differs on at least one shape, so these
+gate    are 3 different faults rather than one fault wearing 3 names.
 ```
+
+The `model_flat` block is the one to read twice. Those two rows printed an **identical**
+`1.874910e+00` under two different fault names while the third variant was undispatched;
+they now read `1.874910e+00` and `4.769584e+00`. That single row is why the pairwise check
+exists — a reader eyeballing a table might not have caught it, and did not.
+
+**That transcript replaced an earlier one, and the earlier one was wrong.** It was taken from
+a run in which the `weight read from x` row was produced by the *MEAN* kernel:
+`BROKEN_WRONG_TENSOR` had a branch in the kernel body but no `case` in `launchRmsNorm`'s
+switch, so it fell through to the same `default:` that dispatched `BROKEN_MEAN`. Nothing in
+the harness noticed, and the transcript was pasted here as evidence the third fault was
+caught. The tell was in it — on the `_flat` shapes the two rows printed an identical
+`1.874910e+00` under different names — and it survived into the committed file.
+
+Three things changed as a result, and each of them is what a reader should check:
+
+1. Every variant has its own `case`, and `default:` now **refuses** rather than guessing.
+2. `launchRmsNorm` returns `int`. It was `void`, so a refusal that launched nothing was
+   indistinguishable at the call site from a success — and because no launch means no
+   error, the caller's `cudaGetLastError()` came back clean and the following
+   `cudaMemcpy` copied uninitialised device memory, which then measured as `caught`.
+3. The gate column has **three** states, not two: `caught`, `MISSED`, and `DID NOT RUN`.
+   `MISSED` is a finding about the gate; `DID NOT RUN` is a finding about the harness, and
+   printing `caught` for the second is the specific mistake above.
+
+`verify` also now fails when any two variants produce identical differences on every
+shape, because two rows with the same number under different fault names are one fault,
+not two. `run-norm.sh` is the command; it prints its own table, and a run where any row
+is not `caught` exits non-zero.
 
 ## Benchmark
 
@@ -497,12 +546,26 @@ attn: broken variant 3 was caught, as it must be
 attn: broken variant 4 was caught, as it must be
 ```
 
+**Re-measured `2026-10-03`, and only the arithmetic.** The parity half of `sh src/cuda/run-attn.sh`
+reproduces every timing-independent column of the table below exactly: `max_abs` reads 5.960e-08 at
+`head_dim` 32, 7.451e-08 at 128 and 1.043e-07 at 192 -- 0.060%, 0.075% and 0.104% of the 1e-04 gate -- with
+all eleven shapes reporting `ok` and the argmax counts matching, and with all eight broken variants caught,
+the four backward ones carrying pairwise-distinct signatures.
+
+**The `cpu_us`, `kernel_us` and `ratio` columns from that run are not recorded anywhere and should not be
+quoted from it.** It was taken with `ATTN_ALLOW_DIRTY_HOST=1` on a card holding another workload, which the
+host gate had refused for exactly that reason. Its ratios land near the published ones by coincidence, and a
+contaminated number that resembles a clean one is worse than no number at all.
+
+
 **One run, so one sample per shape, and this is not the published table.** The root `README.md`
-carries the minimum of three invocations, **57.9x to 168.1x** (min-of-3; the widest single run was 168.8x), because `ctx256`'s CPU column is
+carries the minimum of three invocations, **93.8x to 165.4x** (min-of-3, re-measured `2026-10-04`
+on a host its own gate accepted), because `ctx256`'s CPU column is
 bimodal and a single sample there is a 1.74x coin toss -- `outputs/bench/ctx256-sweep.csv` is the ten
-runs that establish it. The `10800.28 us` above is one draw from the high mode; the root table's
-`57.9x` comes from a run that drew low. Both are correct and they differ by a factor, which is the
-whole reason the minimum is the statistic and a single run is not one.
+runs that establish it. The `10800.28 us` above is one draw from the high mode, and the root table's
+`98.3x` is the minimum of three invocations that all drew that same high mode -- the 34.3% outcome,
+not the expected one. A draw from the low mode would read near `58x`. The two differ by a factor,
+which is the whole reason the minimum is the statistic and a single run is not one.
 
 This block previously quoted `105.2x` at `ctx256` and a `10884.32 us` call from an earlier session,
 and was withdrawn rather than re-pointed at numbers whose log was not kept. It is now a real run
@@ -742,15 +805,12 @@ from the cache itself, so the forward kernel's offset is exercised at every real
 rather than only at 0. **An earlier version of this paragraph said there was no generation loop and
 no `q_offset` on a single-token query. Both were true when written and neither is now.**
 
-The external parity comparison in `tools/removed/` runs entirely on the CPU and is untouched by
-anything here, so the block-parity claim in `AGENTS.md` does not depend on this file existing.
-
-The `gate` column in either table is `ATTN_TOL` / `ATTN_BWD_TOL` from this directory, and it is **not
-one of the gates in `tools/removed/oracle.txt`.** Those eighteen are per-tensor tolerances against a
-an external library reference, from 2e-6 on `attn_norm_out` to 2e-4 on `logits`; the two
-systems share no number and grade different implementations of different things. The closest analogue,
-`attn_ctx` at 2e-5, is tighter than the forward's 1e-4. A row passing here says nothing about that
-one, and the block-parity claim rests entirely on the `oracle.txt` gates.
+**Every gate in this directory is internal, and that is the whole claim.** The `gate` column in
+either table is `ATTN_TOL` / `ATTN_BWD_TOL` from `src/cuda/attn.cu`, and both grade these kernels
+against this repository's own CPU twin -- `attention.forward` forward, `attentionBackward` backward.
+Two tolerance systems, no number in common with each other, and no third-party reference anywhere
+in the loop: a row reading `caught` says these kernels agree with the Zig attention implementation
+to the stated tolerance, which is the only claim these tables make.
 
 ## Fused causal attention, backward
 
@@ -941,7 +1001,7 @@ are quoted because the forward's spread is a factor of 1.67 and pretending to a 
 across that spread would be the exact thing this README keeps refusing to do elsewhere.
 
 **So the honest answer is 1.016x to 1.027x on a training step for the swap the code can make today, and attention is 6.3% to 7.3% of it. The wider 1.065x to 1.077x range earlier in this file assumed the backward was swapped too, which no step can do.** That
-is worth stating plainly because the per-call numbers are 57.9x to 168.1x and they invite the conclusion that
+is worth stating plainly because the per-call numbers are 93.8x to 165.4x and they invite the conclusion that
 the step will be many times faster. It will not be. The other 92.7% to 93.7% of a step is the matmuls,
 the two norms, RoPE, SwiGLU, the tied head and AdamW, and **all of it is still on the CPU.** This
 repository has one primitive kernel and three attention kernels; that is the entire device-side

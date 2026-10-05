@@ -16,10 +16,10 @@ const Tensor = tensor.Tensor;
 // before moving either of them out from under it.
 const device = @import("cuda/device.zig");
 
-/// Public because the parity exporter writes it into the config the
-/// external side builds its reference model from. A harness that hardcoded
-/// 500000 next to a model that changed it would fail on RoPE and read as a
-/// numerics bug rather than as a stale number.
+/// Public rather than private because a constant that is only read inside this
+/// file cannot be pinned by a test outside it. `rope_test.zig` asserts this exact
+/// value, and Llama-3's base is 500000 rather than the textbook 10000 -- a
+/// silent edit to 10000 must fail loudly rather than read as a numerics bug.
 pub const rope_theta: f64 = 500000;
 const init_stddev: f64 = 0.02;
 
@@ -263,6 +263,31 @@ pub fn forwardWith(
     // built for a shallower or deeper stack would pass the check above and then
     // run the depth it was handed, ignoring the parameters it was handed.
     if (p.layers.len != cfg.n_layers) return error.DimensionMismatch;
+    // The per-LAYER geometry, which the two checks above cannot see. They compare
+    // `tok_embed` against `d` and count the layers, so they catch a changed
+    // n_heads, head_dim or depth -- attention's own shape contract catches a changed
+    // n_kv_heads -- and none of them looks at the MLP. A config carrying a different
+    // ffn_mult names weights this run does not have, `mlp.forward` takes no config
+    // and validates nothing, and the matmul then reads past the buffer instead of
+    // reporting the mismatch. Checked here because this is the one place holding
+    // both the parameters and the config.
+    {
+        const kv_dim = cfg.n_kv_heads * cfg.head_dim;
+        const h = ffnDim(cfg);
+        for (p.layers) |*l| {
+            const want = [_][2]usize{
+                .{ 1, d }, .{ d, d }, .{ d, kv_dim }, .{ d, kv_dim }, .{ d, d },
+                .{ 1, d }, .{ d, h }, .{ d, h },      .{ h, d },
+            };
+            const have = [_]Tensor{
+                l.attn_norm, l.wq,     l.wk,   l.wv,     l.wo,
+                l.mlp_norm,  l.w_gate, l.w_up, l.w_down,
+            };
+            for (have, want) |t, shape| {
+                if (t.rows != shape[0] or t.cols != shape[1]) return error.DimensionMismatch;
+            }
+        }
+    }
 
     var x = try Tensor.init(allocator, t_count, d);
     errdefer x.deinit();

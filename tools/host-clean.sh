@@ -112,24 +112,45 @@ if [ -n "$load_whole" ] && [ "$load_whole" -gt "$max_load" ]; then
     failed=1
 fi
 
-# `pgrep -c` prints 0 AND exits 1 when nothing matches, so `|| echo 0` appends a
-# second 0 and the comparison below dies on "integer expected". Counting lines
-# is the form that stays numeric under both outcomes.
+# `pgrep`'s OWN exit status is what matters, and it cannot be recovered through a
+# pipe: `pgrep ... | wc -l` prints 0 on both "no match" and "no such command",
+# because the pipeline's output is wc's. An earlier version of this guard tested
+# the piped RESULT for emptiness, which is always a bare digit, so it never fired
+# and a host without procps was reported as having no sibling builds -- having
+# listed nothing at all. Test the command, then test its status, then count.
 #
 # The pattern names the training and benchmark binaries rather than `zig build`,
 # because this script is itself run from inside a build step and would otherwise
 # match its own parent and refuse every clean host.
-siblings=$(pgrep -f 'ztransformer-train|ztransformer-cuda-train|ztransformer-dbg-train|attn_twin|norm_twin' 2>/dev/null | wc -l | tr -d ' ')
-siblings=${siblings:-0}
-# Same guard as the load read: no procps means no pgrep, the pipeline yields
-# nothing, and an empty `-gt 0` is false rather than a measurement of zero.
-case "$siblings" in
-    '' | *[!0-9]*)
-        echo "host-clean: pgrep did not yield a process count." >&2
+#
+# Assigned BEFORE the branch, not inside its `else`. The comparison below is
+# unconditional, so a host with a card but no procps reached an unset `siblings`
+# and `set -u` killed the script with `unbound variable` -- which exits non-zero,
+# so the gate still refused, but it refused with a shell diagnostic instead of
+# the two lines above that exist to explain what the operator should do about it.
+siblings=0
+if ! command -v pgrep >/dev/null 2>&1; then
+    echo "host-clean: pgrep is not installed, so sibling builds cannot be counted." >&2
+    echo "  A sibling count this script cannot read is not a count of zero." >&2
+    failed=1
+else
+    # pgrep exits 0 when it matched and 1 when it did not. Exit 1 is the NORMAL
+    # case on a clean host, so it must not be treated as a failure; 2 and above
+    # are pgrep reporting an error of its own. An earlier attempt here refused on
+    # any non-zero, which would have made every clean host fail its own pre-flight.
+    # `|| sibling_status=$?` is what keeps `set -e` from aborting here. As a bare
+    # assignment the non-zero status of the substitution IS the assignment's status,
+    # so pgrep's normal "no match" exit of 1 killed the script on every clean host.
+    sibling_status=0
+    sibling_pids=$(pgrep -f 'ztransformer-train|ztransformer-cuda-train|ztransformer-dbg-train|attn_twin|norm_twin' 2>/dev/null) || sibling_status=$?
+    if [ "$sibling_status" -gt 1 ]; then
+        echo "host-clean: pgrep exited $sibling_status and produced no process list." >&2
         echo "  A sibling count this script cannot read is not a count of zero." >&2
         failed=1
-        ;;
-esac
+        sibling_pids=''
+    fi
+    siblings=$(printf '%s\n' "$sibling_pids" | grep -c . || true)
+fi
 if [ "$siblings" -gt 0 ]; then
     echo "host-clean: ${siblings} training or benchmark processes are resident." >&2
     echo "  This host runs one job at a time. A second one makes the first's CPU" >&2

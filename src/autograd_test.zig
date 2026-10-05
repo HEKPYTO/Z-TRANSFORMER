@@ -263,31 +263,31 @@ fn expectSameTensors(want: []const Tensor, got: []const Tensor) !void {
 test "autograd: gradcheck every parameter element on the tiny config" {
     var p = try liveParams(std.testing.allocator, tiny);
     defer p.deinit();
-    try gradcheck.checkAll(std.testing.allocator, tiny, p, tok, tgt);
+    try gradcheck.checkAll(std.testing.allocator, tiny, &p, tok, tgt);
 }
 
 test "autograd: gradcheck every parameter element where the matmul unroll tails run" {
     var p = try liveParams(std.testing.allocator, unroll_tail);
     defer p.deinit();
-    try gradcheck.checkAll(std.testing.allocator, unroll_tail, p, tok, tgt);
+    try gradcheck.checkAll(std.testing.allocator, unroll_tail, &p, tok, tgt);
 }
 
 test "autograd: gradcheck where the attention backward unrolls execute" {
     var p = try liveParams(std.testing.allocator, unroll_s);
     defer p.deinit();
-    try gradcheck.checkAll(std.testing.allocator, unroll_s, p, tok8, tgt8);
+    try gradcheck.checkAll(std.testing.allocator, unroll_s, &p, tok8, tgt8);
 }
 
 test "autograd: gradcheck at the shipped head_dim, where the dim split has four groups" {
     var p = try liveParams(std.testing.allocator, unroll_group);
     defer p.deinit();
-    try gradcheck.checkAll(std.testing.allocator, unroll_group, p, tok8, tgt8);
+    try gradcheck.checkAll(std.testing.allocator, unroll_group, &p, tok8, tgt8);
 }
 
 test "autograd: gradcheck passes for two layers" {
     var p = try liveParams(std.testing.allocator, two_layers);
     defer p.deinit();
-    try gradcheck.checkAll(std.testing.allocator, two_layers, p, tok, tgt);
+    try gradcheck.checkAll(std.testing.allocator, two_layers, &p, tok, tgt);
 }
 
 test "autograd: gradcheck passes when every norm weight is one" {
@@ -298,7 +298,7 @@ test "autograd: gradcheck passes when every norm weight is one" {
         l.mlp_norm.fill(1);
     }
     p.final_norm.fill(1);
-    try gradcheck.checkAll(std.testing.allocator, two_layers, p, tok, tgt);
+    try gradcheck.checkAll(std.testing.allocator, two_layers, &p, tok, tgt);
 }
 
 test "autograd: gradcheck passes when every norm weight is zero" {
@@ -319,7 +319,7 @@ test "autograd: gradcheck passes when every norm weight is zero" {
         l.mlp_norm.fill(0);
     }
     p.final_norm.fill(0);
-    try gradcheck.checkAll(std.testing.allocator, tiny, p, tok, tgt);
+    try gradcheck.checkAll(std.testing.allocator, tiny, &p, tok, tgt);
 
     var g = try autograd.zeroGrads(std.testing.allocator, p);
     defer g.deinit();
@@ -350,7 +350,7 @@ test "autograd: a failed loss evaluation leaves the parameter it moved untouched
     // The first target is out of range, so the very first loss evaluation fails,
     // which is the one taken while tok_embed[0] is a step off its true value.
     const before = p.tok_embed.data[0];
-    try std.testing.expectError(error.TargetOutOfRange, gradcheck.compare(std.testing.allocator, tiny, p, tok, &.{ tiny.vocab_size, 0, 0, 0 }, &g));
+    try std.testing.expectError(error.TargetOutOfRange, gradcheck.compare(std.testing.allocator, tiny, &p, tok, &.{ tiny.vocab_size, 0, 0, 0 }, &g));
     try std.testing.expectEqual(@as(u32, @bitCast(before)), @as(u32, @bitCast(p.tok_embed.data[0])));
 }
 
@@ -381,7 +381,7 @@ test "autograd: a wrong gradient is named, with its index" {
 
     // The positive half, first: the untouched gradient is accepted. A check that
     // rejected everything would satisfy the rest of this test just as well.
-    const clean = try gradcheck.compare(std.testing.allocator, tiny, p, tok, tgt, &g);
+    const clean = try gradcheck.compare(std.testing.allocator, tiny, &p, tok, tgt, &g);
     defer clean.deinit();
     try std.testing.expectEqual(@as(?gradcheck.Mismatch, null), clean.mismatch);
     // And the floor it was accepted against has to be the derived one, small
@@ -391,7 +391,7 @@ test "autograd: a wrong gradient is named, with its index" {
 
     g.tok_embed.data[wrong] = truth + @as(f32, @floatCast(one_percent));
 
-    const r = try gradcheck.compare(std.testing.allocator, tiny, p, tok, tgt, &g);
+    const r = try gradcheck.compare(std.testing.allocator, tiny, &p, tok, tgt, &g);
     defer r.deinit();
 
     const m = r.mismatch orelse {
@@ -470,7 +470,7 @@ test "autograd: the tied head's two paths into tok_embed are separable" {
 
     // And the finite difference agrees with the whole thing, which is the part
     // that matters: the split above is a property, the gradcheck is the proof.
-    try gradcheck.checkAll(std.testing.allocator, cfg, p, one, away);
+    try gradcheck.checkAll(std.testing.allocator, cfg, &p, one, away);
 }
 
 /// The final hidden state the tied head sees, rebuilt from the stream the same
@@ -855,7 +855,7 @@ test "autograd: gradcheck covers grouped-query attention" {
     try std.testing.expect(gqa.n_heads > gqa.n_kv_heads);
     var p = try liveParams(std.testing.allocator, gqa);
     defer p.deinit();
-    try gradcheck.checkAll(std.testing.allocator, gqa, p, tok, tgt);
+    try gradcheck.checkAll(std.testing.allocator, gqa, &p, tok, tgt);
 }
 
 /// A tensor whose values vary with the index.
@@ -957,6 +957,23 @@ test "autograd: attentionBackward refuses five requests, four of them the forwar
     var narrow_dout = try ramped(allocator, t_count, wide - 1, 1.0);
     defer narrow_dout.deinit();
     try std.testing.expectError(error.DimensionMismatch, autograd.attentionBackward(allocator, q, k, v, narrow_dout, .{
+        .n_layers = 1,
+        .n_heads = 2,
+        .n_kv_heads = 2,
+        .head_dim = 4,
+        .n_ctx = t_count,
+        .vocab_size = 0,
+        .ffn_mult = 0,
+    }));
+
+    // A WIDER `dout` is the refusal this had missing, and it is the quiet one. Nothing
+    // reaches the columns past `n_heads * dim`, so an over-wide buffer neither panics
+    // nor looks wrong -- the extra columns are simply ignored, and the caller gets a
+    // plausible answer to a question it did not ask. A `<` test accepts this shape; the
+    // assertion below is what says it does not.
+    var wide_dout = try ramped(allocator, t_count, wide + 1, 1.0);
+    defer wide_dout.deinit();
+    try std.testing.expectError(error.DimensionMismatch, autograd.attentionBackward(allocator, q, k, v, wide_dout, .{
         .n_layers = 1,
         .n_heads = 2,
         .n_kv_heads = 2,

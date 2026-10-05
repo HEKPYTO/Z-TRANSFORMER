@@ -29,12 +29,11 @@
 // it, so the forward kernel's `q_offset` is reached at every real decode
 // position, not only at 0.
 //
-// BOTH parity tables here are against the CPU implementations this would
-// replace -- `attention.forward` and `attentionBackward` -- and NOT against a
-// external reference, which still runs entirely on the CPU and is unaffected
-// by anything in this file. Neither gate is one of the eighteen in
-// `tools/removed/oracle.txt`; those grade a different implementation against a
-// different reference and share no number with `ATTN_TOL` or `ATTN_BWD_TOL`.
+// BOTH parity tables here are against the CPU implementations this replaces --
+// `attention.forward` and `attentionBackward` -- and nothing else. The block they
+// are measured from still runs entirely on the CPU and is unaffected by anything in
+// this file. Those gates share no number with `ATTN_TOL` or `ATTN_BWD_TOL`, which
+// grade this kernel alone.
 //
 // Tolerance: 1e-4 absolute, deliberately looser than the 1e-5 RMSNorm kernel
 // gate. The CPU accumulates scores and the weighted sum in f64 and this

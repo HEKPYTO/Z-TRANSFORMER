@@ -5,10 +5,9 @@
 #
 # A gate that cannot fail is indistinguishable from a gate that is not there, and
 # the only way this repository finds out which of the two it has is by breaking it
-# on purpose and watching. That is `sh tools/removed/sensitivity.sh` for the
-# oracle, `sh src/cuda/run-attn.sh`'s four broken kernels for the CUDA attention
-# gates, and this for the one gate that decides whether a published table can be
-# hand-edited.
+# on purpose and watching. That is `sh src/cuda/run-attn.sh`'s broken kernels for
+# the CUDA attention gates and this script for the one gate that decides whether a
+# published table can be hand-edited.
 #
 # Four cases. The first MATCHES, because a harness in which everything fails
 # proves nothing -- without it, a check that rejected all three broken tables by

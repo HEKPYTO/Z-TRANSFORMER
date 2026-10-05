@@ -88,10 +88,17 @@ const layer_fields = [_][]const u8{
 /// `g` and returns what it found. Silent, and never an error: a disagreement is
 /// `Report.mismatch` rather than a return, so a caller can read the margins of
 /// a passing sweep as well as a failing one.
+/// `p` is a POINTER, and that is load-bearing rather than a style choice. `Report`
+/// stores `&p.tok_embed` and `&p.final_norm` in `groups`, and the report outlives
+/// this call. Taking `p` by value put those two addresses into a parameter copy that
+/// is destroyed the moment this function returns, so every read through
+/// `report.groups[..].param` was undefined behaviour. No in-tree caller dereferences
+/// it, which is why the suite never caught it. The caller's own `Params` outlives its
+/// report at every call site, so a pointer is both correct and sufficient.
 pub fn compare(
     allocator: std.mem.Allocator,
     cfg: model.Config,
-    p: model.Params,
+    p: *const model.Params,
     tokens: []const u32,
     targets: []const u32,
     g: *const autograd.Grads,
@@ -102,7 +109,7 @@ pub fn compare(
         // budget is anchored on. The two losses an element is differenced over
         // are read at points a step away from here and can carry a different
         // scale, which is what `Reading` below exists to notice.
-        var logits = try model.forward(allocator, p, cfg, tokens);
+        var logits = try model.forward(allocator, p.*, cfg, tokens);
         defer logits.deinit();
         for (logits.data) |z| base_scale = @max(base_scale, @abs(@as(f64, @floatCast(z))));
     }
@@ -139,9 +146,9 @@ pub fn compare(
             // asked for.
             errdefer element.* = original;
             element.* = original + step;
-            const up = try lossAt(allocator, cfg, p, tokens, targets);
+            const up = try lossAt(allocator, cfg, p.*, tokens, targets);
             element.* = original - step;
-            const down = try lossAt(allocator, cfg, p, tokens, targets);
+            const down = try lossAt(allocator, cfg, p.*, tokens, targets);
             element.* = original;
 
             const numeric = (up.loss - down.loss) / (2.0 * @as(f64, @floatCast(step)));
@@ -163,6 +170,39 @@ pub fn compare(
                 @max(base_scale, @max(up.logit_scale, down.logit_scale)),
                 tokens.len,
             );
+            // A NON-FINITE gradient is a failure, and it has to be tested for
+            // directly because every comparison below is blind to one by
+            // construction. `diff > budget` is false when `diff` is NaN, and `@max`
+            // drops a NaN instead of propagating it, so both `tightest` and `scale`
+            // would read as if the element had merely been small. A NaN gradient is
+            // the most wrong value there is and it was scoring as the cleanest.
+            // `mismatch == null` now means every element was finite AND agreed.
+            if (!std.math.isFinite(a) or !std.math.isFinite(numeric) or
+                !std.math.isFinite(diff))
+            {
+                // `mismatch == null` belongs on the ASSIGNMENT, not on the test. With
+                // it inside the conjunction the whole finiteness check was skipped for
+                // every element after the first failure, so a second NaN reached
+                // `tightest` and the row below. One failure is recorded, because that
+                // is what the field is for -- but every non-finite element marks its
+                // own row, because `relative > group.worst` is false for a NaN and the
+                // table would otherwise print `worst 0.000e+00` for the tensor holding
+                // it, which reads as the cleanest number in the report.
+                if (mismatch == null) {
+                    mismatch = .{
+                        .layer = group.layer,
+                        .field = group.field,
+                        .index = i,
+                        .analytic = a,
+                        .numeric = numeric,
+                        .diff = diff,
+                        .budget = budget,
+                    };
+                }
+                group.worst = std.math.inf(f64);
+                group.worst_at = i;
+                continue;
+            }
             floor = @max(floor, budget);
             tightest = @max(tightest, diff / budget);
             const scale = @max(maxAbs(group.grad), budget);
@@ -254,23 +294,24 @@ pub fn report(w: *std.Io.Writer, r: Report) std.Io.Writer.Error!void {
 /// `p` is restored element by element as it goes, error path included, so the
 /// caller's parameters come back unchanged. Every element of every parameter is
 /// visited either way; only who hears the verdict changes.
+/// See `compare` for why the parameters arrive by pointer.
 pub fn checkAll(
     allocator: std.mem.Allocator,
     cfg: model.Config,
-    p: model.Params,
+    p: *const model.Params,
     tokens: []const u32,
     targets: []const u32,
 ) !void {
-    var g = try autograd.zeroGrads(allocator, p);
+    var g = try autograd.zeroGrads(allocator, p.*);
     defer g.deinit();
 
     {
-        var logits = try model.forward(allocator, p, cfg, tokens);
+        var logits = try model.forward(allocator, p.*, cfg, tokens);
         defer logits.deinit();
 
         var dl = try autograd.dLossDLogits(allocator, logits, targets);
         defer dl.deinit();
-        try autograd.backward(allocator, p, &g, cfg, tokens, dl);
+        try autograd.backward(allocator, p.*, &g, cfg, tokens, dl);
     }
 
     const r = try compare(allocator, cfg, p, tokens, targets, &g);

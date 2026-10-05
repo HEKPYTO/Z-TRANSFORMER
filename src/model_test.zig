@@ -469,8 +469,8 @@ test "model frees every intermediate of a full forward" {
 
 /// Collects what the sink reports, so a test can count and name it.
 ///
-/// `@fieldParentPtr` rather than a cast of the pointer itself, matching what
-/// `src/removed.zig` does. Casting the `*model.Sink` straight back to a
+/// `@fieldParentPtr` rather than a cast of the pointer itself. Casting the
+/// `*model.Sink` straight back to a
 /// `*Recorder` only works while the sink sits at offset zero, which is an
 /// accident of field order rather than a contract; this form holds whatever
 /// order the fields end up in.
@@ -515,9 +515,9 @@ test "a live sink observes the pass without perturbing it" {
     // itself, which passes for any arithmetic at all. It could not see the one
     // thing it was named after -- a live sink perturbing the pass, either
     // through the `probs` allocation inside `attention.forwardWith` or through
-    // a `Sink.put` that wrote through a bad pointer. That is the failure the
-    // parity sink carries, and it is the thing grading the block against
-    // external, so the blind spot was on the load-bearing path.
+    // a `Sink.put` that wrote through a bad pointer. The sink is on the
+    // load-bearing path -- every forward records into one -- so a blind spot
+    // there is a blind spot in the block itself.
     var rec: Recorder = .{};
     var through_sink = try model.forwardWith(std.testing.allocator, p, two_layers, &tokens, rec.asSink());
     defer through_sink.deinit();
@@ -556,5 +556,55 @@ test "the sink reports every intermediate, once per layer" {
             else => two_layers.n_layers,
         };
         try std.testing.expectEqual(want, rec.names.get(n));
+    }
+}
+
+// `forward` used to check `tok_embed` against `d` and count the layers, and
+// nothing else. That is enough for a changed `n_heads`, `head_dim` or depth --
+// attention has its own shape contract for `n_kv_heads` -- and blind to the MLP,
+// because `mlp.forward` takes no config and validates nothing. A config carrying
+// a different `ffn_mult` therefore named weights the run did not have, and the
+// matmul read past the buffer instead of reporting the mismatch.
+//
+// The first three cases already passed before this was added; the `ffn_mult` one
+// did not, and it is the reason the check exists.
+test "forward refuses a config whose geometry the parameters do not have" {
+    const Cases = struct {
+        name: []const u8,
+        apply: *const fn (*model.Config) void,
+    };
+    const cases = [_]Cases{
+        .{ .name = "n_kv_heads", .apply = struct {
+            fn f(c: *model.Config) void {
+                c.n_kv_heads = 4;
+            }
+        }.f },
+        .{ .name = "ffn_mult", .apply = struct {
+            fn f(c: *model.Config) void {
+                c.ffn_mult = 4;
+            }
+        }.f },
+        .{ .name = "head_dim", .apply = struct {
+            fn f(c: *model.Config) void {
+                c.head_dim = 16;
+            }
+        }.f },
+        .{ .name = "n_heads", .apply = struct {
+            fn f(c: *model.Config) void {
+                c.n_heads = 8;
+            }
+        }.f },
+    };
+    for (cases) |c| {
+        var cfg = model.Config{ .n_layers = 2, .n_heads = 4, .n_kv_heads = 2, .head_dim = 32, .n_ctx = 16, .vocab_size = 64, .ffn_mult = 2 };
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const p = try model.initParams(arena.allocator(), cfg, 7);
+        c.apply(&cfg);
+        const toks = [_]u32{ 1, 2, 3 };
+        try std.testing.expectError(
+            error.DimensionMismatch,
+            model.forward(arena.allocator(), p, cfg, &toks),
+        );
     }
 }

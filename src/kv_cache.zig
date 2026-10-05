@@ -2,12 +2,13 @@
 //! and values for every position generated so far.
 //!
 //! WHAT THIS IS AND IS NOT. It is the storage and the one rule that governs it. It
-//! is not a decode loop, and there is no generation code in this repository -- a
-//! search for `generate`, `sample` or `decode` over `src/` finds only `scale.zig`'s
-//! cost formula and `tokenizer.decode`, which turns ids back into text and is
-//! unrelated. What is missing to make generation work is a caller that feeds one
-//! token at a time and reads logits out; this file is the piece that has to exist
-//! before that caller can, and it is deliberately not more.
+//! is not a decode loop. The generation code DOES exist and is `src/decode.zig`:
+//! `decode.generate` feeds one token at a time, reads logits out, and drives this
+//! cache; `decode.cudaAttnStep` does the same one position at a time against the
+//! CUDA forward. An earlier version of this header said there was no generation
+//! code here at all and named a caller as missing, which stopped being true when
+//! `decode.zig` landed and was not corrected. This file is the piece the caller
+//! needs, and it is deliberately not more.
 //!
 //! WHY A TRAINING STEP DOES NOT NEED IT. `data.Batcher` hands the model
 //! `inputs[t]` and `targets[t+1]` for a whole window in one batch, so the full
@@ -63,11 +64,15 @@ pub const Layer = struct {
 
     pub fn init(allocator: std.mem.Allocator, n_ctx: usize, width: usize) !Layer {
         if (n_ctx == 0 or width == 0) return Error.DimensionMismatch;
-        return .{
-            .k = try Tensor.init(allocator, n_ctx, width),
-            .v = try Tensor.init(allocator, n_ctx, width),
-            .len = 0,
-        };
+        // The two tensors are built into locals rather than straight into a `Layer`
+        // literal. A literal that fails on its SECOND field is never assigned at all,
+        // so an `errdefer` written against it would never register, and the first
+        // tensor would leak. This is the same shape `model.initLayer` handles with an
+        // `errdefer` over the built prefix.
+        var k = try Tensor.init(allocator, n_ctx, width);
+        errdefer k.deinit();
+        const v = try Tensor.init(allocator, n_ctx, width);
+        return .{ .k = k, .v = v, .len = 0 };
     }
 
     pub fn deinit(self: *Layer) void {
@@ -353,4 +358,20 @@ test "a deinit'd cache answers full and bytes instead of indexing an empty slice
     // answer or frees a second time.
     try testing.expect(c.full());
     try testing.expectEqual(@as(usize, 0), c.bytes());
+}
+
+// The second allocation failing must not strand the first. A `Layer` literal
+// never reaches assignment when its second field throws, so nothing owns `k` and
+// it leaks; the earlier version of this file built both tensors that way and had
+// no test that could see it, because nothing else in the tree exercises this
+// path with a failing allocator.
+test "a failed v allocation does not strand k" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 1,
+    });
+    const result = Layer.init(failing.allocator(), 8, 32);
+    // No explicit leak assertion: `std.testing.allocator` checks itself when the
+    // test returns, and the underlying allocator is what `FailingAllocator` wraps,
+    // so a stranded `k` surfaces here rather than needing a count.
+    try std.testing.expectError(error.OutOfMemory, result);
 }

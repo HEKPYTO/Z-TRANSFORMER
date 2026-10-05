@@ -61,12 +61,29 @@ static_assert(WARPS <= 32, "blockReduceSum reads every partial with no bound of 
 //   0  correct
 //   1  one weight element moved by 1e-3   the smallest change that must be caught
 //   2  mean instead of mean of squares    the classic "forgot the multiply"
+//   3  weight indexed from x               "read the wrong tensor at the right index"
+//
+// Variant 3 exists because the other two could not catch that fault. Both mutate a
+// value the kernel already holds in a register, so a kernel reading the wrong
+// TENSOR would still be caught by them -- but nothing tested the tensor choice
+// itself. It is a fault this file could make silently: `norm_twin.zig` drew the
+// weight from the same PRNG seed as the input, which made `w.data[i]` bit-identical
+// to `x.data[i]` for every `i < cols`, so a kernel reading `x_row[i]` where it meant
+// `weight[i]` agreed with the CPU twin on every shape's first row and on the whole
+// of the 1x1 and 1x4 shapes. The twin now draws from a different stream, and this
+// variant is what proves the gate would notice.
 //
 // Variant 1 is deliberately a small perturbation and not garbage. A gate that
 // rejects a kernel returning NaN has proved very little; a gate that rejects a
 // 1e-3 error on one element out of 16 million has proved the 1e-5 it claims.
 #define BROKEN_WEIGHT 1
 #define BROKEN_MEAN 2
+#define BROKEN_WRONG_TENSOR 3
+
+// How many deliberately broken kernels the parity gate runs, and therefore the
+// width of its result arrays. Named so adding a variant cannot leave a stale
+// `2` behind in a bound -- which is how the fifth variant would silently vanish.
+#define BROKEN_VARIANTS 3
 
 __device__ __forceinline__ float warpReduceSum(float v) {
 #pragma unroll
@@ -171,6 +188,12 @@ __global__ void rmsNormKernel(const float *__restrict__ x, const float *__restri
         if constexpr (BROKEN == BROKEN_WEIGHT) {
             if (i == 0) w += 1e-3f;
         }
+        if constexpr (BROKEN == BROKEN_WRONG_TENSOR) {
+            // The index is unchanged; the TENSOR is not. This is the fault the other
+            // two variants cannot express, and with `norm_twin.zig`'s old shared seed
+            // it was invisible: `weight[i]` and `x_row[i]` were the same number.
+            w = x_row[i];
+        }
         y_row[i] = x_row[i] / rms * w;
     }
 }
@@ -195,8 +218,15 @@ static void report(const char *call, cudaError_t err, int line) {
         }                                                 \
     } while (0)
 
-static void launchRmsNorm(int broken, const float *d_x, const float *d_w, float *d_y, int rows,
-                          int cols) {
+// Returns 0 when a kernel was launched and 1 when none was. The return value is the
+// whole point of this signature: as `void`, a refusal that launched nothing was
+// indistinguishable at the call site from a successful launch, and because no launch
+// means no error, the caller's `cudaGetLastError()` came back clean and the follow-on
+// `cudaMemcpy` copied whatever was in `d_y` -- uninitialised. `verify` then measured
+// that garbage, recorded "caught", and exited 0. A gate that cannot tell a refusal from
+// a result cannot be trusted to have run.
+static int launchRmsNorm(int broken, const float *d_x, const float *d_w, float *d_y, int rows,
+                         int cols) {
     switch (broken) {
         case 0:
             rmsNormKernel<0><<<rows, THREADS>>>(d_x, d_w, d_y, cols);
@@ -204,10 +234,33 @@ static void launchRmsNorm(int broken, const float *d_x, const float *d_w, float 
         case BROKEN_WEIGHT:
             rmsNormKernel<BROKEN_WEIGHT><<<rows, THREADS>>>(d_x, d_w, d_y, cols);
             break;
-        default:
+        case BROKEN_WRONG_TENSOR:
+            rmsNormKernel<BROKEN_WRONG_TENSOR><<<rows, THREADS>>>(d_x, d_w, d_y, cols);
+            break;
+        case BROKEN_MEAN:
             rmsNormKernel<BROKEN_MEAN><<<rows, THREADS>>>(d_x, d_w, d_y, cols);
             break;
+        default:
+            // REFUSE rather than guess, and refuse LOUDLY because the alternative is
+            // worse than it looks. This arm used to launch BROKEN_MEAN for anything it
+            // did not recognise. Adding BROKEN_WRONG_TENSOR's kernel branch without
+            // adding a case for it made variant 3 silently run the MEAN kernel: the
+            // table printed "weight read from x" over a run that had never read x.
+            // On the `_flat` shapes the two rows printed an identical 1.874910e+00,
+            // which is the tell.
+            //
+            // The second trap is the one worth writing down. Replacing that default
+            // with a bare `return` WITHOUT first restoring `case BROKEN_MEAN` was worse:
+            // variant 2 then launched nothing at all, and because no launch means no
+            // error, `cudaGetLastError()` came back clean, the follow-on `cudaMemcpy`
+            // copied uninitialised device memory, and `verify` measured that garbage,
+            // recorded "caught", and exited 0. Eighteen lines on stderr, "norm: OK" on
+            // stdout, exit 0. Every variant now has its own case, and this arm cannot
+            // be reached without a #define that has no case.
+            fprintf(stderr, "norm: FAIL unknown variant %d\n", broken);
+            return 1;
     }
+    return 0;
 }
 
 // Runs one RMSNorm over `h_x` and `h_w` and returns a malloc'd host copy of the
@@ -233,7 +286,7 @@ static float *gpuRun(const float *h_x, const float *h_w, int rows, int cols, int
         fprintf(stderr, "norm: FAIL refusing shape %d x %d\n", rows, cols);
         return NULL;
     }
-    if (broken < 0 || broken > BROKEN_MEAN) {
+    if (broken < 0 || broken > BROKEN_VARIANTS) {
         fprintf(stderr, "norm: FAIL unknown variant %d\n", broken);
         return NULL;
     }
@@ -249,7 +302,13 @@ static float *gpuRun(const float *h_x, const float *h_w, int rows, int cols, int
     CUDA_GO(cudaMalloc((void **)&d_y, xb));
     CUDA_GO(cudaMemcpy(d_x, h_x, xb, cudaMemcpyHostToDevice));
     CUDA_GO(cudaMemcpy(d_w, h_w, wb, cudaMemcpyHostToDevice));
-    launchRmsNorm(broken, d_x, d_w, d_y, rows, cols);
+    if (launchRmsNorm(broken, d_x, d_w, d_y, rows, cols) != 0) {
+        // The kernel was NOT launched, so `d_y` still holds whatever the allocator
+        // gave it. Falling through here would copy that back and measure it, which is
+        // how an undispatched variant reported itself caught. Refuse instead.
+        ok = 0;
+        goto cleanup;
+    }
     // The launch call returning success says the grid was well formed. It does
     // not say a kernel started.
     CUDA_GO(cudaGetLastError());
@@ -447,8 +506,14 @@ static int benchShape(const Shape *s, const float *hx, const float *hw, double *
     float *d_w = NULL;
     float *d_y = NULL;
     float *h_y = NULL;
-    cudaEvent_t ev0;
-    cudaEvent_t ev1;
+    // NULL like every other handle in this function, and for the same reason: the
+    // `cudaEventCreate` below is the FIRST CUDA call here, and `CUDA_GO` reaches
+    // `cleanup` on its failure. An uninitialised `cudaEvent_t` was therefore handed
+    // to `cudaEventDestroy` as an event handle made of stack bytes. The destroy is
+    // also guarded rather than left to report `cudaErrorInvalidResourceHandle`, so
+    // the failure that got us here is the one reported rather than the cleanup's.
+    cudaEvent_t ev0 = NULL;
+    cudaEvent_t ev1 = NULL;
     cudaError_t err = cudaSuccess;
     int ok = 1;
     float ms = 0.0f;
@@ -509,8 +574,8 @@ cleanup:
     if (cudaFree(d_x) != cudaSuccess) ok = 0;
     if (cudaFree(d_w) != cudaSuccess) ok = 0;
     if (cudaFree(d_y) != cudaSuccess) ok = 0;
-    if (cudaEventDestroy(ev0) != cudaSuccess) ok = 0;
-    if (cudaEventDestroy(ev1) != cudaSuccess) ok = 0;
+    if (ev0 != NULL && cudaEventDestroy(ev0) != cudaSuccess) ok = 0;
+    if (ev1 != NULL && cudaEventDestroy(ev1) != cudaSuccess) ok = 0;
     free(h_y);
     return ok;
 }
@@ -524,8 +589,14 @@ static int verify(const char *dir, const Shape *shapes, int n) {
     double worst = 0.0;
     char worst_tag[TAG_CAP] = "";
     size_t worst_elems = 0;
-    double gate_diff[MAX_SHAPES][2];
-    int gate_caught[MAX_SHAPES][2];
+    double gate_diff[MAX_SHAPES][BROKEN_VARIANTS];
+    int gate_caught[MAX_SHAPES][BROKEN_VARIANTS];
+    // Whether the variant actually launched. The third state of the gate column: a
+    // row can read `caught`, `MISSED`, or neither, because the kernel behind it
+    // never ran. `MISSED` means "the kernel ran and the gate failed to reject it",
+    // which is a finding about the GATE; "DID NOT RUN" is a finding about the
+    // HARNESS. Conflating them is how an undispatched variant reported itself caught.
+    int gate_ran[MAX_SHAPES][BROKEN_VARIANTS];
 
     for (int i = 0; i < n; ++i) {
         const Shape *s = &shapes[i];
@@ -571,15 +642,23 @@ static int verify(const char *dir, const Shape *shapes, int n) {
         // the run in which the parity number above cannot be trusted. The
         // numbers are kept rather than printed so the table can be printed once
         // at the end, in one block, instead of once per shape.
-        for (int variant = 1; variant <= 2; ++variant) {
+        for (int variant = 1; variant <= BROKEN_VARIANTS; ++variant) {
             float *bad = gpuRun(hx, hw, s->rows, s->cols, variant, NULL);
             if (bad == NULL) {
-                fprintf(stderr, "norm: FAIL broken kernel did not run for %s\n", s->tag);
+                fprintf(stderr, "norm: FAIL broken kernel did not run for %s (variant %d)\n",
+                        s->tag, variant);
                 gate_diff[i][variant - 1] = INFINITY;
-                gate_caught[i][variant - 1] = 1;
+                // NOT `caught`. A variant that never ran has not been caught; it has
+                // not been tested, and printing `caught` for it is how the table ended
+                // up claiming a wrong-tensor fault had been proven when the kernel
+                // behind that row was the MEAN one. This state says neither caught
+                // nor missed -- it says the row is not evidence of anything.
+                gate_ran[i][variant - 1] = 0;
+                gate_caught[i][variant - 1] = 0;
                 failures++;
                 continue;
             }
+            gate_ran[i][variant - 1] = 1;
             const double bdiff = maxAbsDiff(bad, hy, count, NULL);
             gate_diff[i][variant - 1] = bdiff;
             gate_caught[i][variant - 1] = bdiff > PARITY_GATE;
@@ -595,7 +674,8 @@ static int verify(const char *dir, const Shape *shapes, int n) {
     printf("parity: worst %.6e over %s (%zu elements), gate %.1e\n\n", worst, worst_tag, worst_elems,
            PARITY_GATE);
 
-    printf("gate    the same measurement against two deliberately broken kernels. A row that\n");
+    printf("gate    the same measurement against %d deliberately broken kernels. A row that\n",
+           BROKEN_VARIANTS);
     printf("gate    reads MISSED means this gate would not have caught that fault, and every\n");
     printf("gate    parity number above would then mean nothing.\n");
     printf("gate    %-12s %-12s %-24s %13s  %s\n", "shape", "size", "deliberate fault",
@@ -603,11 +683,50 @@ static int verify(const char *dir, const Shape *shapes, int n) {
     for (int i = 0; i < n; ++i) {
         char size[32];
         snprintf(size, sizeof size, "%dx%d", shapes[i].rows, shapes[i].cols);
-        for (int variant = 0; variant < 2; ++variant) {
-            const char *what = (variant == 0) ? "weight[0] += 1e-3" : "mean, not mean of squares";
+        for (int variant = 0; variant < BROKEN_VARIANTS; ++variant) {
+            static const char *const names[BROKEN_VARIANTS] = {
+                "weight[0] += 1e-3", "mean, not mean of squares", "weight read from x",
+            };
+            const char *what = names[variant];
+            const char *verdict = !gate_ran[i][variant]     ? "DID NOT RUN"
+                                  : gate_caught[i][variant] ? "caught"
+                                                           : "MISSED";
             printf("gate    %-12s %-12s %-24s %13.6e  %s\n", shapes[i].tag, size, what,
-                   gate_diff[i][variant], gate_caught[i][variant] ? "caught" : "MISSED");
+                   gate_diff[i][variant], verdict);
         }
+    }
+    // Every pair of variants must differ on at least one shape, or two rows of that
+    // table are the SAME defect under two names. This is the check `run-attn.sh`
+    // has had for its four backward variants since it found the classifier problem,
+    // and this file had none -- which is how BROKEN_WRONG_TENSOR went undispatched
+    // and printed "weight read from x" over a run that had read the MEAN kernel. On
+    // the `_flat` shapes the two rows printed an identical 1.874910e+00, and nothing
+    // in the harness noticed. Comparing pairs rather than one fixed shape is
+    // deliberate: two faults can coincide on a constant row, and that is a property
+    // of the shape, not a duplicate variant.
+    for (int a = 0; a < BROKEN_VARIANTS; ++a) {
+        for (int b = a + 1; b < BROKEN_VARIANTS; ++b) {
+            int differ = 0;
+            for (int i = 0; i < n; ++i) {
+                if (gate_diff[i][a] != gate_diff[i][b]) {
+                    differ = 1;
+                    break;
+                }
+            }
+            if (!differ) {
+                fprintf(stderr,
+                        "norm: FAIL variants %d and %d produced IDENTICAL differences on all "
+                        "%d shapes. They are the same fault under two names, and a row "
+                        "reporting one as caught says nothing about the other.\n",
+                        a + 1, b + 1, n);
+                failures++;
+            }
+        }
+    }
+    if (failures == 0) {
+        printf("gate    ...and every pair of variants differs on at least one shape, so these\n");
+        printf("gate    are %d different faults rather than one fault wearing %d names.\n",
+               BROKEN_VARIANTS, BROKEN_VARIANTS);
     }
     return failures;
 }

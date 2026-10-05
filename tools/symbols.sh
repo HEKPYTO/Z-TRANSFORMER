@@ -3,8 +3,8 @@
 # that is `pub` in src/module.zig.
 #
 # The README arrives as an argument so a falsified copy can be checked without
-# editing the real one, which is how tools/removed/sensitivity.sh proves its own
-# gates fire. The module name is the file stem, because the tables already say
+# editing the real one, which is how `zig build table-block-check` proves its own
+# assertions fire. The module name is the file stem, because the tables already say
 # `tensor.Tensor` and the file is src/tensor.zig, so there is no map to keep in
 # sync and no list of this script's own to go stale.
 #

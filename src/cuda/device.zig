@@ -131,6 +131,13 @@ pub const Error = error{
     ConfigRefused,
     /// `cudaMalloc` returned a non-zero `cudaError_t`.
     DeviceAllocFailed,
+    /// `cudaMemcpy` returned a non-zero `cudaError_t`. DISTINCT from
+    /// `DeviceAllocFailed` on purpose, and for the reason `DegenerateShape` above
+    /// already gives: a caller that retries a failed allocation retries forever, and
+    /// one that retries a failed transfer should not retry it as an allocation at all.
+    /// Reporting a transfer fault as an allocation fault is the same mistake one page
+    /// above, committed a second time.
+    DeviceTransferFailed,
 };
 
 /// Which buffer a size is for. Named rather than indexed so that a caller cannot
@@ -224,6 +231,14 @@ pub const Attn = struct {
         // the point where it can still be fixed.
         if (zt_attn_dim_ok(c_dim) == 0) return Error.ConfigRefused;
         if (c_heads <= 0 or c_kv_heads <= 0 or @rem(c_heads, c_kv_heads) != 0) return Error.ConfigRefused;
+        // The 65535 gridDim.y ceiling, checked HERE for the reason the two lines above
+        // are checked here: both kernels launch `dim3 grid(blocks_x, n_heads)`, so a
+        // head count past 65535 is a shape no call can ever run. Checking it only in
+        // `attn_kernels.cu` meant `Attn.init(1, 65536, 32768, 32)` took eleven buffers
+        // and reported success, and the refusal arrived later as a ConfigRefused from
+        // `forward` -- with the device memory already spent. This is the same contract
+        // the comment two lines up states, broken three lines below where it is stated.
+        if (n_heads > 65535) return Error.ConfigRefused;
 
         const qh = try bytesFor(.query_headed, t, n_heads, n_kv_heads, dim);
         const kvh = try bytesFor(.kv_headed, t, n_heads, n_kv_heads, dim);

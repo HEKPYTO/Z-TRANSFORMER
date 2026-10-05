@@ -43,33 +43,6 @@ jobs:
           zig build verify >"$log" 2>&1 || { cat "$log"; exit 1; }
           test ! -s "$log" || { echo "::error::zig build verify wrote $(wc -c <"$log") bytes on a passing run"; cat "$log"; exit 1; }
 
-  # The parity check is this repository's central claim and `verify` cannot
-  # reach it: the oracle is Python, and AGENTS.md forbids Python in the build
-  # graph. It is its own job because a headline claim checked only on one
-  # person's laptop is not a checked claim.
-  #
-  # The pins in tools/removed/requirements.txt are load-bearing: reference-library v5
-  # moved rope_theta into rope_parameters, so an unpinned install silently
-  # compares against theta=10000 and fails on RoPE while looking like a
-  # numerics bug. The oracle asserts the resolved theta independently.
-  parity:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -m venv venv-removed
-      - run: venv-removed/bin/pip install -r tools/removed/requirements.txt
-      - run: sh tools/removed/check.sh
-      # That the gates CAN fail is a different claim from that they pass, and it
-      # is the one that makes report.csv mean anything. A silent gate exits 0
-      # here, so a red run is a harness that has stopped checking.
-      - name: the parity gates can fail
-        run: sh tools/removed/sensitivity.sh
 
   # That the test suite can still FAIL is a different claim from that it passes,
   # and it is the one nothing above checks. The mutation suite breaks the code on
@@ -95,44 +68,33 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      # `run.sh` takes an optional MUTATION_EXPECTED_CAUGHT floor, which makes this
-      # step able to go red when the caught count drops: it names the mutants that got
-      # through and exits 1. It is deliberately NOT set here, and the reason is worth
-      # stating because an earlier version of this file did set it.
+      # `run.sh` takes an optional MUTATION_EXPECTED_CAUGHT floor, which is what makes
+      # this step able to go red: `run.sh` exits 0 on a SURVIVOR by design, because a
+      # survivor is a measurement rather than an error, so running it bare would let the
+      # caught count fall as far as zero with the job still green. Below the floor it
+      # names the mutants that got through and exits 1.
       #
-      # The knob was pinned to 16, from the figure `tools/README.md` quotes. That
-      # number was never measured ON THIS RUNNER, and `caught` is not a clean measure
-      # of suite strength in the first place: `unbuildable` and the gate's own ERROR
-      # branch both raise `broken` without raising `caught`, so a mutation whose
-      # pattern goes stale looks identical to a survivor from the floor's side. One
-      # such stale pattern was observed this session. Pinning an unmeasured count on a
-      # job that runs weekly would make it permanently red for a reason unrelated to
-      # the code -- the same failure mode this repository already documents for
-      # keeping `cuda-check` out of `verify`.
+      # 15 is MEASURED on this platform family, not quoted: `sh tools/mutation/run.sh`
+      # reports `caught 15 of 18` on Linux, and the same fifteen on the development
+      # machine. The three survivors are all equivalent mutations or below the gates, so
+      # 15 is the strongest claim suite strength supports -- the suite catches every
+      # mutant a test can distinguish, and a drop below 15 means one of those tests
+      # stopped holding.
       #
-      # So the floor stays available and unset. Whoever next runs this on the target
-      # runner should read the count it prints, set the constant to it, and commit
-      # that -- the measurement, not this file's guess, is what the gate needs.
-      # The floor, measured rather than quoted, and measured on THIS platform family:
-      # `sh tools/mutation/run.sh` reports `caught 15 of 18` on Linux at f79a59a and
-      # the same fifteen on the development machine at 6272360. The three survivors are
-      # all equivalent or below the gates, so 15 is the strongest claim suite strength
-      # supports -- the suite catches every mutant a test can distinguish, and a drop
-      # below 15 means one of those tests stopped holding.
+      # The floor was 16 before, from a figure this repository quoted rather than
+      # measured, and it was reached through three separate repairs worth recording
+      # because each is a way this gate can lie. Three of `mutate.zig`'s patterns had
+      # gone stale after `src/tensor.zig` was rewritten. The reason a sweep then reported
+      # `caught 0 of 18` was the CLASSIFIER, not the mutants: its `caught` pattern
+      # required `pass` and `fail` to be adjacent in Zig's summary line, and a skip count
+      # between them (two tests sit behind `comptime model.cuda_attn`) sent every
+      # genuinely-caught mutation to the `error` branch. And a measurement of 13 taken on
+      # this host was discarded rather than adopted, because `run.sh` builds its worktree
+      # from git HEAD and HEAD was behind, so that number described old source.
       #
-      # It was `continue-on-error` until the harness was repaired, and an earlier
-      # measurement of 13 on this host was discarded rather than adopted: `run.sh`
-      # builds its worktree from git HEAD, and this host's HEAD was behind, so that
-      # number described old source. A floor set from a measurement of the wrong commit
-      # is worse than no floor, because it is a gate that looks deliberate.
-      #
-      # This was `continue-on-error` until the harness was repaired, and the repair was
-      # not what it looked like: three of `mutate.zig`'s patterns had gone stale after
-      # `src/tensor.zig` was rewritten, but the reason a sweep reported `caught 0 of 18`
-      # was the CLASSIFIER -- its `caught` pattern required `pass` and `fail` to be
-      # adjacent in Zig's summary line, and a skip count between them (two tests are
-      # gated behind `comptime model.cuda_attn`) sent every genuinely-caught mutation
-      # to the `error` branch. See `tools/README.md` for both.
+      # That last one is why this number is not 13: a floor set from a measurement of
+      # the wrong commit is worse than no floor, because it is a gate that looks
+      # deliberate. `tools/README.md` carries the same 15 and classifies the survivors.
       - run: sh tools/mutation/run.sh
         env:
           MUTATION_EXPECTED_CAUGHT: '15'

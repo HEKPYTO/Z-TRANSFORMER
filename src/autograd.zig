@@ -276,9 +276,8 @@ const Block = struct {
 /// Every buffer is allocated up front, in `init`, and `put` only copies into
 /// them. That is what lets `model.Sink.put` return `void`: an allocation inside
 /// the callback would have to be parked in an error field and checked by the
-/// caller, which is the shape `src/removed.zig` needs because it is writing to
-/// an append-only list and this is not because the shapes are all known before
-/// the pass starts.
+/// caller. An append-only recorder needs that shape; this does not, because the
+/// shapes are all known before the pass starts.
 ///
 /// The pass frees its own buffers as it goes, so the copy is not optional:
 /// `residual1` of one layer and the next layer's input are the same two
@@ -675,7 +674,13 @@ pub fn attentionBackward(
     // `dout.rowConst(t)[h * dim ..][0..dim]`, so a `dout` narrower than one head row
     // reads past its own buffer and panics inside `rowConst` rather than coming back
     // as an error. Same error as the shapes above, because it is the same mistake.
-    if (dout.rows != q.rows or dout.cols < cfg.n_heads * cfg.head_dim) {
+    //
+    // The width test is `!=` and not `<`, and the direction is the whole point. A
+    // WIDER `dout` never panics: nothing reaches the columns past `n_heads * dim`,
+    // so they are simply ignored, and a caller who handed this a buffer sized for
+    // something else gets a plausible answer to a question it did not ask. Every other
+    // shape above is compared with `!=` for exactly that reason.
+    if (dout.rows != q.rows or dout.cols != cfg.n_heads * cfg.head_dim) {
         return error.DimensionMismatch;
     }
     const dim = cfg.head_dim;
@@ -734,9 +739,15 @@ pub fn attentionBackward(
                     var rows: [lanes][]const f32 = undefined;
                     for (0..lanes) |u| rows[u] = k.rowConst(s + u)[kv * dim ..][0..dim];
                     var dot: [lanes]f64 = @splat(0);
+                    // Spelled exactly as the scalar tail below spells it -- both operands
+                    // widened inline -- and not as `af * @as(f64, rows[u][jj])` with one
+                    // operand hoisted. The two are the same bits today: widening f32 to
+                    // f64 is exact, the product order is unchanged, and `a` is loop
+                    // invariant. They are written the same way so that an edit which
+                    // "tidies" one of them cannot move the digest by accident, which is
+                    // the only reason to care about a spelling.
                     for (q_head, 0..) |a, jj| {
-                        const af: f64 = @floatCast(a);
-                        for (0..lanes) |u| dot[u] += af * @as(f64, rows[u][jj]);
+                        for (0..lanes) |u| dot[u] += @as(f64, a) * @as(f64, rows[u][jj]);
                     }
                     for (0..lanes) |u| {
                         probs[s + u] = dot[u] * scale;
@@ -907,12 +918,12 @@ fn normBackward(x: Tensor, w: Tensor, g: Tensor, dw: *Tensor, dx: *Tensor) void 
         // d n . n, with d n[i] = g[i] * w[i] and n[i] = x[i] / rms.
         var dot: f64 = 0;
         for (0..d) |i| {
-            const n = @as(f64, @as(f32, @floatCast(x_row[i])) / rms);
+            const n = @as(f64, x_row[i] / rms);
             dot += @as(f64, g_row[i]) * @as(f64, w_row[i]) * n;
         }
         const inv_d = 1.0 / @as(f64, @floatFromInt(d));
         for (0..d) |i| {
-            const n = @as(f64, @as(f32, @floatCast(x_row[i])) / rms);
+            const n = @as(f64, x_row[i] / rms);
             const dn = @as(f64, g_row[i]) * @as(f64, w_row[i]);
             dw_row[i] += @floatCast(@as(f64, g_row[i]) * n);
             dx_row[i] = @floatCast((dn - n * dot * inv_d) / rms);

@@ -1,7 +1,5 @@
 //! The binary. A bare `ztransformer` prints the banner; `ztransformer train`
-//! runs the one path the project ships end to end: corpus in, loss curve out;
-//! `ztransformer parity` writes the tensors a Llama reference is
-//! compared against.
+//! runs the one path the project ships end to end: corpus in, loss curve out.
 //!
 //! The defaults below are a smoke run, not a recipe, and the reason is measured
 //! rather than assumed. A step is a dense f32 forward and backward over a
@@ -18,7 +16,6 @@ const tokenizer = @import("tokenizer.zig");
 const data = @import("data.zig");
 const model = @import("model.zig");
 const train = @import("train.zig");
-const parity = @import("removed.zig");
 const scale = @import("scale.zig");
 const attn_bench = @import("attn_bench.zig");
 const profile = @import("profile.zig");
@@ -114,15 +111,14 @@ pub fn main(init: std.process.Init) !void {
         // a flag that was meant to change the run and did not: `train
         // --epochs 20` used to train for the hard-coded epoch count and say
         // nothing, which is a 90 second run on the wrong configuration. The two
-        // callers this ships to, `zig build train` and `zig build run -- parity`,
+        // callers this ships to, `zig build train`,
         // each pass one, so nothing legitimate is refused.
         if (args.len == 2) {
             if (std.mem.eql(u8, args[1], "train")) return runTrain(arena, init.gpa, init.io, init.environ_map);
-            if (std.mem.eql(u8, args[1], "parity")) return runRemoved(arena, init.io);
             if (std.mem.eql(u8, args[1], "scale-profile")) return runScaleProfile(init.io);
             if (std.mem.eql(u8, args[1], "attn-bench")) return runAttnBench(init);
         }
-        std.debug.print("usage: {s} [train|parity|scale-profile|attn-bench]\n", .{args[0]});
+        std.debug.print("usage: {s} [train|scale-profile|attn-bench]\n", .{args[0]});
         return error.UnknownCommand;
     }
 
@@ -434,46 +430,4 @@ fn runAttnBench(init: std.process.Init) !void {
     var stdout: Io.File.Writer = .init(.stdout(), init.io, &buffer);
     try attn_bench.print(init, init.gpa, &stdout.interface);
     try stdout.interface.flush();
-}
-
-/// `arena` is `init.arena`, and the name is the point: this function is handed
-/// permanent storage and does not free as it goes. It was called `gpa` until the
-/// training run's allocator was split, and a parameter whose name says one thing
-/// while its value does another is how the run ended up on an arena in the first
-/// place. The export is a single forward sweep over six cases, so it holds one
-/// working set and the arena is the right allocator for it -- measured peak is
-/// 34 MB, which is the sweep, not a sum over anything.
-fn runRemoved(arena: std.mem.Allocator, io: Io) !void {
-    // The exporter is the whole of this side of the harness. It runs in Zig
-    // with no Python anywhere in sight, because AGENTS.md requires every
-    // committed artifact to be reproducible from the toolchain the repository
-    // claims to need. `tools/removed/oracle.txt` reads what this writes; it
-    // never produces any of it.
-    const s = parity.sweep();
-    const res = try parity.run(arena, io, s);
-
-    var buffer: [256]u8 = undefined;
-    var stdout: Io.File.Writer = .init(.stdout(), io, &buffer);
-    const w = &stdout.interface;
-    try w.print(
-        "wrote {s}/{{config.txt,index.txt,inputs.txt,data.bin}}\n" ++
-            "d_model {d}, {d} layers, {d} heads over {d} kv heads of {d}, ffn {d}, vocab {d}, ctx {d}\n" ++
-            "{d} weight blobs, {d} intermediate blobs over {d} cases\n" ++
-            "next: sh tools/removed/check.sh\n",
-        .{
-            parity.dir,
-            model.dModel(s.model),
-            s.model.n_layers,
-            s.model.n_heads,
-            s.model.n_kv_heads,
-            s.model.head_dim,
-            model.ffnDim(s.model),
-            s.model.vocab_size,
-            s.model.n_ctx,
-            res.weight_blobs,
-            res.intermediate_blobs,
-            res.cases,
-        },
-    );
-    try w.flush();
 }

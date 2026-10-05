@@ -5,6 +5,19 @@ set -eu
 files=$(git diff --cached --name-only --diff-filter=ACM -- '*.zig')
 [ -z "$files" ] && exit 0
 
+# Named separately from the format failure. Without this the hook said "run 'zig
+# fmt'", which is advice a contributor who has no Zig installed cannot act on, and
+# the real cause -- a missing toolchain -- went unnamed behind it. Checked only
+# when a .zig file is actually staged, so committing documentation on a machine
+# without Zig is not blocked either.
+if ! command -v zig >/dev/null 2>&1; then
+    echo "pre-commit: zig is not on PATH, so the format check could not run." >&2
+    echo "  This repository needs Zig 0.16.0 exactly; build.zig refuses any other" >&2
+    echo "  version. Install it, or bypass this hook with --no-verify when you have" >&2
+    echo "  verified the change some other way." >&2
+    exit 1
+fi
+
 # shellcheck disable=SC2086
 if ! zig fmt --check $files; then
     echo "pre-commit: run 'zig fmt' on the staged .zig files" >&2

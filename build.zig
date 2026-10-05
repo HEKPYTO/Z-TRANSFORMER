@@ -67,87 +67,12 @@ const corpus_sha256 = "86c4e6aa9db7c042ec79f339dcb96d42b0075e16b8fc2e86bf0ca57e2
 const loss_csv_path = "outputs/loss.csv";
 const loss_csv_sha256 = main_source.csv_sha256;
 
-/// `tools/removed/report.csv`: the 204 tensor rows of the Llama
-/// comparison, written by `tools/removed/oracle.txt` while
-/// `sh tools/removed/check.sh` ran it against the pinned `reference-library` 4.57.3
-/// and `torch` 2.14.0 reference in a repo-local virtualenv.
-///
-/// Deliberately not wired into `verify`, and the reason is not that hashing
-/// needs Python. It does not. A `verify` that only hashes committed bytes
-/// asserts that somebody committed those bytes, not that a comparison produces
-/// them, and producing them is the entire claim. So the digest is checked at
-/// the one moment the claim is testable, by the `removed-digest` step that
-/// `check.sh` runs over the report it has just written — after the oracle, on a
-/// green comparison, where the reader has already paid for the virtualenv. The
-/// step exists rather than a constant inside `check.sh` so the digest has one
-/// owner; it is not a second spelling of the comparison, which is why
-/// `check.sh` still is the only entry point to that.
-///
-/// Two digests rather than one, because this one is reachable only on the
-/// platform that committed it, and that is a property of the version string
-/// rather than of the arithmetic. The report carries `max_abs_delta` per row
-/// and a six-column environment block. The Linux torch wheel bakes its CUDA
-/// build into the version it reports at runtime — `2.14.0+cu130` where the
-/// committed record says `2.14.0` — while the macOS wheel is CPU-only and
-/// reports the bare `2.14.0`. So on every Linux host, Fedora and
-/// ubuntu-latest alike, the environment guard fires and these bytes are not
-/// compared; on macOS they are. Measured on Fedora: the projection matched
-/// exactly, all 18 kinds and 206 rows, and the byte digest was skipped for the
-/// version string, not for a float.
-///
-/// What that costs is stated rather than hidden: the cross-host question for
-/// `max_abs_delta` is not answered by this gate, on any host, ever. Nothing
-/// here shows that two hosts round the delta the same way, and the two values
-/// once quoted as evidence of a host difference were `l0.v` at `T=1` and `T=8`
-/// in one host's own report. `addParityReportCheck` states the two halves: a
-/// projection every host checks, and these bytes on the one host whose version
-/// string matches.
-const removed_report_path = "tools/removed/report.csv";
-const removed_report_sha256 = "d0d501f0dcc5170b7b3bb8f324ed14badae9a2282b7f14245e80bdd8525586b1";
-
-/// `report.csv` with the two groups of columns that are not a property of the
-/// comparison removed: `max_abs_delta`, which is the float another host rounds
-/// differently, and the six environment columns.
-///
-/// What survives is the claim rather than the measurement — which tensors were
-/// compared, at which shapes, against which gate, each with which verdict, plus
-/// the argmax row's own match and total. Every one of those is an integer or a
-/// literal the oracle wrote, so the projection is byte-identical from any host
-/// that runs the same comparison, and a report that is a perturbed export
-/// rather than a comparison that passed cannot reproduce it: `sensitivity.sh`
-/// flips verdicts to `FAIL`, and adding or dropping a row moves the set.
-///
-/// The carriage returns Python's csv writer terminates lines with are stripped
-/// first, so the projection is about the report's content and not about which
-/// line ending a `csv.DictWriter` happened to emit. They are the same on every
-/// host today; the byte digest below is the check that says so.
-///
-/// What it gives up is the magnitude of each delta. On a host whose BLAS
-/// differs, a `max_abs_delta` that moved from `5.96e-08` to `9.9e-06` — still
-/// inside the gate, but two orders of magnitude worse — is invisible here, and
-/// that is stated in the READMEs rather than left to be discovered. The
-/// projection is a check on the gates, not on the arithmetic behind them.
-const removed_report_projection_sha256 = "eb303e0b4d2a84c9c98c7af373dc165643df0058e4364b58ed6580a789db18f4";
-
-/// The environment columns of the committed report, and the predicate for
-/// running the byte digest over it.
-///
-/// The report records nothing else about the host that produced it, so this
-/// string is the whole of what "the platform where the bytes are comparable"
-/// can be tested against. A host reporting the same six columns is a host that
-/// installed the same pins, and a byte difference there is one the report
-/// cannot explain — which is a red, not a skip. A host reporting different ones
-/// gets the projection and is told so on stdout, because a check that quietly
-/// ran less than the one before it is a claim about itself nobody can check.
-const removed_report_environment = "4.57.3,2.14.0,2.5.3,eager,float32,cpu";
-
 /// What `zig build train` is allowed to peak at, in bytes, as macOS
 /// `/usr/bin/time -l` reports the ReleaseFast binary's own maximum resident set
 /// size. The gate is `zig build peak-rss`, and `verify` runs it.
 ///
 /// This number is here because nothing measured peak memory for this
-/// repository's entire history. The five block ops were checked tensor by
-/// tensor against a external reference, the loss curve was gated on a byte
+/// repository's entire history. The loss curve was gated on a byte
 /// digest, and a defect that retained every one of 123 steps' working sets in
 /// an arena whose `free` is a no-op shipped anyway, because the
 /// documentation of it was a table in `src/README.md` and no command behind
@@ -191,10 +116,6 @@ pub fn build(b: *std.Build) void {
     // and the command that re-derives it, because those are the two things a
     // reader in that position needs and neither was in the output.
     const loss_csv = addDigestCheck(b, "committed loss curve (owned by src/main.zig:csv_sha256; re-derive with 'zig build train', which is the gate that checks the CODE still produces these bytes -- this one checks only that the FILE is unchanged)", loss_csv_path, loss_csv_sha256);
-    // Its own step, deliberately not reached from `verify`, for the reason on
-    // `removed_report_sha256`. `check.sh` runs it.
-    const parity_digest_step = b.step("removed-digest", "Check tools/removed/report.csv: the projection everywhere, the bytes where the environment matches the committed report");
-    parity_digest_step.dependOn(&addParityReportCheck(b).step);
 
     const lib = b.addModule("ztransformer", .{
         .root_source_file = b.path("src/lib.zig"),
@@ -323,18 +244,12 @@ pub fn build(b: *std.Build) void {
     // because a gate that prints on every green run trains everyone to ignore
     // it. Nothing here writes anything outside the build cache.
     //
-    // The parity report's digest is the one that is not here, and its absence is
-    // the point rather than a gap: it is written by the only command in this
-    // repository that needs Python, so a reader can check every claim this gate
-    // can check without installing anything. `sh tools/removed/check.sh` checks
-    // the report it just wrote, and `zig build removed-digest` is the step it
-    // calls to do it.
-    // The description below names all ten sub-checks, and it used to name
-    // seven. It listed neither `tools/symbols.sh` nor `tools/removed/report.csv`,
-    // so `zig build --list-steps` understated the gate by two and a reader
-    // weighing a green run against a shorter list than the one that ran was
-    // reading a stale copy. `README.md` already named all ten, which is how only
-    // this one went stale.
+    // The description below names every sub-check this gate runs. It used to
+    // name fewer than it ran: it listed neither `tools/symbols.sh` nor the scale
+    // tables in `src/README.md`, so `zig build --list-steps` understated the gate
+    // and a reader weighing a green run against a shorter list than the one that
+    // ran was reading a stale copy. `README.md` already named them all, which is
+    // how only this one went stale.
     //
     // It now also names the ONE thing the gate does not do, because that list has
     // no other place to say it and `verify` is silent on success: the CUDA
@@ -342,7 +257,7 @@ pub fn build(b: *std.Build) void {
     // so it lives in `zig build cuda-attn-check` and a green `verify` says
     // nothing at all about it. A gate whose omissions are unstated is how a
     // reader concludes a check happened.
-    const verify_step = b.step("verify", "Check fmt, the test suite in Debug, the test suite in ReleaseFast, the version banner, the corpus digest, the committed loss curve, the attention benchmark's CPU half compiles, the scale tables in src/README.md, the symbol table in src/README.md, tools/removed/report.csv, and the training run's peak memory -- but NOT the CUDA attention comparison, which needs a CUDA toolchain and is 'zig build cuda-attn-check', and NOT the negative controls for that scale-table gate, which print what they caught and are 'zig build table-block-check'");
+    const verify_step = b.step("verify", "Check fmt, the test suite in Debug, the test suite in ReleaseFast, the version banner, the corpus digest, the committed loss curve, the attention benchmark's CPU half compiles, the scale tables in src/README.md, the symbol table in src/README.md, and the training run's peak memory -- but NOT the CUDA attention comparison, which needs a CUDA toolchain and is 'zig build cuda-attn-check', and NOT the negative controls for that scale-table gate, which print what they caught and are 'zig build table-block-check'");
 
     // `b.graph.zig_exe` rather than `zig` off `PATH`, so the formatter that
     // decides whether the tree is formatted is the same compiler running the
@@ -493,7 +408,19 @@ pub fn build(b: *std.Build) void {
         \\export ZTRANSFORMER_CORPUS_BYTES=$2
         \\rm -f outputs/loss.pending.csv
         \\"$bin" train > "$work/a.log" 2>&1 || true
-        \\cp outputs/loss.pending.csv "$work/a.csv"
+        \\## `2>/dev/null || true` is load-bearing, not decoration. Under `set -eu` a
+        \\## bare `cp` that finds nothing ABORTS the step on the spot, which is why the
+        \\## first version of this guard could never fire: it sat behind a command that
+        \\## had already ended the script. Pass two has had the suppression all along;
+        \\## this gives pass one the same, so the guard below is reachable at all.
+        \\cp outputs/loss.pending.csv "$work/a.csv" 2>/dev/null || true
+        \\if [ ! -f "$work/a.csv" ]; then
+        \\  echo "determinism: the FIRST pass produced no curve, so there is" >&2
+        \\  echo "  nothing to compare. A pass that never ran is not evidence of" >&2
+        \\  echo "  determinism, in either direction. The first pass said:" >&2
+        \\  tail -5 "$work/a.log" >&2 || true
+        \\  exit 1
+        \\fi
         \\# Removed AGAIN before the second pass, and the reason is a hole this
         \\## step had: `|| true` swallows a second pass that fails, and without
         \\## this rm the `cp` below would copy the leftover from pass one into
@@ -652,8 +579,7 @@ pub fn build(b: *std.Build) void {
     // `sh src/cuda/run-norm.sh` on an NVIDIA host. This compiles three CUDA sources
     // files, so a syntax or type error in them is caught by the build system.
     //
-    // Deliberately NOT in `verify`, and the reason is the same one that keeps
-    // `removed-digest` out: `verify` is silent on success and CI asserts that, so
+    // Deliberately NOT in `verify`: `verify` is silent on success and CI asserts that, so
     // anything in it runs on every ubuntu runner. A GitHub runner has no CUDA
     // toolchain and never will, so a compile step there would be a red for a
     // reason that has nothing to do with the code. A named step a reader has to
@@ -856,84 +782,6 @@ pub fn build(b: *std.Build) void {
     symbols.step.dependOn(&exe.step);
     symbols.step.dependOn(&default_tests.step);
     verify_step.dependOn(&symbols.step);
-
-    // A committed parity report carrying a failing row is a corrupted artifact,
-    // and `verify` used to pass on one. `check.sh` and `sensitivity.sh` both
-    // write this file; run concurrently they leave a perturbed export behind,
-    // and this repository did exactly that: 18 rows reading FAIL where the
-    // committed baseline has none, and `verify` was green throughout.
-    //
-    // `removed-digest` would catch that too and is deliberately not in `verify`,
-    // for the reason on `removed_report_sha256`: hashing committed bytes is not
-    // the claim. This is a different check and does not conflict with that
-    // decision. A comparison that passed writes no FAIL row, so their absence is
-    // a property of a green run rather than of one byte sequence -- a legitimate
-    // re-run that produces a different but equally valid report still passes,
-    // which is exactly the case `removed-digest` would reject.
-    const report_rows = b.addSystemCommand(&.{
-        "sh",
-        "-c",
-        \\# `-r` and the case-insensitive match are both load-bearing, and both
-        \\# were found by breaking this gate rather than by reading it. `grep -q`
-        \\# exits 2 on a missing file, so the `if` below was false and the step
-        \\# exited 0: a committed report that is *absent* passed the check
-        \\# written to catch one that is corrupt. And `FAIL` is the oracle
-        \\# writer's casing, not a contract this gate asserts, so a one-character
-        \\# change to `fail` turned the gate into a no-op. And a readable but EMPTY
-        \\# file satisfied `-r` while grep found no failing row in nothing, so an
-        \\# empty export was green too. So there are four tests and they fail
-        \\# closed: unreadable or absent, near-empty, the wrong number of
-        \\# lines, and a failing row. The count was the fourth because the
-        \\# first three all accept a partial export, and the digest check that
-        \\# would also catch that is deliberately out of `verify`, so this gate
-        \\# is the only thing standing between a truncated report and a green
-        \\# run.
-        \\if [ ! -r "$1" ]; then
-        \\  echo "tools/removed/report.csv is missing or unreadable, so there is" >&2
-        \\  echo "no committed comparison for this gate to inspect. A gate that" >&2
-        \\  echo "cannot read its subject has not passed it." >&2
-        \\  exit 1
-        \\fi
-        \\if [ ! -s "$1" ] || [ "$(grep -c . "$1")" -lt 3 ]; then
-        \\  echo "tools/removed/report.csv has fewer than three lines, so it is" >&2
-        \\  echo "empty or truncated rather than a comparison. Readable is not" >&2
-        \\  echo "populated, and the failing-row grep below finds nothing in" >&2
-        \\  echo "nothing, so without this both tests pass a zero-byte report." >&2
-        \\  exit 1
-        \\fi
-        \\# The count, because the three tests above all accept a partial
-        \\# export. Drop the last eighty rows of a real one and the file is
-        \\# still readable, still over three lines and still carries no
-        \\# failing row, so a hand-truncated report passed a gate written to
-        \\# catch a corrupt one. 207 lines is one header, 204 tensor rows --
-        \\# six cases of 34, being 16 per-layer kinds over two layers plus
-        \\# final_norm and logits -- one argmax row and one summary row. It
-        \\# is a TOTAL line count because the repository quotes two narrower
-        \\# counts elsewhere, 204 tensor rows and 206 rows of data, and a
-        \\# reader who reaches for either of those weakens the gate.
-        \\if [ "$(grep -c . "$1")" -ne 207 ]; then
-        \\  echo "tools/removed/report.csv holds $(grep -c . "$1") lines where 207" >&2
-        \\  echo "are: one header, 204 tensor rows, one argmax row, one summary" >&2
-        \\  echo "row. A truncated export keeps several clean rows, so the" >&2
-        \\  echo "failing-row grep finds nothing in them and the tests above" >&2
-        \\  echo "pass it. Re-run: sh tools/removed/check.sh" >&2
-        \\  exit 1
-        \\fi
-        \\if grep -qi fail "$1"; then
-        \\  echo "tools/removed/report.csv carries failing rows, so the committed" >&2
-        \\  echo "report is a perturbed export rather than a comparison that" >&2
-        \\  echo "passed. check.sh and sensitivity.sh both write this file:" >&2
-        \\  grep -n FAIL "$1" >&2
-        \\  echo "restore it, and do not run the two at once:" >&2
-        \\  echo "  git checkout tools/removed/report.csv" >&2
-        \\  exit 1
-        \\fi
-        ,
-        "sh",
-    });
-    report_rows.addFileArg(b.path("tools/removed/report.csv"));
-    report_rows.setCwd(b.path("."));
-    verify_step.dependOn(&report_rows.step);
 
     // The banner, captured rather than inherited: `verify` has to be silent, and
     // an exact stdout match asserts more than the exit code alone, which is the
@@ -1364,8 +1212,8 @@ fn addBench(b: *std.Build, train_exe: *std.Build.Step.Compile) *std.Build.Step.R
 /// The tool is chosen, not assumed. This said "`shasum` is present on macOS and
 /// on the GitHub ubuntu runners this repository targets", and the second half of
 /// that was never true: `shasum` is a Perl script that ships with macOS, while
-/// Linux ships GNU `sha256sum`. So all three digests — the corpus, the loss curve
-/// and the parity report — failed on Linux with `shasum: command not found`, on
+/// Linux ships GNU `sha256sum`. So the corpus and loss-curve digests failed on
+/// Linux with `shasum: command not found`, on
 /// the platform `.github/workflows/ci.yml` runs, and the comment asserting
 /// otherwise is why it went unnoticed. `sha256sum` is preferred and `shasum -a
 /// 256` is the fallback; a machine with neither fails loudly.
@@ -1400,118 +1248,5 @@ fn addDigestCheck(
             "h '" ++ path ++ "' >&2; exit 1; fi",
     });
     check.setCwd(b.path("."));
-    return check;
-}
-
-/// A step that fails unless `tools/removed/report.csv` is the comparison the
-/// repository committed, checked as far as the host it ran on allows.
-///
-/// Two checks, in this order, and the order is the design. The projection runs
-/// everywhere and is the one that must not be weakened: it is the whole claim —
-/// which tensors, which shapes, which gates, which verdicts, what argmax count —
-/// with the two columns a different host owns taken out, so it is a statement
-/// about the comparison rather than about the rounding of a float. The byte
-/// digest runs only when the report's environment columns are the committed
-/// ones, and is strictly stronger where it does: it catches the deltas moving
-/// inside their gates, which the projection cannot see. A host that fails the
-/// environment predicate has not got a weaker check, it has got the portable
-/// one, and it is told that on stderr rather than left to assume.
-///
-/// Both live in one script because the predicate is a runtime fact about the
-/// file, and the build graph has no conditionals: two steps cannot see each
-/// other's result. That is also why the byte digest is spelled out here instead
-/// of being a second `addDigestCheck` call — one command, one `exit`, and the
-/// message on a red says which of the two fired, which two steps could not.
-///
-/// The sha256 tool selection is the same `sha256sum`-then-`shasum` dance
-/// `addDigestCheck` spells out, for the same reason and with the same failure on
-/// a host carrying neither. Duplicating three lines is the price of not editing
-/// a function three other gates call; if this ever becomes the third copy,
-/// hoist it to a comptime constant above both.
-///
-/// The projection keeps the header line, so a report that gained or lost a
-/// column is a diff here rather than a silent shift of what `$8` means. Its
-/// eight kept columns are positional (`$1..$6`, `$8`, `$9`), which is a
-/// limitation rather than a choice: no field the oracle writes can hold a comma
-/// — they are identifiers, small integers, a Python float `repr` of a gate, and
-/// the literals `pass`, `FAIL`, `OK` — so `awk -F,` cannot mis-split one, and a
-/// future column that could is a loud mismatch rather than a wrong answer.
-fn addParityReportCheck(b: *std.Build) *std.Build.Step.Run {
-    const check = b.addSystemCommand(&.{
-        "sh",
-        "-c",
-        \\p=$(mktemp) || exit 1
-        \\if command -v sha256sum >/dev/null 2>&1; then h() { sha256sum "$@"; };
-        \\elif command -v shasum >/dev/null 2>&1; then h() { shasum -a 256 "$@"; };
-        \\else echo "committed parity report: no sha256 tool on this host (looked for sha256sum and shasum)." >&2; exit 1; fi
-        \\awk -F, 'NR == 1 { print; next } { print $1 "," $2 "," $3 "," $4 "," $5 "," $6 "," $8 "," $9 }' "$1" | tr -d '\r' > "$p" || { rm -f "$p"; exit 1; }
-        \\want="$2"
-        \\got=$(h "$p" | awk '{print $1}')
-        \\if [ "$got" != "$want" ]; then
-        \\  echo "committed parity report: the projection does not match, so this report is not" >&2
-        \\  echo "the comparison that was committed, and no host's float rounding explains it." >&2
-        \\  echo "A verdict, a gate, a row or the argmax count moved. sha256 over the eight" >&2
-        \\  echo "kept columns of this file, then of the committed one:" >&2
-        \\  echo "  expected  $want" >&2
-        \\  echo "  actual    $got" >&2
-        \\  echo "git diff tools/removed/report.csv shows which line moved. A report full of" >&2
-        \\  echo "FAIL rows is sensitivity.sh's export rather than a comparison that passed:" >&2
-        \\  echo "  git checkout tools/removed/report.csv" >&2
-        \\  rm -f "$p"; exit 1
-        \\fi
-        \\rm -f "$p"
-        \\# Every row's environment, not row 2's. This predicate decides whether
-        \\# the byte digest runs at all, and it was read out of the file it is
-        \\# checking, so editing one row's version columns made it disagree with
-        \\# the committed record and switched the byte digest off -- an inflated
-        \\# `max_abs_delta` then passed with every verdict still reading `pass`.
-        \\# Found by breaking the gate, not by reading it. Rows that disagree
-        \\# with each other are a malformed report, so this fails rather than
-        \\# skips; a genuinely different host has every row agreeing, which is
-        \\# the case the skip exists for.
-        \\uniq=$(awk -F, 'NR > 1 { print $10 "," $11 "," $12 "," $13 "," $14 "," $15 }' "$1" | tr -d '\r' | sort -u)
-        \\rows=$(printf '%s\n' "$uniq" | wc -l | tr -d ' ')
-        \\if [ "$rows" -ne 1 ]; then
-        \\  echo "committed parity report: the environment columns are not the same" >&2
-        \\  echo "on every row ($rows distinct values), so this is not a report one" >&2
-        \\  echo "oracle wrote. A row was edited to move the predicate below, which" >&2
-        \\  echo "is the switch that decides whether the byte digest runs." >&2
-        \\  printf '%s\n' "$uniq" | sed 's/^/  /' >&2
-        \\  exit 1
-        \\fi
-        \\got=$uniq
-        \\if [ "$got" != "$3" ]; then
-        \\  echo "removed-digest: projection OK; byte digest NOT run, this host's oracle is not" >&2
-        \\  echo "            the one the committed digest was taken over."
-        \\  echo "  this report   $got" >&2
-        \\  echo "  committed     $3" >&2
-        \\  echo "The deltas here are unchecked against the committed ones, because they are" >&2
-        \\  echo "the floats another host rounds its own way. The verdicts, gates, row set and" >&2
-        \\  echo "argmax count were checked above, and those did match." >&2
-        \\  exit 0
-        \\fi
-        \\if echo "$4  $1" | h -c - >/dev/null 2>&1; then
-        \\  echo "removed-digest: projection OK; byte digest OK, environment matches the committed report."
-        \\  exit 0
-        \\fi
-        \\echo "committed parity report: byte digest failed, and the environment columns are the" >&2
-        \\echo "committed ones, so a version string does not account for it and neither does" >&2
-        \\echo "the float difference between two hosts. Something else moved." >&2
-        \\echo "  expected  $4  tools/removed/report.csv" >&2
-        \\h "$1" >&2
-        \\exit 1
-        ,
-        "sh",
-    });
-    check.setCwd(b.path("."));
-    // The report by its path in the tree rather than as a build input, which is
-    // what `addDigestCheck` does for the other two digests and is enough: a
-    // system command with nothing captured has side effects, so the step runs on
-    // every invocation and reads the file as it is now rather than as it was
-    // when the manifest was written.
-    check.addArg(removed_report_path);
-    check.addArg(removed_report_projection_sha256);
-    check.addArg(removed_report_environment);
-    check.addArg(removed_report_sha256);
     return check;
 }

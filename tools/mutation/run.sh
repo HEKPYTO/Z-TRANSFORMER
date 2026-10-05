@@ -87,6 +87,24 @@ case "$mode" in
         ;;
 esac
 
+# The floor knob, validated here rather than beside the comparison it guards, so a bad
+# value costs a second instead of a full mutation sweep. `[` reports an arithmetic
+# error on a non-numeric operand and inside an `if` condition that status is not fatal
+# -- the branch simply is not taken -- so a floor set to `'15 '` by a YAML or env edit,
+# or to a word, printed the sweep's own summary and exited 0 with the floor nominally
+# enforced. `tools/table-block.sh` validates its floor this way; this did not.
+#
+# `${VAR+x}` rather than `${VAR:-}`: the latter cannot tell UNSET from EMPTY, and unset
+# means "no floor", which is the documented default and must not be refused.
+if [ -n "${MUTATION_EXPECTED_CAUGHT+x}" ]; then
+    case "$MUTATION_EXPECTED_CAUGHT" in
+        ''|*[!0-9]*)
+            echo "mutation: MUTATION_EXPECTED_CAUGHT must be a whole number, got '${MUTATION_EXPECTED_CAUGHT}'." >&2
+            exit 2
+            ;;
+    esac
+fi
+
 # A digest of the whole of src/ used to be taken here and compared after. It is
 # gone, because it could only ever detect one of two things and the two are not
 # distinguishable from inside the run: this harness writing to the caller's
