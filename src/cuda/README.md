@@ -723,8 +723,9 @@ zero" is true here in a way it would not be for an f64 comparison.
 ### Reproducibility, measured three ways
 
 These are **observations, not reproducible outputs.** Three consecutive `sh src/cuda/run-attn.sh`
-invocations on that host, and no transcript of them is committed, so a reader can check the `ctx256`
-triple quoted below and nothing else.
+invocations on that host, and no transcript of those three is committed, so a reader can check the `ctx256`
+triple quoted below and nothing else. (`outputs/bench/run-attn.log` is one full run from a later
+date, not these three.)
 
 | Column | Spread over three runs |
 |---|---|

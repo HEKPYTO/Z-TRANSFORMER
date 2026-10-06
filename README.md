@@ -41,7 +41,8 @@ Per attention call, the fused kernel runs **94x to 165x** the CPU twin across el
 (minimum of three runs each, no floor) at a fraction of a percent of its parity gate. Training
 writes a committed loss curve falling to 5.60 train / 5.16 val. Every number is graded against a
 reference this repository implements: no third-party comparison was ever measured, and a per-call
-ratio is not a step speedup (attention is about 7% of a step). Full tables, method, and every
+ratio is not a step speedup (attention is about 7% of a step). One full benchmark run is
+committed at `outputs/bench/run-attn.log`. Full tables, method, and every
 caveat live beside the code they describe: `src/cuda/README.md` for the kernels,
 `outputs/README.md` for the curve.
 
@@ -53,4 +54,8 @@ training step. Not done: the backward kernel has no training path, there is no i
 benchmark, and long context is out (no RoPE scaling; 8B shapes do not run). `zig build train`
 leaves a checkpoint beside the curve; `zig build infer` decodes from it, greedy only.
 
-Source lives in `src/`. Everything the repository generates lands in `outputs/`. Apache-2.0 licensed.
+Source lives in `src/`. Everything the repository generates lands in `outputs/`.
+
+## License
+
+Apache-2.0. See LICENSE.

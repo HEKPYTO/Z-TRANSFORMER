@@ -869,8 +869,7 @@ not a property of the code.
 `src/cuda/attn_kernels.cu` is that kernel: one block per query and head, walking the causal prefix with
 the running softmax in registers and no score matrix ever written to global memory. Its two backward
 kernels are in that same file and are graded against `attentionBackward` by the same script, at three
-separate gates, one each for dq, dk and dv. Both halves are now wired into a real training step behind
-only the forward is wired behind one flag: `src/model.zig`'s `cuda_attn` routes it through this
+separate gates, one each for dq, dk and dv. Only the forward is wired behind one flag: `src/model.zig`'s `cuda_attn` routes it through this
 file, and `zig build cuda-attn-check` grades that path against `attention.forward` on a real step's
 tensors. **Nothing calls `device.Attn.backward`**, so the backward kernel is graded by the benchmark
 harness and nowhere else. The file

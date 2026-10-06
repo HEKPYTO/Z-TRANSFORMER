@@ -135,7 +135,7 @@ matching — because the source moved — writes an unmutated file, the suite pa
 reports a live defect as a coverage hole. A false survivor is worse than no harness, because it is
 a number a reader would believe.
 
-the classification in that table is an author's claim, not a measurement: the suite's exit code alone decides
+The classification in that table is an author's claim, not a measurement: the suite's exit code alone decides
 caught or survived, and the class only labels the damage afterwards. `mutate list` prints the
 names, and `mutate show <name>` prints the exact before and after for any one of them.
 
