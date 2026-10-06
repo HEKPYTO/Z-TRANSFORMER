@@ -1,0 +1,146 @@
+host-clean: GPU 0% and 521 MiB, load 1.11, no sibling build.
+  Thresholds: GPU <= 5%, VRAM <= 1536 MiB, load <= 8.
+  Necessary and not sufficient: see outputs/bench/ctx256-sweep.csv.
+attn: scratch <worktree>/.zig-cache/cuda/attn
+attn: built the CPU twin
+attn: ctx256 T=256 4/2 heads dim 32 cpu 10693.47 us over 47 calls   cpu_backward 19246.36 us
+attn: ctx512 T=512 4/2 heads dim 32 cpu 46684.72 us over 11 calls   cpu_backward 76678.86 us
+attn: ctx1024 T=1024 4/2 heads dim 32 cpu 189214.68 us over 3 calls   cpu_backward 306161.04 us
+attn: ctx2048 T=2048 4/2 heads dim 32 cpu 762752.83 us over 3 calls   cpu_backward 1231776.65 us
+attn: ctx4096 T=4096 4/2 heads dim 32 cpu 3092276.52 us over 3 calls   cpu_backward 5019111.73 us
+attn: llama3-T256 T=256 32/8 heads dim 128 cpu 338367.43 us over 3 calls   cpu_backward 593722.97 us
+attn: llama3-T512 T=512 32/8 heads dim 128 cpu 1656442.64 us over 3 calls   cpu_backward 2468487.46 us
+attn: gqa-96-T256 T=256 32/8 heads dim 96 cpu 254914.83 us over 3 calls   cpu_backward 440265.73 us
+attn: gqa-96-T512 T=512 32/8 heads dim 96 cpu 1022741.02 us over 3 calls   cpu_backward 1759697.44 us
+attn: mha-192-T256 T=256 16/16 heads dim 192 cpu 251624.95 us over 3 calls   cpu_backward 465587.32 us
+attn: gqa-256-T256 T=256 8/4 heads dim 256 cpu 164836.09 us over 4 calls   cpu_backward 288562.18 us
+attn: wrote inputs, the reference output and manifest.tsv
+attn: wrote inputs, the reference output and the manifest
+attn: compiled attn.cu
+attn: running with ATTN_GROUP_Q=1
+attn: ATTN_MAX_TILE=64
+shape          ctx     cpu_us   kernel_us   max_abs     gate   used    ratio  parity  argmax
+ctx256          256   10693.47     104.829  5.960e-08     1e-04  0.060%    102.0x  ok   argmax 517
+ctx512          512   46684.72     331.458  5.960e-08     1e-04  0.060%    140.8x  ok   argmax 517
+ctx1024        1024  189214.67    1158.277  5.960e-08     1e-04  0.060%    163.4x  ok   argmax 517
+ctx2048        2048  762752.83    4571.443  5.960e-08     1e-04  0.060%    166.9x  ok   argmax 517
+ctx4096        4096 3092276.52   18392.418  5.960e-08     1e-04  0.060%    168.1x  ok   argmax 517
+llama3-T256     256  338367.43    3165.982  7.451e-08     1e-04  0.075%    106.9x  ok   argmax 76157
+llama3-T512     512 1656442.64   11845.427  7.451e-08     1e-04  0.075%    139.8x  ok   argmax 76157
+gqa-96-T256     256  254914.83    2475.802  5.960e-08     1e-04  0.060%    103.0x  ok   argmax 3792
+gqa-96-T512     512 1022741.02    9326.196  5.960e-08     1e-04  0.060%    109.7x  ok   argmax 3792
+mha-192-T256    256  251624.95    2417.541  1.043e-07     1e-04  0.104%    104.1x  ok   argmax 195211
+gqa-256-T256    256  164836.09    1672.950  7.451e-08     1e-04  0.075%     98.5x  ok   argmax 43433
+
+shape          ctx     bwd_us     max_abs_dq     max_abs_dk     max_abs_dv     gate   worst   parity      worst_dq      worst_dk      worst_dv
+ctx256          256     588.80      7.451e-09      1.537e-08      2.384e-07     1e-05   2.38%  ok            170          119            5
+ctx512          512    1476.61      7.451e-09      1.490e-08      2.980e-07     1e-05   2.98%  ok            170          184           39
+ctx1024        1024    4732.80      7.451e-09      1.676e-08      3.576e-07     1e-05   3.58%  ok            170          108           39
+ctx2048        2048   17713.15      7.451e-09      1.863e-08      2.384e-07     1e-05   2.38%  ok            170          108            5
+ctx4096        4096   70385.67      7.451e-09      1.863e-08      2.980e-07     1e-05   2.98%  ok            170          108            5
+llama3-T256     256   31299.49      2.980e-08      5.215e-08      7.153e-07     1e-05   7.15%  ok           7739          983         2043
+llama3-T512     512  115151.87      2.980e-08      7.451e-08      8.345e-07     1e-05   8.34%  ok           7739         1017         2043
+gqa-96-T256     256   19440.54      1.118e-08      4.098e-08      4.768e-07     1e-05   4.77%  ok           3370         2234           45
+gqa-96-T512     512   69907.14      1.118e-08      4.843e-08      5.960e-07     1e-05   5.96%  ok           3370         2234          345
+mha-192-T256    256   30825.47      2.235e-08      3.725e-08      2.384e-07     1e-05   2.38%  ok           3934         3993           73
+gqa-256-T256    256   28603.14      2.095e-08      3.725e-08      4.768e-07     1e-05   4.77%  ok           5564         1246          248
+
+library entry points, one launch per manifest shape at T=8:
+  ctx256       head_dim 32   tile 32/32   8704/8960   bytes  forward 0  backward 0
+  ctx512       head_dim 32   tile 32/32   8704/8960   bytes  forward 0  backward 0
+  ctx1024      head_dim 32   tile 32/32   8704/8960   bytes  forward 0  backward 0
+  ctx2048      head_dim 32   tile 32/32   8704/8960   bytes  forward 0  backward 0
+  ctx4096      head_dim 32   tile 32/32   8704/8960   bytes  forward 0  backward 0
+  llama3-T256  head_dim 128  tile 64/64  66816/67584  bytes  forward 0  backward 0
+  llama3-T512  head_dim 128  tile 64/64  66816/67584  bytes  forward 0  backward 0
+  gqa-96-T256  head_dim 96   tile 64/64  50304/50944  bytes  forward 0  backward 0
+  gqa-96-T512  head_dim 96   tile 64/64  50304/50944  bytes  forward 0  backward 0
+  mha-192-T256 head_dim 192  tile 64/64  99840/100864 bytes  forward 0  backward 0
+  gqa-256-T256 head_dim 256  tile 48/48  99904/101120 bytes  forward 0  backward 0
+
+configurations used: 11
+  group_q 1   block 32   threads  tile 32    256 query blocks per head-row
+  group_q 1   block 32   threads  tile 32    512 query blocks per head-row
+  group_q 1   block 32   threads  tile 32    1024 query blocks per head-row
+  group_q 1   block 32   threads  tile 32    2048 query blocks per head-row
+  group_q 1   block 32   threads  tile 32    4096 query blocks per head-row
+  group_q 1   block 128  threads  tile 64    256 query blocks per head-row
+  group_q 1   block 128  threads  tile 64    512 query blocks per head-row
+  group_q 1   block 96   threads  tile 64    256 query blocks per head-row
+  group_q 1   block 96   threads  tile 64    512 query blocks per head-row
+  group_q 1   block 192  threads  tile 64    256 query blocks per head-row
+  group_q 1   block 256  threads  tile 48    256 query blocks per head-row
+attn: OK
+attn: running with ATTN_MAX_TILE=64
+attn: ATTN_MAX_TILE=64
+shape          ctx     cpu_us   kernel_us   max_abs     gate   used    ratio  parity  argmax
+ctx256          256   10693.47      90.622  5.960e-08     1e-04  0.060%    118.0x  ok   argmax 517
+ctx512          512   46684.72     327.685  5.960e-08     1e-04  0.060%    142.5x  ok   argmax 517
+ctx1024        1024  189214.67    1175.675  5.960e-08     1e-04  0.060%    160.9x  ok   argmax 517
+ctx2048        2048  762752.83    4905.062  5.960e-08     1e-04  0.060%    155.5x  ok   argmax 517
+ctx4096        4096 3092276.52   19664.394  5.960e-08     1e-04  0.060%    157.3x  ok   argmax 517
+llama3-T256     256  338367.43    3229.430  7.451e-08     1e-04  0.075%    104.8x  ok   argmax 76157
+llama3-T512     512 1656442.64   11925.168  7.451e-08     1e-04  0.075%    138.9x  ok   argmax 76157
+gqa-96-T256     256  254914.83    2486.333  5.960e-08     1e-04  0.060%    102.5x  ok   argmax 3792
+gqa-96-T512     512 1022741.02    9425.613  5.960e-08     1e-04  0.060%    108.5x  ok   argmax 3792
+mha-192-T256    256  251624.95    2440.458  1.043e-07     1e-04  0.104%    103.1x  ok   argmax 195211
+gqa-256-T256    256  164836.09    1681.654  7.451e-08     1e-04  0.075%     98.0x  ok   argmax 43433
+
+shape          ctx     bwd_us     max_abs_dq     max_abs_dk     max_abs_dv     gate   worst   parity      worst_dq      worst_dk      worst_dv
+ctx256          256     592.90      7.451e-09      1.537e-08      2.384e-07     1e-05   2.38%  ok            170          119            5
+ctx512          512    1483.78      7.451e-09      1.490e-08      2.980e-07     1e-05   2.98%  ok            170          184           39
+ctx1024        1024    4730.88      7.451e-09      1.676e-08      3.576e-07     1e-05   3.58%  ok            170          108           39
+ctx2048        2048   19805.12      7.451e-09      1.863e-08      2.384e-07     1e-05   2.38%  ok            170          108            5
+ctx4096        4096   70997.73      7.451e-09      1.863e-08      2.980e-07     1e-05   2.98%  ok            170          108            5
+llama3-T256     256   31411.20      2.980e-08      5.215e-08      7.153e-07     1e-05   7.15%  ok           7739          983         2043
+llama3-T512     512  115621.80      2.980e-08      7.451e-08      8.345e-07     1e-05   8.34%  ok           7739         1017         2043
+gqa-96-T256     256   19466.24      1.118e-08      4.098e-08      4.768e-07     1e-05   4.77%  ok           3370         2234           45
+gqa-96-T512     512   71235.58      1.118e-08      4.843e-08      5.960e-07     1e-05   5.96%  ok           3370         2234          345
+mha-192-T256    256   31469.34      2.235e-08      3.725e-08      2.384e-07     1e-05   2.38%  ok           3934         3993           73
+gqa-256-T256    256   28533.38      2.095e-08      3.725e-08      4.768e-07     1e-05   4.77%  ok           5564         1246          248
+
+library entry points, one launch per manifest shape at T=8:
+  ctx256       head_dim 32   tile 32/32   8704/8960   bytes  forward 0  backward 0
+  ctx512       head_dim 32   tile 32/32   8704/8960   bytes  forward 0  backward 0
+  ctx1024      head_dim 32   tile 32/32   8704/8960   bytes  forward 0  backward 0
+  ctx2048      head_dim 32   tile 32/32   8704/8960   bytes  forward 0  backward 0
+  ctx4096      head_dim 32   tile 32/32   8704/8960   bytes  forward 0  backward 0
+  llama3-T256  head_dim 128  tile 64/64  66816/67584  bytes  forward 0  backward 0
+  llama3-T512  head_dim 128  tile 64/64  66816/67584  bytes  forward 0  backward 0
+  gqa-96-T256  head_dim 96   tile 64/64  50304/50944  bytes  forward 0  backward 0
+  gqa-96-T512  head_dim 96   tile 64/64  50304/50944  bytes  forward 0  backward 0
+  mha-192-T256 head_dim 192  tile 64/64  99840/100864 bytes  forward 0  backward 0
+  gqa-256-T256 head_dim 256  tile 48/48  99904/101120 bytes  forward 0  backward 0
+
+configurations used: 11
+  group_q 1   block 32   threads  tile 32    256 query blocks per head-row
+  group_q 1   block 32   threads  tile 32    512 query blocks per head-row
+  group_q 1   block 32   threads  tile 32    1024 query blocks per head-row
+  group_q 1   block 32   threads  tile 32    2048 query blocks per head-row
+  group_q 1   block 32   threads  tile 32    4096 query blocks per head-row
+  group_q 1   block 128  threads  tile 64    256 query blocks per head-row
+  group_q 1   block 128  threads  tile 64    512 query blocks per head-row
+  group_q 1   block 96   threads  tile 64    256 query blocks per head-row
+  group_q 1   block 96   threads  tile 64    512 query blocks per head-row
+  group_q 1   block 192  threads  tile 64    256 query blocks per head-row
+  group_q 1   block 256  threads  tile 48    256 query blocks per head-row
+attn: OK
+attn: proving the parity gate can fail
+attn: broken variant 1 was caught, as it must be
+attn: broken variant 2 was caught, as it must be
+attn: broken variant 3 was caught, as it must be
+attn: broken variant 4 was caught, as it must be
+attn: proving the backward gate can fail too
+attn: backward variant 1 was caught, as it must be   [dq/dk/dv 7.451e-09/2.444e-01/1.536e+00]
+attn: backward variant 2 was caught, as it must be   [dq/dk/dv 3.835e-02/7.273e-02/4.992e-02]
+attn: backward variant 3 was caught, as it must be   [dq/dk/dv 5.224e-02/2.121e-01/2.384e-07]
+attn: backward variant 4 was caught, as it must be   [dq/dk/dv 1.463e-01/2.449e-01/3.018e-01]
+attn: ...and all four signatures differ, so they are four different defects
+attn: the backward kernel exists and this harness grades it against
+      attentionBackward, but it is NOT on the training path: src/model.zig's
+      cuda_attn routes the FORWARD through this file, and nothing in the Zig
+      tree calls device.Attn.backward, so the backward kernel is exercised
+      only here. A KV cache exists (src/kv_cache.zig, six tests) and
+      src/decode.zig decodes through it: decode.cudaAttnStep derives q_offset =
+      pos from the cache itself, so the forward kernel's offset is exercised at
+      every real decode position and not only at 0.
