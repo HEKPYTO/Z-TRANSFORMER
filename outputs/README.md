@@ -35,7 +35,17 @@ The committed curve is the default `zig build train` run: 123 windows, one epoch
 ending at train loss 5.596625 and validation loss 5.155396, the last row of the file, measured on
 held-out tokens the training batcher never touches. A smoke run showing the loop completes and the
 loss falls; not a benchmark, not a throughput figure, not a model-quality claim. There is no
-inference benchmark.
+inference benchmark. The committed shape, as printed:
+
+```
+6.5 |*                                                                  6.489 step 24
+6.0 |    *                                                            6.062 step 49
+5.8 |         *                                                      5.814 step 74
+5.7 |              *                                               5.687 step 99
+5.6 |                   *                                          5.597 step 122
+    +--------------------------------------------------------------------
+      0        25        50        75       100       125   step
+```
 
 Three gates cover it, and they catch different things. `zig build verify` checks the file against the
 digest in `src/main.zig`, so it catches **an edited curve**. `zig build determinism`, also inside

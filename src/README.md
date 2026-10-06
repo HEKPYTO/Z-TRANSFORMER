@@ -156,7 +156,7 @@ complexity, and the digest it reproduced is recorded here so the next attempt do
 re-derive it.
 
 **And nothing may regress while it is tried.** The order that matters: `zig build verify`
-exit 0 and 0 bytes, `zig build test` at 229/231, and `zig build train` reproducing the
+exit 0 and 0 bytes, `zig build test` at 226/228, and `zig build train` reproducing the
 `outputs/loss.csv` digest `7d7bcbd8` before and after. Row-parallel `matmul` is
 bit-safe because a row is still summed over `k` in ascending order by one worker, so the
 digest is a real check rather than a formality — if a pool reorders an accumulation the
