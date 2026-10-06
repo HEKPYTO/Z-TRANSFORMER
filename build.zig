@@ -166,6 +166,15 @@ pub fn build(b: *std.Build) void {
     const train_step = b.step("train", "Train and write outputs/loss.csv");
     train_step.dependOn(&train_run.step);
 
+    // `zig build infer -- <prompt words...>`: greedy continuation from the
+    // checkpoint `train` just wrote. Same ReleaseFast binary (generation is a
+    // forward pass per token), prompt forwarded from `b.args` after `infer`.
+    const infer_run = b.addRunArtifact(train_exe);
+    infer_run.addArg("infer");
+    if (b.args) |args| infer_run.addArgs(args);
+    const infer_step = b.step("infer", "Generate text from outputs/checkpoint.bin (usage: zig build infer -- <prompt>)");
+    infer_step.dependOn(&infer_run.step);
+
     // `zig build dbg-train` is the Debug build of the same run, as a step.
     //
     // It exists because the need is real — the loss curve differs between

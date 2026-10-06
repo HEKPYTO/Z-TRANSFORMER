@@ -39,7 +39,8 @@ that need one require a Linux host with docker and a GPU. A fresh clone has no g
 |---|---|---|
 | `zig build` | Builds the binary. | `zig-out/bin/ztransformer` |
 | `zig build run` | Runs it. With no argument it prints the version banner; `zig build run -- train` reaches training. | nothing |
-| `zig build train` | Trains one pass over a 64 KiB prefix of the corpus. Writes `outputs/loss.pending.csv` and promotes it to `outputs/loss.csv` only if it matches the committed digest, so a run never overwrites the evidence it failed to reproduce. | `outputs/loss.csv` |
+| `zig build train` | Trains one pass over a 64 KiB prefix of the corpus. Writes `outputs/loss.pending.csv` and promotes it to `outputs/loss.csv` only if it matches the committed digest, so a run never overwrites the evidence it failed to reproduce. Also writes `outputs/checkpoint.bin` (gitignored) on every run. | `outputs/loss.csv` |
+| `zig build infer -- <prompt>` | Greedy continuation from `outputs/checkpoint.bin` (50 tokens, `ZTRANSFORMER_N_NEW` overrides). Retrains the same 200-merge tokenizer so the ids match with no vocab file. | nothing |
 | `zig build scale-profile` | Projects the cost of shapes this model cannot be run at, from the code's own formulas. Every number is labelled a projection, and two runs are byte-identical. See `src/README.md`. | nothing |
 | `zig build test` | Runs the test suite, and writes nothing at all when it passes. | nothing |
 | `zig build verify` | The whole gate CI runs, silent when it passes: `zig fmt --check`; the test suite in Debug and in ReleaseFast; the version banner; a sha256 on the committed corpus and on the committed loss curve, read with `sha256sum` or `shasum -a 256` on either platform; the attention benchmark's CPU half compiles; the scale tables in `src/README.md`; the symbol table in `src/README.md`; and the training run's peak resident memory, which is the one sub-check that needs `/usr/bin/time`. | nothing |
@@ -212,7 +213,7 @@ device-resident tensor**, so every other part of a step would still cross PCIe t
 third-party reference anywhere in the loop: a green CUDA gate says the kernel and the Zig twin
 agree, and that is the whole of it.
 
-No checkpoint is written: a run leaves a loss curve and no model. The table above is the whole
+Every run writes `outputs/checkpoint.bin` (gitignored, raw LE f32 `ZTR1`): the trained weights in `train.flatten` order behind the `model.Config` they were built from. `zig build infer -- <prompt>` loads it, greedy only. The table above is the whole
 interface a reader needs.
 
 Two further steps exist because `verify` depends on them, so a reader never runs them by hand:

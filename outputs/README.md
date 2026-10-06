@@ -14,6 +14,7 @@ the run, so it ships. Nothing here is ever written by hand.
 | `loss.csv` | yes | `zig build train` | The loss curve of one training run. Header `step,train_loss,val_loss,lr`, then one line per logged step, six decimals on the two losses and eight on the rate. A `val_loss` that was never measured is an **empty field** and nothing else, so a row reads `24,6.489256,,0.29888502`; a measured zero is `0.000000` and a reader can tell the two apart. `zig build verify` checks it against the digest `src/main.zig` owns and `build.zig` reads, and a `train` run replaces it only by matching those bytes. |
 | `loss.pending.csv` | no | `zig build train` | The curve the last run produced, before anything has compared it to the committed one. Renamed onto `loss.csv` and deleted when the bytes match, which is the ordinary outcome. When they do not, it is kept and the run **fails**: a difference is a failure to reproduce the committed claim, and the default has to be the loud one. `ZTRANSFORMER_ACCEPT_LOSS_DIFFERENCE=1` downgrades that to a reported exit 0 — and still does not promote, because acknowledging a difference and changing the claim are different acts. Ignored, so a run that differs leaves the tree the way `git status` reports it. |
 | `bench/ctx256-sweep.csv` | yes | ten runs of `src/cuda/attn_twin.zig` | The distribution behind the min-of-3 rule, and the reason that rule exists rather than a convention: `ctx256`'s CPU column lands in one of two clusters 1.7384x apart with no sample between them, and 70% of single runs land in the higher one. `src/cuda/README.md` reads it out. |
+| `bench/run-attn.log` | when produced | `sh src/cuda/run-attn.sh 2>&1 \| tee outputs/bench/run-attn.log` on the CUDA host | The full parity + speedup transcript the root README table is derived from. Committed only from a run on the host of record (`host-check` clean, GPU idle); this host has no GPU and produces none. |
 
 
 `train_loss` on a row is the mean over the logged steps of the epoch it closes, not the loss of the
@@ -113,8 +114,7 @@ a CI gate on a curve digest would be permanently red on any host with a differen
 does produce the committed curve finds `loss.pending.csv` byte-identical, promotes it, and leaves
 nothing behind.
 
-There is still no checkpoint: `train.run` returns the trained weights in its `Result` and nothing
-writes them to disk, so a training run that ends leaves a curve and no model. `bench/` is the one
+Every run also writes `checkpoint.bin` (gitignored, `outputs/*.bin`): the raw LE f32 weights `train.run` returned, in `train.flatten` order behind the `model.Config` they were built from. `zig build infer` reads it back. `bench/` is the one
 benchmark measurement committed here, and it is committed for the reason the other numbers in this
 repository are not: it is the evidence that a measurement is unreliable in a way a reader cannot
 nothing reads them and nothing grades them, so they are not recorded here.

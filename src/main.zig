@@ -19,6 +19,8 @@ const train = @import("train.zig");
 const scale = @import("scale.zig");
 const attn_bench = @import("attn_bench.zig");
 const profile = @import("profile.zig");
+const checkpoint = @import("checkpoint.zig");
+const decode = @import("decode.zig");
 
 const corpus_path = "data/tinyshakespeare.txt";
 const csv_path = "outputs/loss.csv";
@@ -92,6 +94,13 @@ const epochs = 1;
 /// The same seed `train_test.zig` measures on, so a run here and a run there
 /// agree.
 const seed = 7;
+/// Where a finished run leaves the model. Gitignored (`outputs/*.bin`): a
+/// build product, not a claim. `infer` reads it back.
+const checkpoint_path = "outputs/checkpoint.bin";
+/// How many tokens `infer` writes when no count is given. Env-overridable so
+/// the binary keeps its no-flags contract: `ZTRANSFORMER_N_NEW=20`.
+const n_new_default: usize = 50;
+const n_new_var = "ZTRANSFORMER_N_NEW";
 
 pub fn main(init: std.process.Init) !void {
     // `init.arena` is permanent storage for the process and `init.gpa` is the
@@ -107,18 +116,16 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     if (args.len > 1) {
-        // Exactly one argument. The binary reads no flags, so a second one is
-        // a flag that was meant to change the run and did not: `train
-        // --epochs 20` used to train for the hard-coded epoch count and say
-        // nothing, which is a 90 second run on the wrong configuration. The two
-        // callers this ships to, `zig build train`,
-        // each pass one, so nothing legitimate is refused.
+        // `train`, `scale-profile` and `attn-bench` take exactly one argument.
+        // `infer` takes the prompt after it, joined with spaces, so a prompt
+        // with spaces needs no quoting beyond the shell's: `infer` plus words.
         if (args.len == 2) {
             if (std.mem.eql(u8, args[1], "train")) return runTrain(arena, init.gpa, init.io, init.environ_map);
             if (std.mem.eql(u8, args[1], "scale-profile")) return runScaleProfile(init.io);
             if (std.mem.eql(u8, args[1], "attn-bench")) return runAttnBench(init);
         }
-        std.debug.print("usage: {s} [train|scale-profile|attn-bench]\n", .{args[0]});
+        if (args.len >= 3 and std.mem.eql(u8, args[1], "infer")) return runInfer(arena, init.io, init.environ_map, args[2..]);
+        std.debug.print("usage: {s} [train|scale-profile|attn-bench|infer <prompt>]\n", .{args[0]});
         return error.UnknownCommand;
     }
 
@@ -205,6 +212,12 @@ fn runTrain(
         profile.active = null;
     }
 
+    // The model, beside the curve. Written on every run, promoted with nothing:
+    // it is gitignored, so there is no committed claim to match. Saved before
+    // the CSV so a run that fails to reproduce still leaves weights that infer
+    // can load; the curve refusal is about the claim, not the artifact.
+    try checkpoint.save(io, checkpoint_path, cfg.model, res.params);
+
     // Written beside the committed curve and moved onto it only on a match. A
     // run truncates its output, so writing `csv_path` directly replaced the
     // committed artifact before anything had compared it, and a reader on a
@@ -225,6 +238,51 @@ fn runTrain(
     });
     try w.flush();
     try settleCsv(io, environ);
+}
+
+/// `ztransformer infer <prompt words...>`: greedy continuation from checkpoint.
+///
+/// Clause 1: exercises the forward pass on real weights outside training.
+/// Tokenizer is retrained from the same corpus prefix and merge count as
+/// `runTrain`, so the ids match without persisting a vocabulary: the corpus is
+/// digest-checked and `train` is deterministic, making the merges deterministic
+/// too. A checkpoint whose `vocab_size` disagrees is refused rather than
+/// decoded wrong.
+fn runInfer(arena: std.mem.Allocator, io: Io, environ: *std.process.Environ.Map, words: []const []const u8) !void {
+    if (words.len == 0) {
+        std.debug.print("usage: ztransformer infer <prompt>\n", .{});
+        return error.EmptyPrompt;
+    }
+    var prompt_len: usize = 0;
+    for (words) |wd| prompt_len += wd.len + 1;
+    const prompt_text = try arena.alloc(u8, prompt_len - 1);
+    var at: usize = 0;
+    for (words, 0..) |wd, i| {
+        @memcpy(prompt_text[at..][0..wd.len], wd);
+        at += wd.len;
+        if (i + 1 < words.len) {
+            prompt_text[at] = ' ';
+            at += 1;
+        }
+    }
+    const whole = try Io.Dir.cwd().readFileAlloc(io, corpus_path, arena, .unlimited);
+    const text = whole[0..@min(whole.len, corpusBytes(environ))];
+    var tk = try tokenizer.Tokenizer.init(arena);
+    try tk.train(text, n_merges);
+    const loaded = try checkpoint.load(arena, io, checkpoint_path);
+    if (tk.vocab.items.len != loaded.cfg.vocab_size) return error.DimensionMismatch;
+    const prompt_ids = try tk.encode(arena, prompt_text);
+    if (prompt_ids.len == 0) return error.EmptyPrompt;
+    var n_new = n_new_default;
+    if (environ.get(n_new_var)) |raw| n_new = std.fmt.parseInt(usize, raw, 10) catch n_new_default;
+    if (prompt_ids.len + n_new > loaded.cfg.n_ctx) return error.SequenceTooLong;
+    const gen = try decode.generate(arena, loaded.params, loaded.cfg, prompt_ids, n_new);
+    const out_text = try tk.decode(arena, gen);
+    var buffer: [4096]u8 = undefined;
+    var stdout: Io.File.Writer = .init(.stdout(), io, &buffer);
+    try stdout.interface.writeAll(out_text);
+    try stdout.interface.writeAll("\n");
+    try stdout.interface.flush();
 }
 
 /// Compares the curve just written against the digest the repository claims for

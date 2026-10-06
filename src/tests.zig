@@ -32,6 +32,7 @@ comptime {
 
 comptime {
     _ = @import("train_test.zig");
+    _ = @import("checkpoint_test.zig");
 }
 
 comptime {

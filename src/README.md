@@ -222,6 +222,8 @@ every Zig target and is what stops a corrupt id from wrapping down into the vali
 | `train.run` | `run(allocator, cfg, train_tokens, val_tokens) !Result` | The whole loop: batch, forward, loss, backward, clip, rate, step, clear. |
 | `train.Result` | `{ train_loss, val_loss, steps, params, rows, allocator }`, with `deinit` | The run's numbers plus the trained weights, so a checkpoint can be written straight out. |
 | `train.writeCsv` | `writeCsv(path, rows) !void` | Header plus one line per row, truncating the file first. |
+| `checkpoint.save` | `save(io, path, cfg, params) !void` | Raw LE f32 `ZTR1` checkpoint: 64-byte header (magic, version 1, seven `model.Config` fields) then every parameter in `train.flatten` order. Written by `train` to `outputs/checkpoint.bin` (gitignored) on every run. |
+| `checkpoint.load` | `load(allocator, io, path) !Loaded` | Reads it back, refusing a bad magic, version or byte count. Returns `{ cfg, params }`; caller owns `params`. |
 | `profile.Op` | `enum { loop, fetch, forward, loss, dlogits, backward, clip, adam, zero, eval }` | The op kinds a step is attributed to, named for the call each probe follows. |
 | `profile.Totals` | `{ ns, calls, span_ns }`, with `rows`, `shareSum`, `denominatorNs`, `bucketSumNs`, `writeTable` | Accumulated nanoseconds per op. `denominatorNs` is the elapsed **span**, not the sum of the buckets, which is why the shares fall short of 100% by the un-attributed remainder. |
 | `profile.Profiler` | `start(io)`, `stop(op)`, `finish()` | One running measurement. `stop` closes the gap since the last probe and names what it was spent on, so no time is counted twice. |
