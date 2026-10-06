@@ -2,11 +2,10 @@
 
 A transformer built from scratch in Zig: RMSNorm, RoPE, grouped-query attention, SwiGLU and tied
 embeddings, with hand-derived gradients checked against central differences. Everything runs on the
-CPU in f32. The block's gradients are checked against central differences and the CUDA kernels
-against their own CPU twins, and a
-GPT-mini trains end to end. Four CUDA kernels implement transformer operations, and each is timed
-against its own CPU twin, though only the attention forward carries a published speedup ratio; the
-rest of the plan is not measured, and `src/cuda/README.md` says exactly which parts those are and why.
+CPU in f32, and a GPT-mini trains end to end. Four CUDA kernels implement transformer operations,
+each timed against its own CPU twin, though only the attention forward carries a published speedup
+ratio; the rest of the plan is not measured, and `src/cuda/README.md` says exactly which parts
+those are and why.
 
 On "Llama-shaped", precisely: the block has RMSNorm, RoPE at Llama-3's theta, grouped-query
 attention, SwiGLU and no biases. It is not a Llama-3 you
@@ -229,7 +228,7 @@ buckets, and the shares to move when the work does; `zig build table-block-check
 control for the gate that holds the scale tables in `src/README.md` -- **six** assertions, of which
 one case is expected to PASS and three to fail, alongside a floor of zero and a check that a
 missing-marker failure names the missing marker -- and it prints what each one produced; `zig build
-cuda-train`, both of which link `attn_kernels.cu`. Those two **exit 1 while `cuda_attn` is false**,
+cuda-attn-check` and `zig build cuda-train` link `attn_kernels.cu`. Those two **exit 1 while `cuda_attn` is false**,
 naming the line to edit, rather than skipping: a green that checked nothing is worse than a refusal.
 
 `zig build train` links its own ReleaseFast binary whatever `-Doptimize` says, because one step is a

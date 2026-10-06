@@ -17,8 +17,7 @@
 #
 # Silent on success: `verify` is silent by contract.
 #
-# ponytail: `zig build verify` wires this in, and tracks the script and the
-# README as inputs plus the library compile and the test run, so a declaration
+# `zig build verify` wires this in, and tracks the script and the README as inputs plus the library compile and the test run, so a declaration
 # going private re-runs the gate from either direction. It still does not track
 # a brand-new `src/<mod>.zig` that no README row names and no module imports,
 # because then there is nothing to check; a new module that the README *does*

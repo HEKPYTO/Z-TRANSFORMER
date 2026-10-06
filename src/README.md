@@ -43,7 +43,7 @@ what that does and does not establish.
 ## What the step profiler says, and the one thing it does not fix
 
 `zig build step-profile` measures a real training step, not an estimate. On an idle
-fedora-pc it reports, over 120 windows:
+CUDA host it reports, over 120 windows:
 
 | bucket | share |
 |---|---|
@@ -75,7 +75,7 @@ each row is computed once, it was deleted.
 A fork-join benchmark on the shapes this model actually builds — `d_model` 128, `ffn_dim`
 512, `vocab_size` 456 — spawning 31 threads per call and having the caller work too:
 
-Measured on `fedora-pc`, the same host as the published step. **Two runs, one sample per
+Measured on the CUDA host, the same host as the published step. **Two runs, one sample per
 shape per run**, at `loadavg` 2.30 and 2.56; the table is the second. Both sets are given
 below because the gap between them is the honest part of this measurement.
 
@@ -112,15 +112,15 @@ into a published figure. What is established is the bound: **no matmul in a step
 3.4% of it, and spawn-per-call loses 7.7% trying to capture it.** A persistent pool is the
 only shape that could win at all, because its handshake is microseconds against a ~2 ms
 matmul — but paying shared-memory prices for a bound that low is not a trade, and what
-would settle it is a repeated idle matmul measurement on `fedora-pc`, not an estimate.
+would settle it is a repeated idle matmul measurement on the CUDA host, not an estimate.
 
 **And `blockBackward` is not matmul.** `zig build step-profile` reports `backward` as one
 bucket, and nothing in `autograd.zig` calls `tensor.matmul` — the gradients are
 hand-rolled in `weightGrad` and `inputGrad`.
 
-**This next measurement was NOT taken on `fedora-pc`.** Timing every callsite in
+**This next measurement was NOT taken on the CUDA host.** Timing every callsite in
 `blockBackward` with a throwaway probe, reverted immediately after reading, was done on
-**the development Mac, under load, while `fedora-pc` was unreachable** — the 123 steps
+**a Mac, under load, while the CUDA host was unreachable** — the 123 steps
 that produced it are not the 123 steps the committed curve is. It puts the total in this
 order, and the order is what is being claimed: `weightGrad` first at roughly half,
 `inputGrad` second at roughly a third,
@@ -135,7 +135,7 @@ loss curve and nothing else, so no transcript of it exists either. That is why n
 percentage is quoted to two significant figures. The ORDER is the finding, it is stable
 across two probe runs that disagreed on the absolute numbers by more than a fifth, and it
 is the same conclusion the `matmul` figures above reach by a different route. **Re-measuring
-it properly is a `fedora-pc` job and it has not been done.**
+it properly is a CUDA-host job and it has not been done.**
 
 **Blocking `weightGrad` over the output rows was tried, and it is not worth shipping.**
 The loop as written runs `i` outermost and `t` inside it, so `w_row` stays in L1 across

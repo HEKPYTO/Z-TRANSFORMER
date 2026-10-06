@@ -478,7 +478,7 @@ fn cell(line: []const u8) !Cell {
 /// readable curve and two runs of one seed produce the same bytes. Nothing
 /// here allocates: each line is formatted into a stack buffer and streamed.
 ///
-/// ponytail: the signature takes a path and no `Io`, so it reaches for the
+/// NOTE: the signature takes a path and no `Io`, so it reaches for the
 /// standard library's single-threaded instance, which supports no concurrency
 /// and no cancelation. A caller that wants its own `Io` writes the same rows
 /// with `std.Io.Dir.createFile`; the upgrade is a fifth parameter, not a

@@ -86,7 +86,7 @@ pub const Tokenizer = struct {
     /// Learns at most `n_merges` merges from `text`, the most frequent pair
     /// first, and stops early once no pair occurs `min_pair_count` times.
     ///
-    /// ponytail: rescans the whole sequence once per merge, O(len * n_merges).
+    /// NOTE: rescans the whole sequence once per merge, O(len * n_merges).
     /// Measured in a debug build: 0.5 s on the 20k byte slice the tests use, 5 s
     /// on the 100k the trainer is verified on, 55 s on the whole 1.1 MB corpus
     /// at 200 merges. A linked list of positions with incremental pair counts is
@@ -188,7 +188,7 @@ pub const Tokenizer = struct {
     /// pair was found, and firing a merge turns two tokens into one: the
     /// sequence strictly shortens every pass and no merge can fire twice.
     ///
-    /// ponytail: one scan per applied merge, O(len * n_merges), same ceiling as
+    /// NOTE: one scan per applied merge, O(len * n_merges), same ceiling as
     /// `train` and the same upgrade. It is not a pre-tokenizer pass: merges may
     /// cross any byte boundary, which is what keeps the encoder to a single
     /// pass over the text and keeps the merge list a property of the corpus

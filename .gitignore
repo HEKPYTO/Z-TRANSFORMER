@@ -22,3 +22,6 @@ docs/
 
 # A review artifact, never committed. AGENTS.md caps committed *.md at 7.
 ISSUES.md
+
+# Local agent instructions. Never tracked; see Docs rule.
+AGENTS.md

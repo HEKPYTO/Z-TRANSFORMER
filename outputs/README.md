@@ -31,8 +31,11 @@ that was measured on one curve and not on the other is refused with `error.Curve
 compared: there is no number on one side of the subtraction, and treating the missing one as zero
 would report two different curves as agreeing.
 
-The committed curve is the default `zig build train` run: 123 windows, one epoch, 64 KiB of corpus.
-The root `README.md` quotes the two final numbers out of it.
+The committed curve is the default `zig build train` run: 123 windows, one epoch, 64 KiB of corpus,
+ending at train loss 5.596625 and validation loss 5.155396, the last row of the file, measured on
+held-out tokens the training batcher never touches. A smoke run showing the loop completes and the
+loss falls; not a benchmark, not a throughput figure, not a model-quality claim. There is no
+inference benchmark.
 
 Three gates cover it, and they catch different things. `zig build verify` checks the file against the
 digest in `src/main.zig`, so it catches **an edited curve**. `zig build determinism`, also inside
