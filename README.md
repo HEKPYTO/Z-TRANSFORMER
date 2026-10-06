@@ -13,7 +13,8 @@ CPU and GPU.
 
 Requires Zig 0.16.0, enforced by `build.zig` rather than by hope. Nothing to install, no package
 manager step. Tested on macOS on Apple Silicon; the CPU path is portable, but CUDA work needs a
-Linux host with docker and a GPU. A fresh clone has no git hook, because `core.hooksPath` is
+Linux host with docker and a GPU. Test hardware: Intel i9-13900K, NVIDIA RTX 3080 Ti
+12 GB, CUDA 12.6.3 (driver 615.71.09), glibc 2.43, Zig 0.16.0. A fresh clone has no git hook, because `core.hooksPath` is
 per-clone local config:
 
     git config core.hooksPath .githooks
