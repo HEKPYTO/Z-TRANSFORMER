@@ -82,7 +82,7 @@ comptime {
 // is 337 lines of Zig under `src/` that this walk cannot see and no build
 // target compiles. It is not dead -- `src/cuda/run-norm.sh` builds it as its
 // own module root -- but nothing in `zig build test` or CI checks it, which is
-// why `AGENTS.md` says no CI step reaches it. (`zig build cuda-check` compiles
+// why no CI step reaches it. (`zig build cuda-check` compiles
 // `norm.cu` and `probe.cu` under the pinned toolchain, but not this file, which
 // is a module root only for run-norm.sh, and it is not in `verify` either.")
 //

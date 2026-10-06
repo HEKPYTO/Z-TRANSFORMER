@@ -583,8 +583,7 @@ pub fn build(b: *std.Build) void {
     const bench = b.step("bench", "Report median CPU seconds per training step over N runs (default 3)");
     bench.dependOn(&addBench(b, train_exe).step);
 
-    // Nothing in this graph reached `src/cuda/` until now, which `AGENTS.md`
-    // said out loud: a change there was unchecked until a person ran
+    // Nothing in this graph reached `src/cuda/` until now, which is worth stating plainly: a change there was unchecked until a person ran
     // `sh src/cuda/run-norm.sh` on an NVIDIA host. This compiles three CUDA sources
     // files, so a syntax or type error in them is caught by the build system.
     //
@@ -847,7 +846,7 @@ fn cudaAttnObject(b: *std.Build) *std.Build.Step.Run {
 /// `/usr/local/cuda/targets/x86_64-linux/lib/`, so a linker there finds `-lcudart`
 /// with no help at all -- while the object above was built by the pinned 12.6.3
 /// image. Linking the host's copy would put two toolchains in one build, the
-/// condition `AGENTS.md` refuses, and it would do so invisibly: nothing fails and
+/// condition this repository refuses, and it would do so invisibly: nothing fails and
 /// every number still prints.
 ///
 /// The pinned runtime therefore has to be copied out of the image first, and

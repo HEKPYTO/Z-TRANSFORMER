@@ -12,9 +12,9 @@
 // here. See the two blocks below that explain the one place this cannot
 // reproduce the CPU exactly.
 //
-// There is no CPU implementation of RMSNorm in this file, on purpose. AGENTS.md
-// is explicit that a second implementation we wrote is not a reference and that
-// agreeing with it proves less than it appears to, so the only thing this can be
+// There is no CPU implementation of RMSNorm in this file, on purpose: a second
+// implementation we wrote is not a reference and agreeing with it proves less
+// than it appears to, so the only thing this can be
 // compared against is `norm.forward` itself, run by src/cuda/norm_twin.zig on the
 // same machine and over the same input bytes. That is why the shape table lives
 // in the twin and is read here as a manifest.

@@ -103,7 +103,7 @@ thing to revisit if the kernel has to accept rows wider than a few thousand.
 ## Parity
 
 The reference is `src/norm.zig` itself. `norm.cu` contains **no CPU implementation of RMSNorm**,
-because AGENTS.md is explicit that a second implementation we wrote is not a reference and that
+as a matter of policy: a second implementation we wrote is not a reference and that
 agreeing with it proves less than it appears to. The two sides meet on flat little-endian `f32`
 blobs, and the shape table lives in `norm_twin.zig` and reaches the `.cu` as `manifest.tsv`, so
 neither side can disagree about what was run.
@@ -1150,8 +1150,8 @@ links a device binary outside the container would, and it needs the runtime copi
 **The host may already have a `libcudart`, and using it would be the wrong one.** The host of record carries a
 CUDA 13.4 toolkit and `ldconfig -p` resolves `libcudart.so` to
 `/usr/local/cuda/targets/x86_64-linux/lib/`, so a linker there finds `-lcudart` with no help at all.
-That runtime is **13.4**, and this repository pins **12.6.3**: `AGENTS.md` records the same tension for
-the compiler and refuses it there -- "one repository should not carry two toolchains whose numbers would
+That runtime is **13.4**, and this repository pins **12.6.3**: the same tension holds for
+the compiler, refused the same way -- "one repository should not carry two toolchains whose numbers would
 then describe different builds". Linking against the host's copy would reintroduce exactly that, one
 level down and invisibly, because nothing would fail and every number would still print. So the recipe
 below copies the pinned version out of the pinned image rather than accepting the one already present:

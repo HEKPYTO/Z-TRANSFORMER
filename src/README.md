@@ -52,7 +52,7 @@ CUDA host it reports, over 120 windows:
 | `adam` | 0.8% |
 | everything else | under 0.7% each |
 
-That matches what `AGENTS.md` publishes for the 30-window run (77% backward, 19%
+That matches the earlier 30-window run (77% backward, 19%
 forward), so the split is stable and it says the same thing both times: **the step is
 the backward pass, and the backward pass is matmul.**
 

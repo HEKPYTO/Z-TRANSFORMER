@@ -3,9 +3,9 @@
 //! and its own timing. `src/cuda/norm.cu` then runs the GPU kernel over the same
 //! input bytes and the two are compared.
 //!
-//! The reference is this file calling `norm.zig`, not a C copy of it. AGENTS.md
-//! is explicit that a second implementation we wrote is not a reference and that
-//! agreeing with it proves less than it appears to, so the .cu deliberately has
+//! The reference is this file calling `norm.zig`, not a C copy of it: a second
+//! implementation we wrote is not a reference and agreeing with it proves less
+//! than it appears to, so the .cu deliberately has
 //! no CPU implementation of RMSNorm at all: it can only fail by disagreeing with
 //! the same code the CPU tests pin.
 //!
