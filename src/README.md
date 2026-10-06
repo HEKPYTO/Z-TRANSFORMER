@@ -1037,11 +1037,13 @@ gate, `8.2e4` times it. **Nearly five orders above**, which is what makes it the
 to be blind to. The conclusion never depended on the magnitude; this file said "two orders" until
 an audit recomputed it, which was wrong by three.
 
-### Two survivors that are not holes
+### Three survivors that are not holes
 
-`tools/mutation` leaves two survivors after that test. Neither is a coverage hole, and
-neither is going to become one, so they are recorded here rather than left for the next person to
+`tools/mutation` leaves three survivors after that test. None is a coverage hole, and
+none is going to become one, so they are recorded here rather than left for the next person to
 spend a day on. `clip-ge` is the `>` / `>=` question settled above: bit-identical, uncaughtable.
+`loss-no-rowmax` is equivalent algebraically: seeding `max` with 0 instead of the row maximum
+shifts every term and they cancel, so the run is identical rather than close.
 `norm-reassociate` is `v / rms * w[i]` written as `v * w[i] / rms`, and the measured answer is that
 it is below the resolution of any tolerance that could be written down.
 
@@ -1059,6 +1061,8 @@ this one. Measured on all three hand-computed rows, the
 two spellings differ by `0.0`: they are bit-identical, so they are identical at a tolerance of zero
 and not merely at `1e-6`. Catching this needs a non-dyadic weight, and then the divergence is one
 ulp, which is a statement about `f32` and not about this function. The `tol` is left where it is.
+
+### Reproducibility
 
 Reproducibility is per build configuration and per host, and the first half of that used to be
 asserted on a measurement that no longer reproduces. Two runs at one seed in one build produce
